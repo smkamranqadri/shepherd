@@ -5,6 +5,7 @@ pub mod icons;
 pub mod open_files;
 pub mod roots;
 pub mod runner;
+pub mod save;
 pub mod status;
 pub mod tabs;
 pub mod tree;

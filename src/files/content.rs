@@ -89,6 +89,12 @@ pub struct Text {
     pub crlf: bool,
     /// It started with a UTF-8 byte order mark.
     pub bom: bool,
+    /// Its most common line end, which an edit is saved with.
+    pub ending: super::save::LineEnding,
+    /// It ends with a line end.
+    pub final_newline: bool,
+    /// It has more than one kind of line end (a save makes them all `ending`).
+    pub mixed: bool,
 }
 
 impl Text {
@@ -123,7 +129,8 @@ pub fn decode(bytes: &[u8]) -> Option<Text> {
     let mut starts = vec![0u32];
     starts.extend(text.bytes().enumerate().filter(|(i, b)| *b == b'\n' && i + 1 < text.len()).map(|(i, _)| i as u32 + 1));
     let crlf = text.contains("\r\n");
-    Some(Text { text, starts, crlf, bom })
+    let format = super::save::line_format(text.as_bytes());
+    Some(Text { text, starts, crlf, bom, ending: format.ending, final_newline: format.final_newline, mixed: format.mixed })
 }
 
 /// A file as the viewer shows it, read by `load`.
@@ -313,6 +320,17 @@ mod tests {
         assert_eq!(lines(&decode(b"").unwrap()), [""]);
         assert_eq!(decode(b"x\ny").unwrap().line(7), "");
         assert!(decode(b"\xff").is_none());
+    }
+
+    #[test]
+    fn decode_records_how_lines_end() {
+        use super::super::save::LineEnding;
+        let format = |t: Text| (t.ending, t.bom, t.final_newline, t.mixed);
+        assert_eq!(format(decode(b"\xEF\xBB\xBFa\r\nb\r\n").unwrap()), (LineEnding::Crlf, true, true, false));
+        assert_eq!(format(decode(b"a\nb").unwrap()), (LineEnding::Lf, false, false, false));
+        assert_eq!(format(decode(b"a\rb\r").unwrap()), (LineEnding::Cr, false, true, false));
+        assert_eq!(format(decode(b"a\r\nb\r\nc\n").unwrap()), (LineEnding::Crlf, false, true, true));
+        assert_eq!(format(decode(b"").unwrap()), (LineEnding::Lf, false, false, false));
     }
 
     #[test]
