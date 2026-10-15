@@ -74,7 +74,8 @@ impl Listing {
 }
 
 /// Reads `dir` (blocking; call it off the main thread), at most `MAX_ENTRIES` of it, sorted. A symlink is followed
-/// to tell a folder from a file and whether it leaves `root`; one that points nowhere is a file. `.git` is left out.
+/// to tell a folder from a file and whether it leaves `root`; one that points nowhere is a file. `.git` is left out,
+/// and so are a save's temp files (`.name.shepherd-PID-N~`), which a save in flight or one cut short leaves.
 pub fn list(dir: &Path, root: &Path) -> io::Result<Listing> {
     // a root that is itself a link (`~/src` → `/data/src`) still holds its own folders
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -87,7 +88,7 @@ pub fn list(dir: &Path, root: &Path) -> io::Result<Listing> {
         // an entry gone between the read and the stat (a build's temp file) is just not listed
         let Ok(item) = item else { continue };
         let os_name = item.file_name();
-        if os_name == ".git" {
+        if os_name == ".git" || crate::files::save::is_temp_name(&os_name) {
             continue;
         }
         let Ok(file_type) = item.file_type() else { continue };
@@ -398,6 +399,16 @@ mod tests {
         let src = list(&root.path().join("src"), root.path()).unwrap();
         assert_eq!((src.entries[0].kind, src.entries[0].size), (EntryKind::File, 12));
         assert!(list(&root.path().join("missing"), root.path()).is_err());
+    }
+
+    #[test]
+    fn a_saves_temp_files_are_never_listed() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["a.rs", ".a.rs.shepherd-123-4~", ".shepherd-1-2~x", "b.shepherd-1-2~"] {
+            std::fs::write(root.path().join(name), "").unwrap();
+        }
+        let listing = list(root.path(), root.path()).unwrap();
+        assert_eq!(names(&listing.entries), [".shepherd-1-2~x", "a.rs", "b.shepherd-1-2~"]);
     }
 
     #[test]
