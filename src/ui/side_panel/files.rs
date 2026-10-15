@@ -4,7 +4,7 @@
 //! carries the generation its folder had when it started: an answer that a newer read of the folder overtook is
 //! dropped, as is one for a tree since replaced by another root's.
 use super::{SidePanel, SidePanelEvent};
-use crate::files::icons::icon_for;
+use crate::files::icons::material_icon;
 use crate::files::runner::{self, Host, Limits, RunError};
 use crate::files::tree::{self, Listing, Read, Row};
 use crate::settings::SettingsGlobal;
@@ -500,7 +500,8 @@ impl SidePanel {
                     });
                     let dangling = entry.kind == tree::EntryKind::Dangling;
                     let color = if *ignored || dangling { theme.text_faint } else { theme.text };
-                    let icon = icon_for(&entry.name, entry.kind, *expanded);
+                    let (is_dir, link) = (entry.is_dir(), matches!(entry.kind, tree::EntryKind::Symlink { .. }));
+                    let icon = material_icon(&entry.name, is_dir, *expanded);
                     let outside = matches!(entry.kind, tree::EntryKind::Symlink { dir: true, outside: true });
                     let (click, menu) = (path.clone(), path.clone());
                     let file = !entry.is_dir() && !dangling;
@@ -518,7 +519,21 @@ impl SidePanel {
                         .when(selected, |el| el.bg(theme.selected))
                         .when(!selected, |el| el.hover(move |s| s.bg(hover)))
                         .child(div().size(px(16.)).flex_none().flex().items_center().justify_center().children(chevron))
-                        .child(gpui::svg().path(icon).size(px(14.)).flex_none().text_color(if *ignored { theme.text_faint } else { theme.text_muted }))
+                        .child(
+                            // A coloured SVG, so img(), not the tinted svg(); an ignored or dangling entry is dimmed
+                            div()
+                                .relative()
+                                .size(px(16.))
+                                .flex_none()
+                                .child(gpui::img(icon).size(px(16.)).object_fit(gpui::ObjectFit::Contain).when(*ignored || dangling, |el| el.opacity(0.5)))
+                                .when(link, |el| {
+                                    el.child(
+                                        div().absolute().right(px(-2.)).bottom(px(-2.)).child(
+                                            gpui::svg().path("icons/solar/arrow-right-up.svg").size(px(8.)).text_color(theme.text_muted),
+                                        ),
+                                    )
+                                }),
+                        )
                         .child(div().flex_1().min_w_0().truncate().text_size(px(12.5)).text_color(color).child(entry.name.clone()))
                         .when(outside, |el| el.tooltip(crate::shell::widgets::tip("A link to a folder outside this one", None)))
                         .when(dangling, |el| el.tooltip(crate::shell::widgets::tip("A link to something that is not there", None)))
