@@ -74,7 +74,8 @@ struct Shown {
     tint: (Hsla, Hsla),
     /// One of its panes is zoomed to fill it: the other panes are hidden.
     zoomed: bool,
-    /// The full width: label measured, clamped.
+    /// The full width: label measured, clamped (`tab_width`). The slot is laid out and drawn at this width, so the
+    /// wash, a slide and the scroll into view land on the tab itself.
     width: f32,
 }
 
@@ -212,7 +213,12 @@ fn reveal(scrolled: f32, view: f32, x: f32, w: f32) -> Option<f32> {
     }
 }
 
-fn tab_width(label_w: f32, zoomed: bool) -> f32 {
+/// A tab's full width: its parts around the measured label, clamped; the widest while its name is being edited,
+/// for the field.
+fn tab_width(label_w: f32, zoomed: bool, renaming: bool) -> f32 {
+    if renaming {
+        return MAX_W;
+    }
     let mark = if zoomed { ZOOM_MARK + INNER_GAP } else { 0. };
     (PAD_L + ICON + INNER_GAP + label_w + mark + INNER_GAP + SLOT + PAD_R).clamp(MIN_W, MAX_W).ceil()
 }
@@ -444,6 +450,7 @@ impl Shell {
                         let label_w = label_w(&t.label, window);
                         let agent = agents.iter().find(|p| p.tab_id == t.tab_id).and_then(|p| p.agent.as_deref());
                         let zoomed = s.layouts.iter().any(|l| l.tab_id == t.tab_id && l.zoomed);
+                        let renaming = self.renaming.as_ref().is_some_and(|r| r.target == RenameTarget::Tab(t.tab_id.clone()));
                         Shown {
                             face: Face::Herdr,
                             id: t.tab_id.clone(),
@@ -452,7 +459,7 @@ impl Shell {
                             icon: agent_icon(agent),
                             tint: agent_tint(agent, theme),
                             zoomed,
-                            width: tab_width(label_w, zoomed),
+                            width: tab_width(label_w, zoomed, renaming),
                         }
                     })
                     .collect()
@@ -468,7 +475,7 @@ impl Shell {
         }
         for f in &file_tabs {
             let label = f.path.file_name().map_or_else(|| f.path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
-            let width = tab_width(label_w(&label, window), false);
+            let width = tab_width(label_w(&label, window), false, false);
             // ponytail: nothing is dirty until tabs edit (E1)
             let face = Face::File { tab: f.id, preview: f.preview, dirty: false };
             let icon = crate::files::icons::material_icon(&label, false, false);
@@ -530,7 +537,6 @@ impl Shell {
             let editing = (!closing && file.is_none()).then(|| self.rename_field(&RenameTarget::Tab(t.id.clone()), cx)).flatten();
             // ponytail: file tabs are reordered by drag in X1
             let draggable = editing.is_none() && file.is_none();
-            let full_w = if draggable { full_w } else { MAX_W };
             // While dragged, the ghost carries the tab; while it flies home, a copy over everything does.
             let lifted = lifted_id.as_deref() == Some(t.id.as_str()) || entry.lifted(now);
             if entry.lifted(now) {
@@ -803,6 +809,39 @@ mod tests {
         assert_eq!(got, [("a", Gone), ("b", Gone), ("c", Stay)].map(|(id, p)| (id.to_string(), p)));
         // a reorder is herdr's new order
         assert_eq!(merge(&["a", "b"], &["b", "a"]), [("b", Stay), ("a", Stay)].map(|(id, p)| (id.to_string(), p)));
+    }
+
+    fn file(n: u64, label: &str, preview: bool) -> Shown {
+        let width = tab_width(label.len() as f32 * 7., false, false);
+        Shown { face: Face::File { tab: TabId(n), preview, dirty: false }, id: file_entry_id(TabId(n)), label: label.into(), width, ..tab("") }
+    }
+
+    #[test]
+    fn a_tab_is_as_wide_as_its_label_unless_renamed() {
+        // a file tab's short name keeps it narrow: it is drawn at this width, not stretched to the widest
+        assert_eq!(tab_width(60., false, false), (PAD_L + ICON + INNER_GAP + 60. + INNER_GAP + SLOT + PAD_R).ceil());
+        assert_eq!(tab_width(10., false, false), MIN_W);
+        assert_eq!(tab_width(500., false, false), MAX_W);
+        assert_eq!(tab_width(10., false, true), MAX_W); // the rename field's room
+    }
+
+    #[test]
+    fn file_tabs_hold_their_slots_through_a_preview_replaced() {
+        let t0 = Instant::now();
+        let divider = Shown { face: Face::Divider, id: "file-divider".into(), width: DIVIDER_W, ..tab("") };
+        let mut bar = TabBar::default();
+        // TASKS.md pinned, README.md previewed to its right
+        bar.sync(Some("w"), vec![tab("a"), divider.clone(), file(1, "TASKS.md", false), file(2, "README.md", true)], t0);
+        let tasks_w = bar.entries[2].tab.width;
+        assert!(tasks_w < MAX_W);
+        let layout = bar.layout(t0);
+        assert_eq!(layout[3].0, 100. + GAP + DIVIDER_W + GAP + tasks_w + GAP);
+        // the next single click replaces the preview in place: the same slot, its new name's width
+        bar.sync(Some("w"), vec![tab("a"), divider, file(1, "TASKS.md", false), file(2, "main.rs", true)], t0);
+        assert_eq!(bar.entries.len(), 4);
+        assert_eq!(bar.entries[3].tab.label, "main.rs");
+        assert_eq!(bar.entries[3].presence(t0), 1.);
+        assert_eq!(bar.layout(t0)[3], (layout[3].0, file(2, "main.rs", true).width, 1.));
     }
 
     #[test]
