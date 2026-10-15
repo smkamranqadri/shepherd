@@ -757,15 +757,14 @@ impl PaneTerminal {
             let cwd = pane_cwd(&client, &pane_id).await;
             let path = resolve(&path, Path::new(&cwd))?;
             if is_image(&path) {
-                return Some(path);
+                return Some(Ok(path));
             }
-            open_at(&client, editor, &path, line, col, Some((&pane_id, &cwd))).await;
-            None
+            open_at(&client, editor, &path, line, col, Some((&pane_id, &cwd))).await.err().map(Err)
         });
-        cx.spawn(async move |this, cx| {
-            if let Ok(Some(path)) = opened.await {
-                let _ = this.update(cx, |pane, cx| pane.show_preview(path, cx));
-            }
+        cx.spawn(async move |this, cx| match opened.await {
+            Ok(Some(Ok(path))) => drop(this.update(cx, |pane, cx| pane.show_preview(path, cx))),
+            Ok(Some(Err(why))) => cx.update(|cx| crate::ui::toast::error(cx, why)),
+            _ => {}
         })
         .detach();
     }
@@ -1273,20 +1272,25 @@ impl Preview {
 }
 
 /// Opens `path` (absolute, and there) in the user's editor at its line and column, as a Cmd+click on a path in a
-/// pane does: the right panel's Files tab and a pane's links share it. `pane_id` is the pane nvim opens beside
-/// (without one, nvim has no terminal to run in, and the first GUI editor installed opens it instead); a folder goes
-/// to the file manager.
+/// pane does: the right panel's Files tab and a pane's links share it. `pane_id` is the pane a terminal editor opens
+/// beside; a folder goes to the file manager. What it can't open, it says in a toast.
 pub fn open_in_editor(path: PathBuf, line: Option<u32>, col: Option<u32>, pane_id: Option<String>, cx: &App) {
     let Some(PaneQueries(client, rt)) = cx.try_global::<PaneQueries>() else { return };
     let editor = cx.try_global::<crate::settings::SettingsGlobal>().and_then(|s| s.settings.editor.clone());
     let client = client.clone();
-    rt.spawn(async move {
+    let opened = rt.spawn(async move {
         let pane = match pane_id {
             Some(id) => Some((pane_cwd(&client, &id).await, id)),
             None => None,
         };
-        open_at(&client, editor, &path, line, col, pane.as_ref().map(|(cwd, id)| (id.as_str(), cwd.as_str()))).await;
+        open_at(&client, editor, &path, line, col, pane.as_ref().map(|(cwd, id)| (id.as_str(), cwd.as_str()))).await
     });
+    cx.spawn(async move |cx| {
+        if let Ok(Err(why)) = opened.await {
+            cx.update(|cx| crate::ui::toast::error(cx, why));
+        }
+    })
+    .detach();
 }
 
 /// The folder a pane's shell (or the program in front of it) is in, as herdr knows it; `/` when it does not.
@@ -1295,30 +1299,85 @@ async fn pane_cwd(client: &Client, pane_id: &str) -> String {
     pane["foreground_cwd"].as_str().or(pane["cwd"].as_str()).unwrap_or("/").to_string()
 }
 
-/// `open_in_editor`'s work, on the runtime: `pane` is the pane nvim splits and the folder its new pane starts in.
-async fn open_at(client: &Client, editor: Option<String>, path: &Path, line: Option<u32>, col: Option<u32>, pane: Option<(&str, &str)>) {
-    // a folder goes to Finder, not the editor
-    if path.is_dir() {
-        let _ = tokio::process::Command::new(crate::platform::OPEN).arg(path).status().await;
-        return;
+/// How a path is opened.
+#[derive(Debug, PartialEq)]
+pub enum Opener {
+    /// A folder, in the file manager.
+    FileManager,
+    /// A terminal editor (this command) in a new herdr pane to the right of the focused one.
+    Split(String),
+    /// A program with a window of its own: this argv.
+    Gui(Vec<String>),
+    /// No editor to be found.
+    Nothing,
+}
+
+/// Picks how to open `path` (`is_dir` when it is a folder). `editor` is the setting; with none set, macOS takes the
+/// first of Zed, Cursor and VS Code installed, else the file's default app, as it always has; Linux takes nvim in a
+/// pane beside the focused one, else `$VISUAL`/`$EDITOR` there, else a GUI editor. nvim set but no pane to open
+/// beside falls back to the GUI editors. `installed` finds a program on the PATH.
+#[allow(clippy::too_many_arguments)]
+pub fn choose_opener(
+    path: &Path,
+    is_dir: bool,
+    line: Option<u32>,
+    col: Option<u32>,
+    editor: Option<&str>,
+    env_editor: Option<&str>,
+    has_pane: bool,
+    mac: bool,
+    installed: &dyn Fn(&str) -> Option<String>,
+) -> Opener {
+    if is_dir {
+        return Opener::FileManager;
     }
-    let nvim = is_nvim(editor.as_deref());
-    if let Some((pane_id, cwd)) = pane.filter(|_| nvim) {
-        // A terminal editor gets a pane to the right; its shell drops typeahead until the prompt is drawn.
-        let params = serde_json::json!({"target_pane_id": pane_id, "direction": "right", "focus": true, "cwd": cwd});
-        let Ok(r) = client.call("pane.split", params).await else { return };
-        let Some(new_pane) = r["pane"]["pane_id"].as_str() else { return };
-        let prompt = serde_json::json!({"type": "regex", "value": "\\S"});
-        let wait = serde_json::json!({"pane_id": new_pane, "source": "recent", "match": prompt, "timeout_ms": 5000});
-        let _ = client.call("pane.wait_for_output", wait).await;
-        let text = nvim_command(editor.as_deref().unwrap_or("nvim"), path, line, col);
-        let _ = client.call("pane.send_input", serde_json::json!({"pane_id": new_pane, "text": text, "keys": ["enter"]})).await;
-        return;
+    let target = editor_target(path, line, col);
+    let fallback = || match gui_editor(&target, installed) {
+        Some(argv) => Opener::Gui(argv),
+        None if mac => Opener::Gui(vec![crate::platform::OPEN.into(), path.display().to_string()]),
+        None => Opener::Nothing,
+    };
+    match editor.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(e) if is_nvim(Some(e)) => {
+            if has_pane {
+                Opener::Split(e.to_string())
+            } else {
+                fallback()
+            }
+        }
+        Some(e) => Opener::Gui(editor_argv_with(&e.split_whitespace().map(String::from).collect::<Vec<_>>(), &target, installed)),
+        None if mac => fallback(),
+        None => match (has_pane, installed("nvim"), env_editor.map(str::trim).filter(|e| !e.is_empty())) {
+            (true, Some(_), _) => Opener::Split("nvim".into()),
+            (true, None, Some(e)) => Opener::Split(e.to_string()),
+            _ => fallback(),
+        },
     }
-    // nvim with no pane to open beside: the GUI editors, as with no editor set
-    let argv = editor_argv(if nvim { None } else { editor.as_deref() }, path, line, col);
-    if let Ok(mut child) = tokio::process::Command::new(&argv[0]).args(&argv[1..]).spawn() {
-        let _ = child.wait().await;
+}
+
+/// `open_in_editor`'s work, on the runtime: `pane` is the pane a terminal editor splits and the folder its new pane
+/// starts in. The error is for a toast.
+async fn open_at(client: &Client, editor: Option<String>, path: &Path, line: Option<u32>, col: Option<u32>, pane: Option<(&str, &str)>) -> Result<(), String> {
+    let env_editor = std::env::var("VISUAL").ok().filter(|e| !e.trim().is_empty()).or_else(|| std::env::var("EDITOR").ok());
+    let mac = cfg!(target_os = "macos");
+    match choose_opener(path, path.is_dir(), line, col, editor.as_deref(), env_editor.as_deref(), pane.is_some(), mac, &installed) {
+        Opener::FileManager => crate::platform::launch(&[crate::platform::OPEN.into(), path.into()]).await,
+        Opener::Gui(argv) => crate::platform::launch(&argv.into_iter().map(Into::into).collect::<Vec<_>>()).await,
+        Opener::Nothing => Err("No editor to open it in: set one in Settings, or install nvim or VS Code".into()),
+        Opener::Split(editor) => {
+            let Some((pane_id, cwd)) = pane else { return Err("No pane to open the editor beside".into()) };
+            // A terminal editor gets a pane to the right; its shell drops typeahead until the prompt is drawn.
+            let params = serde_json::json!({"target_pane_id": pane_id, "direction": "right", "focus": true, "cwd": cwd});
+            let r = client.call("pane.split", params).await.map_err(|e| format!("Couldn't open a pane for {editor}: {e:#}"))?;
+            let new_pane = r["pane"]["pane_id"].as_str().ok_or_else(|| format!("Couldn't open a pane for {editor}"))?;
+            let prompt = serde_json::json!({"type": "regex", "value": "\\S"});
+            let wait = serde_json::json!({"pane_id": new_pane, "source": "recent", "match": prompt, "timeout_ms": 5000});
+            let _ = client.call("pane.wait_for_output", wait).await;
+            let text = terminal_command(&editor, path, line, col);
+            let input = serde_json::json!({"pane_id": new_pane, "text": text, "keys": ["enter"]});
+            client.call("pane.send_input", input).await.map_err(|e| format!("{editor}: {e:#}"))?;
+            Ok(())
+        }
     }
 }
 
@@ -1336,31 +1395,60 @@ fn resolve(path: &str, cwd: &Path) -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-/// The command opening `path` at its line: the user's editor, else the first of Zed, Cursor and VS Code installed,
-/// else macOS's default app for the file (which cannot take a line).
-pub fn editor_argv(editor: Option<&str>, path: &Path, line: Option<u32>, col: Option<u32>) -> Vec<String> {
-    let target = match (line, col) {
+/// `path` with its line and column, as editors take it on their command line (`a.rs:3:4`).
+fn editor_target(path: &Path, line: Option<u32>, col: Option<u32>) -> String {
+    match (line, col) {
         (Some(l), Some(c)) => format!("{}:{l}:{c}", path.display()),
         (Some(l), None) => format!("{}:{l}", path.display()),
         _ => path.display().to_string(),
-    };
-    // An app opened from Finder gets launchd's PATH, without the usual homes of these CLIs.
+    }
+}
+
+/// `name` on the PATH, or where Homebrew puts it: an app opened from Finder gets launchd's PATH, without the usual
+/// homes of these CLIs.
+fn installed(name: &str) -> Option<String> {
     let path_env = std::env::var("PATH").unwrap_or_default();
-    let installed = |name: &str| {
-        let dirs = path_env.split(':').chain(["/usr/local/bin", "/opt/homebrew/bin"]);
-        dirs.map(|d| Path::new(d).join(name)).find(|p| p.is_file()).map(|p| p.display().to_string())
-    };
-    if let Some(words) = editor.map(|e| e.split_whitespace().map(String::from).collect::<Vec<_>>()).filter(|w| !w.is_empty()) {
-        let program = if words[0].contains('/') { None } else { installed(&words[0]) };
-        return [vec![program.unwrap_or_else(|| words[0].clone())], words[1..].to_vec(), vec![target]].concat();
-    }
+    let dirs = path_env.split(':').filter(|d| !d.is_empty()).chain(["/usr/local/bin", "/opt/homebrew/bin"]);
+    dirs.map(|d| Path::new(d).join(name)).find(|p| p.is_file()).map(|p| p.display().to_string())
+}
+
+/// The first of Zed, Cursor and VS Code installed, opening `target`.
+fn gui_editor(target: &str, installed: &dyn Fn(&str) -> Option<String>) -> Option<Vec<String>> {
     if let Some(zed) = installed("zed") {
-        return vec![zed, target];
+        return Some(vec![zed, target.into()]);
     }
-    if let Some(code) = installed("cursor").or_else(|| installed("code")) {
-        return vec![code, "-g".into(), target];
+    installed("cursor").or_else(|| installed("code")).map(|code| vec![code, "-g".into(), target.into()])
+}
+
+/// The editor command's words (its program found on the PATH) with `target` last.
+fn editor_argv_with(words: &[String], target: &str, installed: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    let program = if words[0].contains('/') { None } else { installed(&words[0]) };
+    [vec![program.unwrap_or_else(|| words[0].clone())], words[1..].to_vec(), vec![target.into()]].concat()
+}
+
+/// The command opening `path` at its line: the user's editor, else the first of Zed, Cursor and VS Code installed,
+/// else the file's default app (which cannot take a line).
+pub fn editor_argv(editor: Option<&str>, path: &Path, line: Option<u32>, col: Option<u32>) -> Vec<String> {
+    let target = editor_target(path, line, col);
+    if let Some(words) = editor.map(|e| e.split_whitespace().map(String::from).collect::<Vec<_>>()).filter(|w| !w.is_empty()) {
+        return editor_argv_with(&words, &target, &installed);
     }
-    vec!["open".into(), path.display().to_string()]
+    gui_editor(&target, &installed).unwrap_or_else(|| vec![crate::platform::OPEN.into(), path.display().to_string()])
+}
+
+/// The shell line running the terminal editor `editor` on `path` in a new pane: nvim's own, else `+line` for the
+/// editors that take it; `exec`, so quitting the editor closes its pane.
+pub fn terminal_command(editor: &str, path: &Path, line: Option<u32>, col: Option<u32>) -> String {
+    if is_nvim(Some(editor)) {
+        return nvim_command(editor, path, line, col);
+    }
+    let quoted = format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    let program = editor.split_whitespace().next().unwrap_or_default().rsplit('/').next().unwrap_or_default();
+    let jump = match line {
+        Some(l) if matches!(program, "vim" | "vi" | "nano" | "micro" | "emacs") => format!(" +{l}"),
+        _ => String::new(),
+    };
+    format!("exec {editor}{jump} {quoted}")
 }
 
 /// Whether the editor command runs nvim, which opens in a pane instead of its own window.
@@ -1661,6 +1749,35 @@ mod tests {
         assert_eq!(nvim_command("nvim", Path::new("/tmp/a b.rs"), Some(3), Some(4)), "exec nvim '+call cursor(3,4)' '/tmp/a b.rs'");
         assert_eq!(nvim_command("nvim", Path::new("/tmp/it's"), Some(3), None), "exec nvim +3 '/tmp/it'\\''s'");
         assert_eq!(nvim_command("nvim", Path::new("/tmp/a"), None, None), "exec nvim '/tmp/a'");
+    }
+
+    #[test]
+    fn with_no_editor_set_linux_opens_nvim_beside_the_pane() {
+        let (path, has) = (Path::new("/tmp/a.rs"), |names: &'static [&'static str]| move |n: &str| names.contains(&n).then(|| format!("/usr/bin/{n}")));
+        let pick = |editor: Option<&str>, env: Option<&str>, pane: bool, mac: bool, found: &dyn Fn(&str) -> Option<String>| choose_opener(path, false, Some(3), None, editor, env, pane, mac, found);
+        let all = has(&["nvim", "code"]);
+        assert_eq!(pick(None, Some("hx"), true, false, &all), Opener::Split("nvim".into()));
+        // no nvim: $VISUAL/$EDITOR in the split, else VS Code, else nothing (no xdg-open: it runs nvim.desktop
+        // with no terminal)
+        assert_eq!(pick(None, Some("omarchy-launch-editor --inline"), true, false, &has(&["code"])), Opener::Split("omarchy-launch-editor --inline".into()));
+        assert_eq!(pick(None, Some(" "), true, false, &has(&["code"])), Opener::Gui(vec!["/usr/bin/code".into(), "-g".into(), "/tmp/a.rs:3".into()]));
+        assert_eq!(pick(None, None, false, false, &all), Opener::Gui(vec!["/usr/bin/code".into(), "-g".into(), "/tmp/a.rs:3".into()]));
+        assert_eq!(pick(None, Some("vim"), false, false, &has(&[])), Opener::Nothing);
+        // macOS keeps its GUI editors first, then the default app
+        assert_eq!(pick(None, None, true, true, &all), Opener::Gui(vec!["/usr/bin/code".into(), "-g".into(), "/tmp/a.rs:3".into()]));
+        assert_eq!(pick(None, None, true, true, &has(&["nvim"])), Opener::Gui(vec![crate::platform::OPEN.into(), "/tmp/a.rs".into()]));
+        // an editor set is used as before
+        assert_eq!(pick(Some("nvim"), None, true, false, &all), Opener::Split("nvim".into()));
+        assert_eq!(pick(Some("nvim"), None, false, false, &has(&["zed"])), Opener::Gui(vec!["/usr/bin/zed".into(), "/tmp/a.rs:3".into()]));
+        assert_eq!(pick(Some("subl -n"), None, true, false, &has(&["subl"])), Opener::Gui(vec!["/usr/bin/subl".into(), "-n".into(), "/tmp/a.rs:3".into()]));
+        assert_eq!(choose_opener(Path::new("/tmp"), true, None, None, Some("nvim"), None, true, false, &all), Opener::FileManager);
+    }
+
+    #[test]
+    fn terminal_editors_get_the_line_when_they_take_it() {
+        assert_eq!(terminal_command("vim", Path::new("/tmp/a"), Some(3), Some(1)), "exec vim +3 '/tmp/a'");
+        assert_eq!(terminal_command("hx", Path::new("/tmp/a"), Some(3), None), "exec hx '/tmp/a'");
+        assert_eq!(terminal_command("/usr/bin/nvim", Path::new("/tmp/a"), Some(3), None), "exec /usr/bin/nvim +3 '/tmp/a'");
     }
 
     #[test]

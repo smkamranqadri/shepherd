@@ -33,6 +33,46 @@ pub fn reveal_command(path: &std::path::Path) -> (&'static str, Vec<std::ffi::Os
     (OPEN, vec![path.parent().unwrap_or(path).into()])
 }
 
+#[cfg(unix)]
+unsafe extern "C" {
+    fn setsid() -> i32;
+}
+
+/// Starts `argv` on its own, as a launcher would: in a session of its own (no terminal, none of Shepherd's
+/// signals), with no stdin, stdout or stderr of Shepherd's, and not killed when Shepherd or the handle goes. A
+/// program still running after a moment (an app with its window up) is left to run, and tokio reaps it when it
+/// exits; one that has already failed by then (`xdg-open` with no app for the file) or could not start is the error,
+/// in words for a toast. Runs on the tokio runtime.
+pub async fn launch(argv: &[std::ffi::OsString]) -> Result<(), String> {
+    use std::process::Stdio;
+    let Some((program, args)) = argv.split_first() else { return Err("Nothing to run".into()) };
+    let name = std::path::Path::new(program).file_name().unwrap_or(program).to_string_lossy().into_owned();
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe, the only kind of call allowed between fork and exec.
+        unsafe {
+            cmd.as_std_mut().pre_exec(|| if setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
+        }
+    }
+    let mut child = cmd.spawn().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => format!("Couldn't find {name}"),
+        _ => format!("Couldn't start {name}: {e}"),
+    })?;
+    match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => Err(match status.code() {
+            Some(code) => format!("{name} failed (exit {code})"),
+            None => format!("{name} was stopped by a signal"),
+        }),
+        Ok(Err(e)) => Err(format!("{name}: {e}")),
+        // still running: dropping the child leaves it be, and tokio reaps it once it exits
+        Err(_) => Ok(()),
+    }
+}
+
 /// The terminal's own shortcut for `key` (copy, paste, find, find next): Cmd+key on macOS, Ctrl+Shift+key elsewhere
 /// (`terminal::keys::app_shortcut`).
 pub fn terminal_chord(key: &str, mods: &Modifiers) -> Option<&'static str> {
@@ -67,6 +107,28 @@ mod tests {
         assert_eq!(terminal_chord("c", &m(true, true, false)), Some("c"));
         assert_eq!(terminal_chord("c", &m(true, false, false)), None, "Ctrl+C is the shell's");
         assert_eq!(terminal_chord("v", &m(false, false, true)), None, "Super is the desktop's");
+    }
+
+    #[tokio::test]
+    async fn a_launch_says_why_it_failed() {
+        let argv = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert_eq!(launch(&argv(&["/nonexistent/editor", "a"])).await, Err("Couldn't find editor".into()));
+        assert_eq!(launch(&argv(&["sh", "-c", "exit 3"])).await, Err("sh failed (exit 3)".into()));
+        assert_eq!(launch(&argv(&["true"])).await, Ok(()));
+        assert!(launch(&[]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_launched_program_has_a_session_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("ids");
+        // setsid makes it the leader of a new session and group: its group's id is its pid (macOS's `ps` has no
+        // session id to show)
+        let script = format!("echo $$ $(ps -o pgid= -p $$) > '{}'", out.display());
+        launch(&["sh".into(), "-c".into(), script.into()]).await.unwrap();
+        let ids: Vec<i32> = std::fs::read_to_string(&out).unwrap().split_whitespace().map(|w| w.parse().unwrap()).collect();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], ids[1]);
     }
 
     #[test]
