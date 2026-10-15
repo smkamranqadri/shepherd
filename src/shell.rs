@@ -436,6 +436,15 @@ impl Shell {
                     crate::ui::side_panel::SidePanelEvent::UsePaneFolder => s.use_pane_folder(window, cx),
                     crate::ui::side_panel::SidePanelEvent::OpenFile { path, line, preview } => s.open_file(path.clone(), *line, *preview, window, cx),
                     crate::ui::side_panel::SidePanelEvent::OpenInEditor(path) => s.open_in_editor_from_panel(path.clone(), window, cx),
+                    // TODO(C2): a change opens its diff tab; until then its file as the working tree has it, and one
+                    // the tree lacks (or a submodule's or nested repository's folder) has nothing to show
+                    crate::ui::side_panel::SidePanelEvent::OpenChange { path, change, preview } => {
+                        if change.openable() {
+                            s.open_file(path.clone(), None, *preview, window, cx);
+                        }
+                    }
+                    // the badge is in the Shell's tab strip
+                    crate::ui::side_panel::SidePanelEvent::ChangesCounted => cx.notify(),
                 })
                 .detach();
                 let mut shell = Shell {
@@ -1557,7 +1566,12 @@ impl Render for Shell {
         }
         let files_shown = side_shown && self.shown_panel_tab() == crate::settings::PanelTab::Files;
         let active = window.is_window_active();
-        self.side_panel.update(cx, |p, cx| p.set_files_shown(files_shown, active, cx));
+        let changes_shown = side_shown && self.shown_panel_tab() == crate::settings::PanelTab::Changes;
+        let panel_shown = self.panel_open && !on_page;
+        self.side_panel.update(cx, |p, cx| {
+            p.set_files_shown(files_shown, active, cx);
+            p.set_changes_shown(panel_shown, changes_shown, active, cx);
+        });
         if !(pr_shown && !on_page) && !viewer_markdown {
             // a hidden panel's selection is not Cmd+C's to copy
             crate::ui::markdown::forget();

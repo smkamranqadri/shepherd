@@ -436,11 +436,32 @@ impl Shell {
         });
 
         let has_pr = self.panel_has_pr;
+        // the Changes tab's count, once git said: a pill on its icon (the side panel tells the Shell when it changes)
+        let changes = self.side_panel.read(cx).changes_count().filter(|&n| n > 0);
         let tabs: Vec<_> = PanelTab::ALL.into_iter().filter(|t| *t != PanelTab::Pr || has_pr).map(|t| {
             let on = t == tab;
             let hover = theme.hover;
+            let badge = changes.filter(|_| t == PanelTab::Changes).map(|n| {
+                div()
+                    .absolute()
+                    .top(px(-1.))
+                    .right(px(-3.))
+                    .h(px(13.))
+                    .min_w(px(13.))
+                    .px(px(3.))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(theme.accent)
+                    .text_size(px(8.5))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.surface)
+                    .child(if n > 99 { "99+".to_string() } else { n.to_string() })
+            });
             div()
                 .id(SharedString::from(format!("panel-tab-{}", t.label())))
+                .relative()
                 .size(px(26.))
                 .flex()
                 .flex_none()
@@ -453,6 +474,7 @@ impl Shell {
                 .when(!on, |el| el.hover(move |s| s.bg(hover)))
                 .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
                 .child(gpui::svg().path(t.icon()).size(px(15.)).text_color(if on { theme.text } else { theme.text_muted }))
+                .children(badge)
                 .tooltip(tip(t.label(), Some(t.action())))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.pick_panel_tab(t, cx)))
         }).collect();

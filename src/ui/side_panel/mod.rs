@@ -1,6 +1,7 @@
 //! The right panel's Files, Changes and Search tabs: one entity beside the Shell, which keeps the panel's frame (its
 //! tab strip, edge and width) and the PR tab. It holds what those tabs show and the work that fills them, so a
 //! keystroke in Search re-renders the panel, not the window.
+mod changes;
 mod files;
 
 use crate::settings::PanelTab;
@@ -42,6 +43,12 @@ pub enum SidePanelEvent {
     /// Cmd+Enter (Ctrl+Enter on Linux) on a file, or its menu's "Open in editor": the Shell opens it in the editor,
     /// beside the focused pane.
     OpenInEditor(std::path::PathBuf),
+    /// A change clicked in the Changes tab, or its menu's "Open file": `path` is its file in the root. The Shell
+    /// opens the file as it is in the working tree (nothing for one the tree lacks, or a folder) until C2 gives
+    /// changes diff tabs. `preview` as `OpenFile`'s: a single click's tab is replaced by the next.
+    OpenChange { path: std::path::PathBuf, change: crate::files::status::Change, preview: bool },
+    /// The Changes tab's count (its badge, which the Shell draws in the tab strip) changed: the Shell redraws.
+    ChangesCounted,
 }
 
 pub struct SidePanel {
@@ -55,19 +62,46 @@ pub struct SidePanel {
     file_menu: Option<crate::ui::Popup<files::FileMenu>>,
     /// The Files tab is on screen in the active window: its open folders are polled.
     files_live: bool,
+    /// The Changes tab's list of the context's root, while it has a local one.
+    changes: Option<changes::ChangeList>,
+    change_menu: Option<crate::ui::Popup<changes::ChangeMenu>>,
+    /// The panel is open in the active window: git is asked every `POLL`, for the list and the tab's badge.
+    changes_live: bool,
+    /// The Changes tab itself is in view (not just its badge): the list is asked at the tab's pace, and its coming
+    /// into view lifts a halt.
+    changes_tab_shown: bool,
+    /// The Changes tab's folded groups, kept across roots as VS Code keeps them across repositories.
+    changes_folded: std::collections::HashSet<crate::files::status::Group>,
 }
 
 impl SidePanel {
     pub fn new(rt: Handle, tab: PanelTab, cx: &mut Context<Self>) -> SidePanel {
-        // the poll's clock: a tick does nothing unless the Files tab is live
+        // the polls' clock: a tick does nothing for a tab that is not live
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(files::POLL).await;
-            if this.update(cx, |p, cx| p.poll_files(cx)).is_err() {
+            let polled = this.update(cx, |p, cx| {
+                p.poll_files(cx);
+                p.poll_changes(cx);
+            });
+            if polled.is_err() {
                 return;
             }
         })
         .detach();
-        SidePanel { focus: cx.focus_handle(), rt, tab, context: PanelContext::default(), files: None, file_menu: None, files_live: false }
+        SidePanel {
+            focus: cx.focus_handle(),
+            rt,
+            tab,
+            context: PanelContext::default(),
+            files: None,
+            file_menu: None,
+            files_live: false,
+            changes: None,
+            change_menu: None,
+            changes_live: false,
+            changes_tab_shown: false,
+            changes_folded: Default::default(),
+        }
     }
 
     /// Takes the Shell's view of things; called every render, so it notifies only on a change.
@@ -75,6 +109,7 @@ impl SidePanel {
         if self.context != context {
             self.context = context;
             self.sync_files(cx);
+            self.sync_changes(cx);
             cx.notify();
         }
     }
@@ -155,10 +190,12 @@ impl Render for SidePanel {
                 .into_any_element()
         } else if self.tab == PanelTab::Files {
             self.render_files(theme, window, cx)
+        } else if self.tab == PanelTab::Changes {
+            self.render_changes(theme, window, cx)
         } else {
             let (title, hint) = match self.tab {
                 PanelTab::Files => ("Files", ""),
-                PanelTab::Changes => ("Changes", "The workspace's git changes will be listed here."),
+                PanelTab::Changes => ("Changes", ""),
                 PanelTab::Search => ("Search", "Search across the workspace's folder will be here."),
                 // the Shell draws the PR tab itself
                 PanelTab::Pr => ("Pull request", ""),
