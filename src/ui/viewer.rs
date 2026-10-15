@@ -600,6 +600,7 @@ impl FileViewer {
             .child(gpui::img(icon).size(px(16.)).flex_none().object_fit(gpui::ObjectFit::Contain))
             .child(div().min_w_0().truncate().text_color(theme.text).child(self.shown_path()))
             .when(self.is_text() && self.text.crlf, |el| el.child(tag("CRLF")))
+            .when(self.is_text() && !self.text.crlf && self.text.ending == crate::files::save::LineEnding::Cr, |el| el.child(tag("CR")))
             .when(self.is_text(), |el| el.child(tag("Read only")))
             .child(div().flex_1())
             .children(toggle)
@@ -664,6 +665,7 @@ impl FileViewer {
             Content::Image(w, h) => image(*w as f32 / window.scale_factor(), *h as f32 / window.scale_factor()),
             Content::Svg(w, h) => image(*w as f32, *h as f32),
             Content::Binary => self.notice(theme, "This file is binary", "The viewer shows text and images.", true, cx),
+            Content::NotUtf8 => self.notice(theme, "This file is not UTF-8 text", "The viewer shows UTF-8 text; an editor may read its encoding.", true, cx),
             Content::TooLarge(size) => {
                 let hint = format!("It is {}; the viewer shows text up to {} and images up to {}.", content::human_size(*size), content::human_size(MAX_TEXT), content::human_size(content::MAX_IMAGE));
                 self.notice(theme, "This file is too large to show", hint, true, cx)

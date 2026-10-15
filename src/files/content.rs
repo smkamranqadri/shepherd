@@ -30,6 +30,8 @@ pub enum FileKind {
     /// Shown by a placeholder until the viewer draws PDFs itself (M4b), never handed to an outside app.
     Pdf,
     Binary,
+    /// Text in another encoding (no NUL, but not UTF-8): Latin-1, UTF-16 without NULs in its head, …
+    NotUtf8,
     /// Its size in bytes: over `MAX_TEXT` for text, `MAX_IMAGE` for an image or a PDF.
     TooLarge(u64),
 }
@@ -50,8 +52,8 @@ pub fn is_markdown(path: &Path) -> bool {
 }
 
 /// What `path` is, from its `size` and the first bytes read of it (`head`, up to 8 KiB): an image or a PDF by its
-/// name, else
-/// binary when its head has a NUL or is not UTF-8 (a character cut at the end of the head is fine), else text.
+/// name, else binary when its head has a NUL, else not UTF-8 when it is not (a character cut at the end of the head
+/// is fine), else text.
 pub fn kind_of(path: &Path, head: &[u8], size: u64) -> FileKind {
     if is_image(path) {
         return if size > MAX_IMAGE { FileKind::TooLarge(size) } else { FileKind::Image };
@@ -65,8 +67,11 @@ pub fn kind_of(path: &Path, head: &[u8], size: u64) -> FileKind {
         // `error_len() == None`: the head stops inside a character
         Err(e) => e.error_len().is_none(),
     };
-    if head.contains(&0) || !utf8 {
+    if head.contains(&0) {
         return FileKind::Binary;
+    }
+    if !utf8 {
+        return FileKind::NotUtf8;
     }
     if size > MAX_TEXT {
         FileKind::TooLarge(size)
@@ -107,14 +112,12 @@ impl Text {
         self.starts.is_empty()
     }
 
-    /// Line `ix`, without its line end (`\n` or `\r\n`); empty past the last.
+    /// Line `ix`, without its line end (`\n`, `\r\n` or `\r`); empty past the last.
     pub fn line(&self, ix: usize) -> &str {
         let Some(&start) = self.starts.get(ix) else { return "" };
-        let end = match self.starts.get(ix + 1) {
-            Some(&next) => next as usize - 1,
-            None => self.text.len() - usize::from(self.text.ends_with('\n')),
-        };
-        let line = &self.text[start as usize..end.max(start as usize)];
+        let end = self.starts.get(ix + 1).map_or(self.text.len(), |&next| next as usize);
+        let line = &self.text[start as usize..end];
+        let line = line.strip_suffix('\n').unwrap_or(line);
         line.strip_suffix('\r').unwrap_or(line)
     }
 
@@ -123,12 +126,14 @@ impl Text {
     }
 }
 
-/// `bytes` as UTF-8 text; `None` when they are not UTF-8.
+/// `bytes` as UTF-8 text; `None` when they are not UTF-8. A line ends at `\n`, `\r\n` or a `\r` alone (a classic
+/// Mac file's, as editors take it).
 pub fn decode(bytes: &[u8]) -> Option<Text> {
     let bom = bytes.starts_with(b"\xEF\xBB\xBF");
     let text = std::str::from_utf8(if bom { &bytes[3..] } else { bytes }).ok()?.to_string();
+    let b = text.as_bytes();
     let mut starts = vec![0u32];
-    starts.extend(text.bytes().enumerate().filter(|(i, b)| *b == b'\n' && i + 1 < text.len()).map(|(i, _)| i as u32 + 1));
+    starts.extend((0..b.len()).filter(|&i| i + 1 < b.len() && (b[i] == b'\n' || (b[i] == b'\r' && b[i + 1] != b'\n'))).map(|i| i as u32 + 1));
     let crlf = text.contains("\r\n");
     let format = super::save::line_format(text.as_bytes());
     Some(Text { text, starts, crlf, bom, ending: format.ending, final_newline: format.final_newline, mixed: format.mixed })
@@ -146,6 +151,8 @@ pub enum Content {
     /// A PDF within `MAX_IMAGE`; only its head was read.
     Pdf,
     Binary,
+    /// Text that is not UTF-8 (no NUL in it): the viewer does not guess encodings.
+    NotUtf8,
     TooLarge(u64),
     /// An image whose pixels are over `MAX_PIXELS` or a side over `MAX_SIDE`.
     TooManyPixels(u32, u32),
@@ -190,6 +197,7 @@ pub fn load(path: &Path) -> Content {
     }
     match kind_of(path, &head, meta.len()) {
         FileKind::Binary => Content::Binary,
+        FileKind::NotUtf8 => Content::NotUtf8,
         FileKind::Pdf => Content::Pdf,
         FileKind::TooLarge(n) => Content::TooLarge(n),
         FileKind::Image if is_svg(path) => {
@@ -229,7 +237,9 @@ pub fn load(path: &Path) -> Content {
                 Some(text) if text.len() > MAX_LINES => Content::TooManyLines(text.len()),
                 Some(text) if kind == FileKind::Markdown => Content::Markdown(text),
                 Some(text) => Content::Text(text),
-                None => Content::Binary,
+                // past the head: a NUL says binary, else another encoding
+                None if bytes.contains(&0) => Content::Binary,
+                None => Content::NotUtf8,
             }
         }
     }
@@ -395,7 +405,9 @@ mod tests {
         let rs = PathBuf::from("a.rs");
         assert_eq!(kind_of(&rs, b"fn main() {}", 12), FileKind::Text);
         assert_eq!(kind_of(&rs, b"ab\0cd", 5), FileKind::Binary);
-        assert_eq!(kind_of(&rs, b"\xff\xfe", 2), FileKind::Binary);
+        assert_eq!(kind_of(&rs, b"\xff\xfe", 2), FileKind::NotUtf8);
+        assert_eq!(kind_of(&rs, b"caf\xe9 cr\xe8me", 11), FileKind::NotUtf8, "Latin-1");
+        assert_eq!(kind_of(&rs, b"\xe9\0", 2), FileKind::Binary, "a NUL wins");
         // a character the head cut in two is still text
         assert_eq!(kind_of(&rs, "aé".as_bytes().split_at(2).0, 3), FileKind::Text);
         assert_eq!(kind_of(&rs, b"x", MAX_TEXT), FileKind::Text);
@@ -424,6 +436,38 @@ mod tests {
         assert_eq!(lines(&decode(b"").unwrap()), [""]);
         assert_eq!(decode(b"x\ny").unwrap().line(7), "");
         assert!(decode(b"\xff").is_none());
+    }
+
+    #[test]
+    fn a_cr_alone_ends_a_line_too() {
+        let lines = |b: &[u8]| decode(b).unwrap().lines().map(String::from).collect::<Vec<_>>();
+        assert_eq!(lines(b"one\rtwo\rthree\r"), ["one", "two", "three"], "a classic Mac file");
+        assert_eq!(lines(b"a\r\rb"), ["a", "", "b"]);
+        assert_eq!(lines(b"a\r\nb\rc\nd"), ["a", "b", "c", "d"], "mixed");
+        assert_eq!(lines(b"a\r\r\n"), ["a", ""]);
+        assert_eq!(lines(b"\r"), [""]);
+        let t = decode(b"one\rtwo").unwrap();
+        assert_eq!((t.len(), t.line(1), t.crlf), (2, "two", false));
+    }
+
+    #[test]
+    fn text_in_another_encoding_is_not_called_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("latin1.txt");
+        std::fs::write(&path, b"caf\xe9\n").unwrap();
+        assert_eq!(load(&path), Content::NotUtf8);
+        // UTF-8 in the head, Latin-1 past it
+        let mut late = vec![b'a'; HEAD + 10];
+        late.push(0xE9);
+        std::fs::write(&path, &late).unwrap();
+        assert_eq!(load(&path), Content::NotUtf8);
+        late.push(0);
+        std::fs::write(&path, &late).unwrap();
+        assert_eq!(load(&path), Content::Binary);
+        let mac = dir.path().join("mac.txt");
+        std::fs::write(&mac, b"one\rtwo\r").unwrap();
+        let Content::Text(text) = load(&mac) else { panic!() };
+        assert_eq!(text.len(), 2);
     }
 
     #[test]
