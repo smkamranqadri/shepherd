@@ -684,6 +684,19 @@ impl Shell {
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.new_tab(ws.clone(), cx))),
                 )
             })
+            // The right panel's toggle, at the titlebar's right end (the left one's mirror): the bar ends where the
+            // panel begins, so it sits beside the panel's header when open and in the corner when closed.
+            .child(
+                titlebar_button(theme, "toggle-right-panel", "icons/sidebar-minimalistic-right.svg")
+                    .flex_none()
+                    .ml(px(2.))
+                    .when(self.panel_open, |el| el.bg(theme.selected))
+                    .tooltip(tip("Toggle right panel", Some("ToggleReview")))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.toggle_review(window, cx);
+                    })),
+            )
     }
 }
 
