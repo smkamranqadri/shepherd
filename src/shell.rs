@@ -1051,6 +1051,15 @@ impl Shell {
         self.show_herdr_tab(tab, false, cx);
     }
 
+    /// Workspace1–9: the shown place's `index`th workspace in sidebar order (worktrees under their repo, folded or
+    /// not), as it was left, a file tab it showed included.
+    fn go_to_workspace(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.snapshot.as_ref() else { return };
+        let Some((w, _)) = snapshot.workspace_tree().into_iter().nth(index) else { return };
+        let tab = w.active_tab_id.clone().or_else(|| snapshot.tabs_of(&w.workspace_id).first().map(|t| t.tab_id.clone()));
+        self.show_herdr_tab(tab, false, cx);
+    }
+
     fn new_tab(&mut self, workspace_id: String, cx: &mut Context<Self>) {
         self.send(Command::NewTab { workspace_id }, cx, |shell, result, cx| {
             shell.show_herdr_tab(crate::commands::created_tab_id(result), true, cx);
@@ -1646,6 +1655,15 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &PreviousSession, _, cx| this.step_place(false, cx)))
             .on_action(cx.listener(|this, _: &NextSession, _, cx| this.step_place(true, cx)))
             .on_action(cx.listener(|this, _: &SwitchSession, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Places, w, cx)))
+            .on_action(cx.listener(|this, _: &Workspace1, _, cx| this.go_to_workspace(0, cx)))
+            .on_action(cx.listener(|this, _: &Workspace2, _, cx| this.go_to_workspace(1, cx)))
+            .on_action(cx.listener(|this, _: &Workspace3, _, cx| this.go_to_workspace(2, cx)))
+            .on_action(cx.listener(|this, _: &Workspace4, _, cx| this.go_to_workspace(3, cx)))
+            .on_action(cx.listener(|this, _: &Workspace5, _, cx| this.go_to_workspace(4, cx)))
+            .on_action(cx.listener(|this, _: &Workspace6, _, cx| this.go_to_workspace(5, cx)))
+            .on_action(cx.listener(|this, _: &Workspace7, _, cx| this.go_to_workspace(6, cx)))
+            .on_action(cx.listener(|this, _: &Workspace8, _, cx| this.go_to_workspace(7, cx)))
+            .on_action(cx.listener(|this, _: &Workspace9, _, cx| this.go_to_workspace(8, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &ToggleReview, w, cx| this.toggle_review(w, cx)))
             .on_action(cx.listener(|this, _: &ShowFiles, w, cx| this.show_panel_tab(crate::settings::PanelTab::Files, w, cx)))

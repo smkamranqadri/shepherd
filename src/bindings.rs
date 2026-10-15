@@ -46,6 +46,15 @@ app_actions! {
     PreviousSession: "Previous session",
     NextSession: "Next session",
     SwitchSession: "Switch session",
+    Workspace1: "Go to workspace 1",
+    Workspace2: "Go to workspace 2",
+    Workspace3: "Go to workspace 3",
+    Workspace4: "Go to workspace 4",
+    Workspace5: "Go to workspace 5",
+    Workspace6: "Go to workspace 6",
+    Workspace7: "Go to workspace 7",
+    Workspace8: "Go to workspace 8",
+    Workspace9: "Go to workspace 9",
     ToggleSidebar: "Toggle sidebar",
     ToggleReview: "Toggle right panel",
     ShowFiles: "Files",
@@ -99,6 +108,16 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // the sessions and machines of the sidebar's bar; Cmd+Opt+Up/Down is taken, by focus up and down
     ("PreviousSession", "ctrl-cmd-up"),
     ("NextSession", "ctrl-cmd-down"),
+    // Ctrl, not Cmd+Shift: Cmd+Shift+3, 4 and 5 are macOS's screenshots
+    ("Workspace1", "ctrl-1"),
+    ("Workspace2", "ctrl-2"),
+    ("Workspace3", "ctrl-3"),
+    ("Workspace4", "ctrl-4"),
+    ("Workspace5", "ctrl-5"),
+    ("Workspace6", "ctrl-6"),
+    ("Workspace7", "ctrl-7"),
+    ("Workspace8", "ctrl-8"),
+    ("Workspace9", "ctrl-9"),
     ("ToggleSidebar", "cmd-b"),
     ("ToggleReview", "cmd-alt-b"),
     ("ShowFiles", "cmd-shift-e"),
@@ -153,6 +172,17 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // the sessions and machines of the sidebar's bar: the workspace chords with Alt
     ("PreviousSession", "ctrl-shift-alt-pageup"),
     ("NextSession", "ctrl-shift-alt-pagedown"),
+    // Ctrl+Shift+1…9 as GPUI hears them on Linux: xkb gives the shifted symbol (US layout) and GPUI drops the Shift
+    // of a key that has no case, so `ctrl-shift-1` would never match (`shifted_digit` shows them as typed).
+    ("Workspace1", "ctrl-!"),
+    ("Workspace2", "ctrl-@"),
+    ("Workspace3", "ctrl-#"),
+    ("Workspace4", "ctrl-$"),
+    ("Workspace5", "ctrl-%"),
+    ("Workspace6", "ctrl-^"),
+    ("Workspace7", "ctrl-&"),
+    ("Workspace8", "ctrl-*"),
+    ("Workspace9", "ctrl-("),
     ("ToggleSidebar", "ctrl-shift-b"),
     ("ToggleReview", "ctrl-alt-b"),
     // the right panel's chords take Ctrl+Alt, as its toggle does: Ctrl+Shift+E splits down, Ctrl+Shift+F and G are
@@ -173,6 +203,25 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // Ctrl+Shift+/ as a US layout reports it: the shifted key, without shift. Ctrl+/ stays the terminal's.
     ("ShowShortcuts", "ctrl-?"),
 ];
+
+/// The Tab1–9 actions, in order: `TAB_ACTIONS[i]` goes to the strip's `i`th tab.
+pub const TAB_ACTIONS: [&str; 9] = ["Tab1", "Tab2", "Tab3", "Tab4", "Tab5", "Tab6", "Tab7", "Tab8", "Tab9"];
+
+/// The Workspace1–9 actions, in order: `WORKSPACE_ACTIONS[i]` goes to the sidebar's `i`th workspace.
+pub const WORKSPACE_ACTIONS: [&str; 9] =
+    ["Workspace1", "Workspace2", "Workspace3", "Workspace4", "Workspace5", "Workspace6", "Workspace7", "Workspace8", "Workspace9"];
+
+/// The digit a US layout types `key` with Shift: Linux hears Ctrl+Shift+1 as `ctrl-!` (see the defaults), which
+/// reads better as the keys pressed.
+pub fn shifted_digit(key: &str) -> Option<char> {
+    let at = ["!", "@", "#", "$", "%", "^", "&", "*", "(", ")"].iter().position(|k| *k == key)?;
+    char::from_digit((at as u32 + 1) % 10, 10)
+}
+
+/// The chord bound to `action` now, if any.
+pub fn chord_of(cx: &App, action: &str) -> Option<String> {
+    cx.try_global::<ActiveBindings>()?.0.iter().find(|(a, _)| a == action).map(|(_, k)| k.clone())
+}
 
 fn known(action: &str) -> bool {
     ACTIONS.iter().any(|(name, _)| *name == action)
@@ -293,6 +342,17 @@ fn menus(secure_input: bool) -> Vec<gpui::Menu> {
             I::action("Previous Session", PreviousSession),
             I::action("Next Session", NextSession),
             I::action("Switch Session…", SwitchSession),
+            I::submenu(Menu::new("Go to Workspace").items([
+                I::action("Workspace 1", Workspace1),
+                I::action("Workspace 2", Workspace2),
+                I::action("Workspace 3", Workspace3),
+                I::action("Workspace 4", Workspace4),
+                I::action("Workspace 5", Workspace5),
+                I::action("Workspace 6", Workspace6),
+                I::action("Workspace 7", Workspace7),
+                I::action("Workspace 8", Workspace8),
+                I::action("Workspace 9", Workspace9),
+            ])),
             I::separator(),
             I::action("Focus Pane Left", FocusLeft),
             I::action("Focus Pane Right", FocusRight),
@@ -402,6 +462,75 @@ mod tests {
             assert!(!eff.iter().any(|(_, k)| *k == taken), "ctrl-{key} is readline's");
         }
         assert_eq!(chord(&eff, "QuickOpen"), normalize("ctrl-alt-p").as_deref());
+    }
+
+    /// Whether a keystroke typed as GPUI's Linux backend reports it (`keystroke_from_xkb`) fires `chord`.
+    #[cfg(not(target_os = "macos"))]
+    fn fires(typed: gpui::Keystroke, chord: &str) -> bool {
+        let target = gpui::KeybindingKeystroke::from_keystroke(gpui::Keystroke::parse(chord).unwrap());
+        typed.should_match(&target)
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn linux_workspaces_are_ctrl_shift_digits_as_xkb_types_them() {
+        let eff = effective(&user(&[]));
+        assert_eq!(chord(&eff, "PreviousWorkspace"), normalize("ctrl-shift-pageup").as_deref());
+        assert_eq!(chord(&eff, "NextWorkspace"), normalize("ctrl-shift-pagedown").as_deref());
+        for (i, action) in WORKSPACE_ACTIONS.iter().enumerate() {
+            let bound = chord(&eff, action).unwrap_or_else(|| panic!("{action} is bound"));
+            let key = Keystroke::parse(bound).unwrap().key;
+            assert_eq!(shifted_digit(&key), char::from_digit(i as u32 + 1, 10), "{action} is Ctrl+Shift+{}", i + 1);
+            // Ctrl+Shift+digit on a US layout: xkb's shifted symbol, and no Shift (GPUI drops it on a caseless key)
+            let typed = gpui::Keystroke { modifiers: gpui::Modifiers::control(), key: key.clone(), key_char: Some(key.clone()) };
+            assert!(fires(typed.clone(), bound), "{action}");
+            assert!(!fires(typed, &format!("ctrl-shift-{}", i + 1)), "GPUI never hears ctrl-shift-{} on Linux", i + 1);
+        }
+        let alt_1 = gpui::Keystroke { modifiers: gpui::Modifiers::alt(), key: "1".into(), key_char: Some("1".into()) };
+        assert!(fires(alt_1.clone(), chord(&eff, "Tab1").unwrap()));
+        assert!(!fires(alt_1, chord(&eff, "Workspace1").unwrap()), "Alt+1 is a tab, not a workspace");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn linux_defaults_leave_word_moves_their_ctrl_arrows() {
+        let eff = effective(&user(&[]));
+        for key in ["ctrl-up", "ctrl-down", "ctrl-left", "ctrl-right"] {
+            let taken = normalize(key).unwrap();
+            assert!(!eff.iter().any(|(_, k)| *k == taken), "{key} is the terminal's");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_workspaces_are_ctrl_digits_off_the_screenshot_chords() {
+        let eff = effective(&user(&[]));
+        assert_eq!(chord(&eff, "PreviousWorkspace"), normalize("cmd-shift-up").as_deref());
+        assert_eq!(chord(&eff, "NextWorkspace"), normalize("cmd-shift-down").as_deref());
+        for (i, action) in WORKSPACE_ACTIONS.iter().enumerate() {
+            assert_eq!(chord(&eff, action), normalize(&format!("ctrl-{}", i + 1)).as_deref(), "{action}");
+        }
+        for key in ["3", "4", "5"] {
+            let shot = normalize(&format!("cmd-shift-{key}")).unwrap();
+            assert!(!eff.iter().any(|(_, k)| *k == shot), "cmd-shift-{key} is a screenshot");
+        }
+    }
+
+    #[test]
+    fn every_numbered_action_has_a_default() {
+        for action in TAB_ACTIONS.iter().chain(&WORKSPACE_ACTIONS) {
+            assert!(known(action), "{action}");
+            assert!(DEFAULTS.iter().any(|(a, _)| a == action), "{action} has a default");
+        }
+    }
+
+    #[test]
+    fn shifted_digits_read_as_their_digit() {
+        assert_eq!(shifted_digit("!"), Some('1'));
+        assert_eq!(shifted_digit("("), Some('9'));
+        assert_eq!(shifted_digit(")"), Some('0'));
+        assert_eq!(shifted_digit("1"), None);
+        assert_eq!(shifted_digit("{"), None);
     }
 
     #[test]

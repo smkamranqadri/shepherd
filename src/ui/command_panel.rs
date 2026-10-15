@@ -643,8 +643,11 @@ pub(crate) fn glyphs(keystroke: &str) -> String {
         return crate::ui::settings::display_chord(keystroke);
     }
     let Ok(k) = Keystroke::parse(keystroke) else { return keystroke.to_string() };
-    let m = k.modifiers;
+    let mut m = k.modifiers;
+    let digit = crate::bindings::shifted_digit(&k.key);
+    m.shift |= digit.is_some();
     let key = match k.key.as_str() {
+        _ if digit.is_some() => digit.map(String::from).unwrap_or_default(),
         "left" => "←".into(),
         "right" => "→".into(),
         "up" => "↑".into(),

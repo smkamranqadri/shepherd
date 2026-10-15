@@ -917,10 +917,13 @@ fn field(theme: &Theme, input: &Entity<InputState>) -> Div {
 /// A chord as Zeron shows it: `cmd-shift-t` → `Cmd+Shift+T`.
 pub(crate) fn display_chord(chord: &str) -> String {
     let Ok(k) = Keystroke::parse(chord) else { return chord.to_string() };
-    let m = k.modifiers;
-    let key = match k.key.as_str() {
-        key if key.chars().count() == 1 => key.to_uppercase(),
-        key => key[..1].to_uppercase() + &key[1..],
+    let mut m = k.modifiers;
+    let digit = crate::bindings::shifted_digit(&k.key);
+    m.shift |= digit.is_some();
+    let key = match (digit, k.key.as_str()) {
+        (Some(digit), _) => digit.to_string(),
+        (None, key) if key.chars().count() == 1 => key.to_uppercase(),
+        (None, key) => key[..1].to_uppercase() + &key[1..],
     };
     let (alt, platform) = if cfg!(target_os = "macos") { ("Opt", "Cmd") } else { ("Alt", "Super") };
     [(m.control, "Ctrl"), (m.alt, alt), (m.shift, "Shift"), (m.platform, platform), (m.function, "Fn")]
@@ -1523,5 +1526,9 @@ mod tests {
     fn chords_read_in_words() {
         assert_eq!(display_chord("ctrl-shift-t"), "Ctrl+Shift+T");
         assert_eq!(display_chord("ctrl-alt-space"), "Ctrl+Alt+Space");
+        assert_eq!(display_chord("super-,"), "Super+,");
+        // Linux hears Ctrl+Shift+1 as ctrl-! (US layout): it reads as pressed
+        assert_eq!(display_chord("ctrl-!"), "Ctrl+Shift+1");
+        assert_eq!(display_chord("ctrl-("), "Ctrl+Shift+9");
     }
 }
