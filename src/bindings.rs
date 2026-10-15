@@ -47,7 +47,14 @@ app_actions! {
     NextSession: "Next session",
     SwitchSession: "Switch session",
     ToggleSidebar: "Toggle sidebar",
-    ToggleReview: "Toggle pull request panel",
+    ToggleReview: "Toggle right panel",
+    ShowFiles: "Files",
+    ShowChanges: "Changes",
+    ShowSearch: "Search in files",
+    ShowPullRequest: "Pull request",
+    QuickOpen: "Go to file",
+    RevealActiveFile: "Reveal file in sidebar",
+    ChooseRoot: "Choose sidebar folder",
     FontSizeUp: "Bigger text",
     FontSizeDown: "Smaller text",
     FontSizeReset: "Default text size",
@@ -92,6 +99,12 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("NextSession", "ctrl-cmd-down"),
     ("ToggleSidebar", "cmd-b"),
     ("ToggleReview", "cmd-alt-b"),
+    ("ShowFiles", "cmd-shift-e"),
+    // Ctrl, not Cmd: Cmd+Shift+G is a pane's find previous. Terminals get Ctrl+Shift+G in the legacy encoding as
+    // Ctrl+G (BEL), which this takes from them; rebind it in Keys settings if a TUI wants it.
+    ("ShowChanges", "ctrl-shift-g"),
+    ("ShowSearch", "cmd-shift-f"),
+    ("QuickOpen", "cmd-p"),
     ("FontSizeUp", "cmd-="),
     ("FontSizeUp", "cmd-+"),
     ("FontSizeDown", "cmd--"),
@@ -137,6 +150,13 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("NextSession", "ctrl-shift-alt-pagedown"),
     ("ToggleSidebar", "ctrl-shift-b"),
     ("ToggleReview", "ctrl-alt-b"),
+    // the right panel's chords take Ctrl+Alt, as its toggle does: Ctrl+Shift+E splits down, Ctrl+Shift+F and G are
+    // the terminal's find, and Ctrl+letter is the shell's
+    ("ShowFiles", "ctrl-alt-e"),
+    ("ShowChanges", "ctrl-alt-g"),
+    ("ShowSearch", "ctrl-alt-f"),
+    // not Ctrl+P: readline's previous line
+    ("QuickOpen", "ctrl-alt-p"),
     ("FontSizeUp", "ctrl-="),
     ("FontSizeUp", "ctrl-+"),
     ("FontSizeDown", "ctrl--"),
@@ -242,8 +262,13 @@ fn menus(secure_input: bool) -> Vec<gpui::Menu> {
         ]),
         Menu::new("View").items([
             I::action("Toggle Sidebar", ToggleSidebar),
-            I::action("Toggle Pull Request Panel", ToggleReview),
+            I::action("Toggle Right Panel", ToggleReview),
             I::action("Zoom Pane", ToggleZoom),
+            I::separator(),
+            I::action("Files", ShowFiles),
+            I::action("Changes", ShowChanges),
+            I::action("Search in Files", ShowSearch),
+            I::action("Go to File", QuickOpen),
             I::separator(),
             I::action("Command Panel", CommandPanel),
             I::action("Agents", AgentsPanel),
@@ -346,6 +371,37 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn linux_defaults_leave_the_terminal_its_chords() {
+        let eff = effective(&user(&[]));
+        for key in ["c", "v", "f", "g"] {
+            let taken = normalize(&format!("ctrl-shift-{key}")).unwrap();
+            assert!(!eff.iter().any(|(_, k)| *k == taken), "ctrl-shift-{key} is the terminal's");
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn linux_defaults_leave_readline_its_ctrl_letters() {
+        let eff = effective(&user(&[]));
+        for key in ["p", "n", "r", "e", "a", "f", "u", "y", "l"] {
+            let taken = normalize(&format!("ctrl-{key}")).unwrap();
+            assert!(!eff.iter().any(|(_, k)| *k == taken), "ctrl-{key} is readline's");
+        }
+        assert_eq!(chord(&eff, "QuickOpen"), normalize("ctrl-alt-p").as_deref());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_defaults_leave_a_panes_find_previous() {
+        let eff = effective(&user(&[]));
+        let previous = normalize("cmd-shift-g").unwrap();
+        assert!(!eff.iter().any(|(_, k)| *k == previous), "cmd-shift-g is a pane's find previous");
+        assert_eq!(chord(&eff, "ShowChanges"), normalize("ctrl-shift-g").as_deref());
+        assert_eq!(chord(&eff, "ShowSearch"), normalize("cmd-shift-f").as_deref());
+    }
+
+    #[test]
     #[cfg(target_os = "macos")]
     fn defaults_when_the_user_set_nothing() {
         let eff = effective(&user(&[]));
@@ -424,6 +480,17 @@ mod tests {
         for (action, chord) in DEFAULTS {
             assert!(ACTIONS.iter().any(|(name, _)| name == action), "{action}");
             assert!(normalize(chord).is_some(), "{chord}");
+        }
+        for action in ["ShowFiles", "ShowChanges", "ShowSearch", "QuickOpen"] {
+            assert!(DEFAULTS.iter().any(|(a, _)| *a == action), "{action} has a default");
+        }
+    }
+
+    #[test]
+    fn no_two_defaults_share_a_chord() {
+        let mut seen = std::collections::HashSet::new();
+        for (action, chord) in DEFAULTS {
+            assert!(seen.insert(normalize(chord).unwrap()), "{action}'s {chord} is taken");
         }
     }
 

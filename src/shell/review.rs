@@ -2,7 +2,6 @@
 //! description) and its checks or pipeline jobs, each opening in the browser.
 use super::*;
 use gpui::AnyElement;
-use crate::settings::{REVIEW_MAX, REVIEW_MIN, REVIEW_WIDTH};
 use crate::ui::review::{Check, CheckState, Request, Review, act, check_icon, duration, markdown, read_review, retry_failed};
 use crate::ui::statusbar::{branch_of, cached, fetching, pane_dir, refetch};
 
@@ -44,29 +43,6 @@ pub(super) struct MergeAsk {
 }
 
 impl Shell {
-    pub(super) fn toggle_review(&mut self, cx: &mut Context<Self>) {
-        self.review_open = !self.review_open;
-        let open = self.review_open;
-        save_from_sidebar(cx, |s| s.review_open = open);
-        cx.notify();
-    }
-
-    pub(super) fn drag_review(&mut self, x: Pixels, window: &Window, cx: &mut Context<Self>) {
-        if self.review_drag {
-            self.review_width = f32::from(window.viewport_size().width - x).clamp(REVIEW_MIN, REVIEW_MAX);
-            cx.notify();
-        }
-    }
-
-    pub(super) fn end_review_drag(&mut self, cx: &mut Context<Self>) {
-        if std::mem::take(&mut self.review_drag) {
-            cx.set_global(GridHold(false));
-            let width = self.review_width;
-            save_from_sidebar(cx, |s| s.review_width = width);
-            cx.refresh_windows();
-        }
-    }
-
     /// Asks gh or glab again about the branch the panel shows while its checks run; called every `REVIEW_POLL`.
     pub(super) fn poll_review(&mut self, cx: &mut Context<Self>) {
         if let Some(key) = self.review_poll.clone() {
@@ -138,42 +114,30 @@ impl Shell {
         .detach();
     }
 
-    /// The panel, and its edge: drag to resize, double-click for the default width.
-    pub(super) fn render_review(&mut self, theme: &Theme, shown: &ShownReview, window: &mut Window, cx: &mut Context<Self>) -> [AnyElement; 2] {
-        let (key, review, branch) = (shown.key.clone(), shown.review.clone(), shown.branch.clone());
+    /// The PR tab's title in the right panel's header ("Pull request", or GitLab's "Merge request") and the buttons
+    /// before its close: a refresh, or a spinner while gh or glab are asked.
+    pub(super) fn review_header(&mut self, theme: &Theme, shown: &ShownReview, window: &mut Window, cx: &mut Context<Self>) -> (SharedString, Vec<AnyElement>) {
+        let key = shown.key.clone();
         let busy = key.as_deref().is_some_and(|k| fetching::<Review>(k, cx));
+        let title = if is_gitlab(shown.review.as_ref()) { "Merge request" } else { "Pull request" };
+        let actions = key.map(|key| {
+            if busy {
+                div().size(px(24.)).flex().items_center().justify_center().child(crate::ui::loader::mini_spinner(2., theme.text_faint, window)).into_any_element()
+            } else {
+                titlebar_button(theme, "review-refresh", "icons/solar/refresh.svg")
+                    .tooltip(tip("Refresh", None))
+                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| refetch::<Review>(&key, cx)))
+                    .into_any_element()
+            }
+        });
+        (title.into(), actions.into_iter().collect())
+    }
 
-        let gitlab = matches!(&review, Some(Review::Found { request: Some(r), .. }) if r.pr.gitlab)
-            || matches!(&review, Some(Review::Found { pipeline: Some(_), .. }) | Some(Review::NoTool("glab") | Review::NoLogin("glab", _)));
+    /// The PR tab's body (the request, its checks and description) and the footer with its buttons, if it has one.
+    pub(super) fn review_body(&mut self, theme: &Theme, shown: &ShownReview, window: &mut Window, cx: &mut Context<Self>) -> (Vec<AnyElement>, Option<AnyElement>) {
+        let (key, review, branch) = (shown.key.clone(), shown.review.clone(), shown.branch.clone());
+        let gitlab = is_gitlab(review.as_ref());
         let noun = if gitlab { "merge request" } else { "pull request" };
-        let header = div()
-            .h(px(TITLEBAR_HEIGHT))
-            .flex_none()
-            .pl(px(12.))
-            // clear of the window's buttons, which sit over its right end off macOS
-            .pr(px(12. + window_controls_w(cx)))
-            .flex()
-            .items_center()
-            .gap(px(6.))
-            .border_b_1()
-            .border_color(theme.border)
-            .child(gpui::svg().path("icons/git-pull-request.svg").size(px(14.)).flex_none().text_color(theme.text_muted))
-            .child(div().flex_1().min_w_0().truncate().font_weight(gpui::FontWeight::MEDIUM).child(if gitlab { "Merge request" } else { "Pull request" }))
-            .children(key.clone().map(|key| {
-                if busy {
-                    div().size(px(24.)).flex().items_center().justify_center().child(crate::ui::loader::mini_spinner(2., theme.text_faint, window)).into_any_element()
-                } else {
-                    titlebar_button(theme, "review-refresh", "icons/solar/refresh.svg")
-                        .tooltip(tip("Refresh", None))
-                        .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| refetch::<Review>(&key, cx)))
-                        .into_any_element()
-                }
-            }))
-            .child(
-                titlebar_button(theme, "review-close", "icons/close.svg")
-                    .tooltip(tip("Close", Some("ToggleReview")))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_review(cx))),
-            );
         let (dir, key_or) = (shown.dir.clone().unwrap_or_default(), key.clone().unwrap_or_default());
 
         let mut footer = None;
@@ -252,7 +216,7 @@ impl Shell {
                     let this = cx.entity().downgrade();
                     let names: Vec<String> = pages.iter().map(|(n, _)| n.clone()).collect();
                     // the panel's whole width: pages slide in from its edge
-                    let width = self.review_width;
+                    let width = self.panel_width;
                     let on_page: OnPage = Rc::new({
                         let (names, key) = (names.clone(), key_or.clone());
                         move |to, cx| {
@@ -301,62 +265,14 @@ impl Shell {
             }
         };
 
-        let width = self.review_width;
-        let panel = div()
-            .w(px(width))
-            .h_full()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .bg(theme.wash(0.05))
-            .border_l_1()
-            .border_color(theme.border)
-            .child(header)
-            .child(
-                div()
-                    .id("review-body")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .p(px(12.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(16.))
-                    // one reset for the description's and the logs' selectable text, before either paints
-                    .child(crate::ui::markdown::frame_reset())
-                    .children(body),
-            )
-            .children(footer);
-        let edge = div()
-            .id("review-resize")
-            .on_hover(cx.listener(|this, on: &bool, _, cx| this.hover_seam("review-resize", *on, cx)))
-            .absolute()
-            .top(px(TITLEBAR_HEIGHT))
-            .bottom_0()
-            .right(px(width - 3.))
-            .w(px(6.))
-            .cursor_col_resize()
-            // the panel's 1 px border sits at x = 3 of the strip
-            .child(resize_seam("review-resize".into(), true, 3., theme.accent, self.review_drag, self.seam_hover.get("review-resize").copied()))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.review_drag = true;
-                    cx.set_global(GridHold(true));
-                    cx.notify();
-                }),
-            )
-            .on_click(cx.listener(|this, e: &ClickEvent, _, cx| {
-                if e.click_count() == 2 {
-                    this.review_width = REVIEW_WIDTH;
-                    save_from_sidebar(cx, |s| s.review_width = REVIEW_WIDTH);
-                    cx.notify();
-                }
-            }));
-        [panel.into_any_element(), edge.into_any_element()]
+        (body, footer)
     }
+}
+
+/// The review is GitLab's: its request is an MR, or its pipeline (or the tool missing) is glab's.
+fn is_gitlab(review: Option<&Review>) -> bool {
+    matches!(review, Some(Review::Found { request: Some(r), .. }) if r.pr.gitlab)
+        || matches!(review, Some(Review::Found { pipeline: Some(_), .. }) | Some(Review::NoTool("glab") | Review::NoLogin("glab", _)))
 }
 
 fn empty(theme: &Theme, title: impl Into<SharedString>, hint: impl Into<SharedString>) -> AnyElement {

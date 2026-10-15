@@ -36,10 +36,21 @@ pub struct Settings {
     pub keys: BTreeMap<String, String>,
     /// The workspaces sidebar's width; dragging its edge sets it.
     pub sidebar_width: f32,
-    /// The review panel on the right: the shown branch's PR or MR and its checks.
-    pub review_open: bool,
+    /// The right panel (Files, Changes, Search and the shown branch's PR or MR) shows. Saved under the review
+    /// panel's old key, so a settings file from before the tabs opens as it was left.
+    #[serde(rename = "review_open")]
+    pub panel_open: bool,
     /// Its width; dragging its edge sets it.
-    pub review_width: f32,
+    #[serde(rename = "review_width")]
+    pub panel_width: f32,
+    /// The right panel's tab.
+    pub panel_tab: PanelTab,
+    /// The Files tab lists dotfiles.
+    pub panel_show_hidden: bool,
+    /// The Files tab lists what git ignores.
+    pub panel_show_ignored: bool,
+    /// Each workspace's folder in the right panel, by `files::roots::root_key` (its place and id).
+    pub workspace_roots: BTreeMap<String, String>,
     pub agent_sort: AgentSort,
     /// The sidebar's Agents section; General settings hide it.
     pub show_agents: bool,
@@ -86,6 +97,52 @@ pub struct Settings {
     pub folded: Vec<String>,
     /// Where the window was last; `None` opens it centered.
     pub window: Option<WindowFrame>,
+}
+
+/// The right panel's tabs. An unknown (future) value reads as Files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PanelTab {
+    Changes,
+    Search,
+    /// The shown branch's pull or merge request and its checks; only there while its repo has a remote.
+    Pr,
+    // last: serde's catch-all must be
+    #[default]
+    #[serde(other)]
+    Files,
+}
+
+impl PanelTab {
+    pub const ALL: [PanelTab; 4] = [PanelTab::Files, PanelTab::Changes, PanelTab::Search, PanelTab::Pr];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PanelTab::Files => "Files",
+            PanelTab::Changes => "Changes",
+            PanelTab::Search => "Search",
+            PanelTab::Pr => "Pull request",
+        }
+    }
+
+    /// The action that shows it, for its tooltip's chord.
+    pub fn action(self) -> &'static str {
+        match self {
+            PanelTab::Files => "ShowFiles",
+            PanelTab::Changes => "ShowChanges",
+            PanelTab::Search => "ShowSearch",
+            PanelTab::Pr => "ShowPullRequest",
+        }
+    }
+
+    pub fn icon(self) -> &'static str {
+        match self {
+            PanelTab::Files => "icons/folder.svg",
+            PanelTab::Changes => "icons/git-branch.svg",
+            PanelTab::Search => "icons/solar/magnifier.svg",
+            PanelTab::Pr => "icons/git-pull-request.svg",
+        }
+    }
 }
 
 /// An agent whose plan limits Shepherd reads. An unknown (future) value reads as Claude.
@@ -206,10 +263,10 @@ impl WindowFrame {
 pub const SIDEBAR_WIDTH: f32 = 256.0;
 pub const SIDEBAR_MIN: f32 = 224.0;
 pub const SIDEBAR_MAX: f32 = 400.0;
-/// The review panel: 340 px by default, its edge drags it between 280 and 640.
-pub const REVIEW_WIDTH: f32 = 340.0;
-pub const REVIEW_MIN: f32 = 280.0;
-pub const REVIEW_MAX: f32 = 640.0;
+/// The right panel: 340 px by default, its edge drags it between 280 and 640.
+pub const PANEL_WIDTH: f32 = 340.0;
+pub const PANEL_MIN: f32 = 280.0;
+pub const PANEL_MAX: f32 = 640.0;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -229,8 +286,12 @@ impl Default for Settings {
             editor: None,
             keys: BTreeMap::new(),
             sidebar_width: SIDEBAR_WIDTH,
-            review_open: false,
-            review_width: REVIEW_WIDTH,
+            panel_open: false,
+            panel_width: PANEL_WIDTH,
+            panel_tab: PanelTab::Files,
+            panel_show_hidden: false,
+            panel_show_ignored: false,
+            workspace_roots: BTreeMap::new(),
             agent_sort: AgentSort::default(),
             show_agents: true,
             show_status_bar: true,
@@ -317,7 +378,7 @@ impl Settings {
                 settings.font_size = settings.font_size.clamp(9.0, 32.0);
                 settings.line_height = step_line_height(settings.line_height, 0.0);
                 settings.sidebar_width = settings.sidebar_width.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
-                settings.review_width = settings.review_width.clamp(REVIEW_MIN, REVIEW_MAX);
+                settings.panel_width = settings.panel_width.clamp(PANEL_MIN, PANEL_MAX);
                 if let Some(family) = settings.theme_family.take() {
                     settings.adopt_family(&family);
                 }
@@ -536,8 +597,34 @@ mod tests {
         let (_d, path) = tmp();
         std::fs::write(&path, r#"{"sidebar_width": 10}"#).unwrap();
         assert_eq!(Settings::load(&path).0.sidebar_width, SIDEBAR_MIN);
-        std::fs::write(&path, r#"{"review_width": 9000}"#).unwrap();
-        assert_eq!(Settings::load(&path).0.review_width, REVIEW_MAX);
+    }
+
+    #[test]
+    fn the_review_panels_keys_open_the_right_panel() {
+        let (_d, path) = tmp();
+        std::fs::write(&path, r#"{"review_open": true, "review_width": 9000}"#).unwrap();
+        let (s, err) = Settings::load(&path);
+        assert!(err.is_none());
+        assert_eq!((s.panel_open, s.panel_width, s.panel_tab), (true, PANEL_MAX, PanelTab::Files));
+        let mut s = Settings { panel_width: 400., panel_tab: PanelTab::Changes, ..s };
+        s.workspace_roots.insert("sock\nw1".into(), "/src/app".into());
+        s.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"review_open\": true") && text.contains("\"review_width\": 400.0"), "{text}");
+        assert!(!text.contains("panel_open") && !text.contains("panel_width"));
+        assert!(text.contains("\"panel_tab\": \"changes\""));
+        assert_eq!(Settings::load(&path), (s, None));
+    }
+
+    #[test]
+    fn an_unknown_panel_tab_reads_as_files() {
+        let (_d, path) = tmp();
+        std::fs::write(&path, r#"{"panel_tab": "outline", "font_size": 15}"#).unwrap();
+        let (s, err) = Settings::load(&path);
+        assert!(err.is_none());
+        assert_eq!((s.panel_tab, s.font_size), (PanelTab::Files, 15.0));
+        std::fs::write(&path, r#"{"panel_tab": "pr"}"#).unwrap();
+        assert_eq!(Settings::load(&path).0.panel_tab, PanelTab::Pr);
     }
 
     #[test]

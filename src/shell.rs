@@ -28,6 +28,7 @@ mod motion;
 mod pane_drag;
 mod popups;
 mod review;
+mod right_panel;
 mod sessions;
 mod sidebar;
 mod sync;
@@ -114,12 +115,18 @@ pub struct Shell {
     sidebar_drag: bool,
     /// The drag hit a width limit (-1 min, +1 max) at this instant: the edge nudges past it and springs back.
     sidebar_edge: Option<(f32, Instant)>,
-    /// The review panel on the right shows; saved in the settings.
-    review_open: bool,
+    /// The right panel (Files, Changes, Search, PR) shows; saved in the settings.
+    panel_open: bool,
     /// Saved in the settings when a drag ends.
-    review_width: f32,
-    /// The review panel's edge is being dragged.
-    review_drag: bool,
+    panel_width: f32,
+    /// The right panel's edge is being dragged.
+    panel_drag: bool,
+    /// The right panel's tab as picked; `shown_panel_tab` is the one it shows.
+    panel_tab: crate::settings::PanelTab,
+    /// The shown pane's repo has a remote, so the right panel has a PR tab; as of the last render.
+    panel_has_pr: bool,
+    /// The right panel's Files, Changes and Search tabs.
+    side_panel: Entity<crate::ui::side_panel::SidePanel>,
     /// The shown branch (its review's key), while its checks run: asked again every `REVIEW_POLL`.
     review_poll: Option<String>,
     /// The shown branch's key at the last render and whether its checks ran: when they stop, CI finished.
@@ -392,6 +399,12 @@ impl Shell {
                     let _ = this.update(cx, |s, cx| s.save_frame(cx));
                     true
                 });
+                let tab = SettingsGlobal::of(cx).settings.panel_tab;
+                let side_panel = cx.new(|cx| crate::ui::side_panel::SidePanel::new(rt.clone(), tab, cx));
+                cx.subscribe_in(&side_panel, window, |s: &mut Shell, _, event: &crate::ui::side_panel::SidePanelEvent, window, cx| match event {
+                    crate::ui::side_panel::SidePanelEvent::Dismiss => s.focus_pane(window, cx),
+                })
+                .detach();
                 let mut shell = Shell {
                     snapshot: None,
                     error: None,
@@ -428,9 +441,12 @@ impl Shell {
                     peek_hovered: false,
                     sidebar_drag: false,
                     sidebar_edge: None,
-                    review_open: SettingsGlobal::of(cx).settings.review_open,
-                    review_width: SettingsGlobal::of(cx).settings.review_width,
-                    review_drag: false,
+                    panel_open: SettingsGlobal::of(cx).settings.panel_open,
+                    panel_width: SettingsGlobal::of(cx).settings.panel_width,
+                    panel_drag: false,
+                    panel_tab: SettingsGlobal::of(cx).settings.panel_tab,
+                    panel_has_pr: false,
+                    side_panel: side_panel.clone(),
                     review_poll: None,
                     review_last: None,
                     review_acting: Default::default(),
@@ -1006,7 +1022,7 @@ impl Shell {
     fn resize_cursor(&self) -> Option<impl IntoElement> {
         let vertical = if let Some(d) = &self.divider {
             d.vertical
-        } else if self.sidebar_drag || self.review_drag {
+        } else if self.sidebar_drag || self.panel_drag {
             true
         } else if self.agents_drag.is_some() {
             false
@@ -1424,7 +1440,18 @@ impl Render for Shell {
             .children(floating);
 
         let show_bar = SettingsGlobal::of(cx).settings.show_status_bar;
-        let shown = if show_bar || self.review_open { self.shown_review(snapshot.as_ref(), window, cx) } else { Default::default() };
+        // nothing to show outside a repo with a remote: the PR tab waits for one. Asked of git (cheap, cached), so
+        // gh or glab only run for the status bar's label or the PR tab, as before the tabs.
+        let active_dir = crate::ui::statusbar::pane_dir(snapshot.as_ref(), self.active_pane(window, cx).as_deref());
+        self.panel_has_pr = active_dir.as_deref().is_some_and(|d| crate::ui::statusbar::has_origin(d, cx));
+        let pr_shown = self.panel_open && self.shown_panel_tab() == crate::settings::PanelTab::Pr;
+        let shown = if show_bar || pr_shown {
+            self.shown_review(snapshot.as_ref(), window, cx)
+        } else {
+            // nothing shows the review: its checks are not polled
+            self.review_poll = None;
+            Default::default()
+        };
         let statusbar = show_bar.then(|| {
             let pane = self.active_pane(window, cx);
             let on_branch = cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -1451,7 +1478,7 @@ impl Render for Shell {
             } else {
                 self.usage_menu.as_ref().is_some_and(|m| m.is_open()).then_some(Item::Usage)
             };
-            let on_review = cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_review(cx));
+            let on_review = cx.listener(|this, _: &ClickEvent, window, cx| this.show_panel_tab(crate::settings::PanelTab::Pr, window, cx));
             let show = SettingsGlobal::of(cx).settings.status_bar_show;
             div()
                 .flex_none()
@@ -1459,15 +1486,18 @@ impl Render for Shell {
                     this.statusbar_menu = Some(crate::ui::Popup::new(e.position));
                     cx.notify();
                 }))
-                .child(crate::ui::statusbar::bar(show, snapshot.as_ref(), pane.as_deref(), shown.review.as_ref(), &theme, open, self.review_open, on_branch, on_spent, on_usage, on_review, window, cx))
+                .child(crate::ui::statusbar::bar(show, snapshot.as_ref(), pane.as_deref(), shown.review.as_ref(), &theme, open, pr_shown, on_branch, on_spent, on_usage, on_review, window, cx))
         });
         let spring_back = self.pane_spring_back(window);
         let settings_page = self.settings.as_ref().map(|(view, _)| view.clone());
         let on_page = settings_page.is_some();
-        // nothing to show outside a repo with a remote, and no PR label to close it from: it waits for one
-        let has_remote = shown.key.is_some() && !matches!(shown.review, Some(crate::ui::review::Review::NoRemote));
-        let review = (self.review_open && !on_page && has_remote).then(|| self.render_review(&theme, &shown, window, cx));
-        if review.is_none() {
+        let panel = (self.panel_open && !on_page).then(|| self.render_right_panel(&theme, &shown, window, cx));
+        // the side panel gone from view (closed, the PR tab now there, the settings page) keeps no keyboard focus
+        let side_shown = self.panel_open && !on_page && self.shown_panel_tab() != crate::settings::PanelTab::Pr;
+        if !side_shown && self.side_panel.read(cx).focus_handle(cx).contains_focused(window, cx) {
+            self.focus_pane(window, cx);
+        }
+        if !(pr_shown && !on_page) {
             // a hidden panel's selection is not Cmd+C's to copy
             crate::ui::markdown::forget();
         }
@@ -1532,7 +1562,15 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &NextSession, _, cx| this.step_place(true, cx)))
             .on_action(cx.listener(|this, _: &SwitchSession, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Places, w, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
-            .on_action(cx.listener(|this, _: &ToggleReview, _, cx| this.toggle_review(cx)))
+            .on_action(cx.listener(|this, _: &ToggleReview, w, cx| this.toggle_review(w, cx)))
+            .on_action(cx.listener(|this, _: &ShowFiles, w, cx| this.show_panel_tab(crate::settings::PanelTab::Files, w, cx)))
+            .on_action(cx.listener(|this, _: &ShowChanges, w, cx| this.show_panel_tab(crate::settings::PanelTab::Changes, w, cx)))
+            .on_action(cx.listener(|this, _: &ShowSearch, w, cx| this.show_panel_tab(crate::settings::PanelTab::Search, w, cx)))
+            .on_action(cx.listener(|this, _: &ShowPullRequest, w, cx| this.show_panel_tab(crate::settings::PanelTab::Pr, w, cx)))
+            // ponytail: until Quick Open (M7), reveal (M8) and the folder chooser (M2) land, these open the Files tab
+            .on_action(cx.listener(|this, _: &QuickOpen, w, cx| this.open_panel_tab(crate::settings::PanelTab::Files, w, cx)))
+            .on_action(cx.listener(|this, _: &RevealActiveFile, w, cx| this.open_panel_tab(crate::settings::PanelTab::Files, w, cx)))
+            .on_action(cx.listener(|this, _: &ChooseRoot, w, cx| this.open_panel_tab(crate::settings::PanelTab::Files, w, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.toggle_settings_here(window, cx)))
             .on_action(cx.listener(|this, _: &CommandPanel, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Commands, w, cx)))
             .on_action(cx.listener(|this, _: &ChangeTheme, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Themes, w, cx)))
@@ -1543,19 +1581,19 @@ impl Render for Shell {
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, w, cx| {
                 this.drag_divider(e.position, cx);
                 this.drag_sidebar(e.position.x, cx);
-                this.drag_review(e.position.x, w, cx);
+                this.drag_panel(e.position.x, w, cx);
                 this.drag_agents(e.position.y, w, cx);
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.end_divider(cx);
                 this.end_sidebar_drag(cx);
-                this.end_review_drag(cx);
+                this.end_panel_drag(cx);
                 this.end_agents_drag(cx);
             }))
             .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.end_divider(cx);
                 this.end_sidebar_drag(cx);
-                this.end_review_drag(cx);
+                this.end_panel_drag(cx);
                 this.end_agents_drag(cx);
             }))
             .child(self.drag_strip())
@@ -1577,7 +1615,7 @@ impl Render for Shell {
                 Some(page) => el.child(page),
                 None => el.child(div().flex_1().min_w_0().h_full().flex().flex_col().child(tabbar).child(grid).children(statusbar)),
             })
-            .children(review.into_iter().flatten())
+            .children(panel.into_iter().flatten())
             // The sidebar closed: the window's left edge brings it out floating over the panes, as Arc's does.
             .when(!self.sidebar_open && sidebar_w == 0. && !on_page, |el| {
                 el.child(

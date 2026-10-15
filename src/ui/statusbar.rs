@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 pub const HEIGHT: f32 = 24.0;
 /// How old a directory's git state may get before a render asks git again.
 const GIT_TTL: Duration = Duration::from_secs(5);
+/// How often a folder's repo is asked whether it has an `origin` (remotes rarely change).
+const ORIGIN_TTL: Duration = Duration::from_secs(30);
 /// The agents' usage endpoints are polled as often as the dotfiles' statusbar does.
 const USAGE_TTL: Duration = Duration::from_secs(300);
 /// How often the shown agent's transcript is summed again.
@@ -149,6 +151,20 @@ pub fn branch_of(dir: &str, cx: &mut App) -> Option<String> {
 /// `dir`'s branch and how far it is from its upstream, as the status bar shows them.
 pub fn git_of(dir: &str, cx: &mut App) -> Option<Git> {
     cached(dir, GIT_TTL, read_git, cx)
+}
+
+/// `dir`'s repo has an `origin` remote, so a PR or MR can be asked about: the right panel's PR tab shows. A local
+/// `git remote get-url`, asked every `ORIGIN_TTL`; `false` until it answers and outside a repo.
+pub fn has_origin(dir: &str, cx: &mut App) -> bool {
+    cached(dir, ORIGIN_TTL, read_origin, cx).is_some_and(|Origin(yes)| yes)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Origin(bool);
+
+fn read_origin(dir: &str) -> Option<Origin> {
+    let out = crate::herdr::git(dir, &["remote", "get-url", "origin"]).ok()?;
+    Some(Origin(out.status.success() && crate::ui::review::host(&String::from_utf8_lossy(&out.stdout)).is_some()))
 }
 
 /// Asks git about `dir` again on the next render, as after a checkout.
@@ -746,8 +762,8 @@ pub enum Item {
 
 /// The bar for the pane `pane_id` of `snapshot`. `on_branch`, `on_spent` and `on_usage` run on a click on
 /// the branch, the spend and the limits (the last two with the label's bounds); `open` is the one whose popup is up.
-/// `on_review` runs on a click on the PR or MR (from `review`, with its CI's icon), which toggles the review panel
-/// and is lit while `review_open`. `show` hides labels.
+/// `on_review` runs on a click on the PR or MR (from `review`, with its CI's icon), which toggles the right panel's
+/// PR tab and is lit while `review_open` (that tab shows). `show` hides labels.
 pub fn bar(
     show: crate::settings::StatusBarShow,
     snapshot: Option<&Snapshot>,
@@ -798,11 +814,11 @@ pub fn bar(
         }).map(|(pr, ci)| {
             let el = match &pr {
                 Some(pr) => link(label(theme, "icons/git-pull-request.svg").id("statusbar-pr"), theme, review_open)
-                    .tooltip(crate::shell::tip("Toggle pull request panel", Some("ToggleReview")))
+                    .tooltip(crate::shell::tip("Pull request", Some("ShowPullRequest")))
                     .child(format!("{}{}", if pr.gitlab { "!" } else { "#" }, pr.number))
                     .when(pr.state != "open", |el| el.child(div().text_color(theme.text_faint).child(pr.state))),
                 None => link(label(theme, "icons/checklist.svg").id("statusbar-pr"), theme, review_open)
-                    .tooltip(crate::shell::tip("Toggle pipeline panel", Some("ToggleReview")))
+                    .tooltip(crate::shell::tip("Pipeline", Some("ShowPullRequest")))
                     .child("CI"),
             };
             el.flex_shrink_0().children(ci.map(|state| crate::ui::review::check_icon(theme, state, 12., window))).on_click(on_review)

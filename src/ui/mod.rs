@@ -6,6 +6,7 @@ pub mod markdown;
 pub mod project_icon;
 pub mod review;
 pub mod settings;
+pub mod side_panel;
 pub mod statusbar;
 pub mod toast;
 
