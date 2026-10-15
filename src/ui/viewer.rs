@@ -1,4 +1,5 @@
-//! The file viewer: one file, read-only, over the pane grid (the panes keep their size under it). Text shows at
+//! The file viewer: one file, read-only, a file tab's view in the pane grid's place (the panes keep their size).
+//! It closes as its tab does (Ctrl/Cmd+W, the tab's `×`), so it has no Esc or close button of its own. Text shows at
 //! once in the terminal's font and size, highlighting lands when the runtime has it (`files::highlight`); markdown
 //! previews through `ui::markdown`; images show through gpui; anything else says why not and offers the editor.
 //!
@@ -39,10 +40,8 @@ const MAX_PREVIEW: usize = 512 * 1024;
 const MAX_DRAWN: usize = 2048;
 
 pub enum ViewerEvent {
-    /// Esc, or the close button: the Shell drops the viewer and gives the pane the keyboard back.
-    Dismiss,
-    /// "Open in editor", at a line when the viewer has one to give: the Shell closes the viewer (the editor's pane
-    /// opens under it otherwise) and opens the file.
+    /// "Open in editor", at a line when the viewer has one to give: the Shell shows the terminals (the editor's pane
+    /// opens among them) and opens the file.
     OpenInEditor { path: PathBuf, line: Option<u32> },
 }
 
@@ -429,8 +428,6 @@ impl FileViewer {
             self.select_all(cx);
         } else if primary && !m.alt && !m.shift && key == "enter" {
             self.open_in_editor(cx);
-        } else if key == "escape" && !m.modified() {
-            cx.emit(ViewerEvent::Dismiss);
         } else if !m.modified() || (primary && matches!(key, "up" | "down")) {
             if !self.scroll_key(key, primary, window, cx) {
                 return;
@@ -546,7 +543,7 @@ impl FileViewer {
 
     fn header(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let name = self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let icon = crate::files::icons::icon_for(&name, crate::files::tree::EntryKind::File, false);
+        let icon = crate::files::icons::material_icon(&name, false, false);
         let tag = |label: &'static str| {
             div().flex_none().px(px(5.)).rounded(px(4.)).border_1().border_color(theme.border).text_size(px(10.5)).text_color(theme.text_faint).child(label)
         };
@@ -599,7 +596,8 @@ impl FileViewer {
             .bg(theme.wash(0.04))
             .font_family(theme.font_ui.clone())
             .text_size(px(12.5))
-            .child(gpui::svg().path(icon).size(px(14.)).flex_none().text_color(theme.text_muted))
+            // a coloured SVG, so img(), not the tinted svg(); the Files tree's size
+            .child(gpui::img(icon).size(px(16.)).flex_none().object_fit(gpui::ObjectFit::Contain))
             .child(div().min_w_0().truncate().text_color(theme.text).child(self.shown_path()))
             .when(self.is_text() && self.text.crlf, |el| el.child(tag("CRLF")))
             .when(self.is_text(), |el| el.child(tag("Read only")))
@@ -614,11 +612,6 @@ impl FileViewer {
                 titlebar_button(theme, "viewer-copy-path", "icons/solar/copy.svg")
                     .tooltip(tip("Copy path", None))
                     .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(path.clone())))),
-            )
-            .child(
-                titlebar_button(theme, "viewer-close", "icons/close.svg")
-                    .tooltip(tip("Close", None))
-                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(ViewerEvent::Dismiss))),
             )
     }
 

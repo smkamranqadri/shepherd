@@ -71,13 +71,17 @@ pub(super) async fn sync_loop(this: gpui::WeakEntity<Shell>, rt: tokio::runtime:
                         // herdr's focus moved (its TUI, another window, a command): Shepherd shows the same tab. Only a
                         // move counts, so a snapshot taken before your own switch reached herdr does not undo it.
                         let old = s.snapshot.as_ref().map(|o| o.focused_tab_id.as_deref());
-                        if let Some(tab) = moved_focus(old, snapshot.focused_tab_id.as_deref()) {
-                            s.selected_tab = Some(tab.into());
+                        // A move to the tab already shown, or to one Shepherd itself switched herdr to lately (A, B, A
+                        // clicked quickly: B's echo lands after), is Shepherd's own switch coming back: a file tab shown
+                        // since stays.
+                        let moved = moved_focus(old, snapshot.focused_tab_id.as_deref());
+                        if let Some(tab) = moved.filter(|t| s.selected_tab.as_deref() != Some(*t) && !own_echo(&mut s.own_focus, t, Instant::now())) {
+                            s.show_herdr_tab(Some(tab.into()), true, cx);
                         }
                         snapshot.track(&mut s.since, Instant::now());
                         s.snapshot = Some(snapshot);
                         s.prune_roots(cx);
-                        s.prune_viewers(cx);
+                        s.prune_file_tabs(cx);
                         s.error = None;
                         s.connecting = None;
                     }
@@ -148,9 +152,21 @@ impl Shell {
         if self.snapshot.as_ref().and_then(|s| s.focused_tab_id.as_ref()) != Some(&tab) {
             let (client, id) = (self.client.clone(), tab.clone());
             self.rt.spawn(async move { client.call("tab.focus", json!({"tab_id": id})).await });
+            own_echo(&mut self.own_focus, "", Instant::now());
+            self.own_focus.push((tab.clone(), Instant::now()));
         }
         self.focused_tab = Some(tab);
     }
+}
+
+/// How long a `tab.focus` Shepherd sent may take to come back in a snapshot: a move of herdr's focus to that tab
+/// within it is Shepherd's own.
+const ECHO: Duration = Duration::from_secs(3);
+
+/// `tab` is one Shepherd gave herdr's focus within `ECHO` of `now` (`recent`, oldest first, is pruned of older ones).
+fn own_echo(recent: &mut Vec<(String, Instant)>, tab: &str, now: Instant) -> bool {
+    recent.retain(|(_, at)| now.duration_since(*at) < ECHO);
+    recent.iter().any(|(t, _)| t == tab)
 }
 
 /// herdr's focused tab when its focus moved since the last snapshot (`old`: none yet, or its focused tab).
@@ -160,7 +176,18 @@ fn moved_focus<'a>(old: Option<Option<&str>>, new: Option<&'a str>) -> Option<&'
 
 #[cfg(test)]
 mod tests {
-    use super::moved_focus;
+    use super::{ECHO, moved_focus, own_echo};
+    use std::time::Instant;
+
+    #[test]
+    fn shepherds_own_switches_echo_for_a_while() {
+        let t0 = Instant::now();
+        let mut recent = vec![("w1:t2".to_string(), t0), ("w1:t1".to_string(), t0)];
+        assert!(own_echo(&mut recent, "w1:t2", t0 + ECHO / 2), "B's echo after A, B, A");
+        assert!(!own_echo(&mut recent, "w1:t3", t0), "another client's move");
+        assert!(!own_echo(&mut recent, "w1:t2", t0 + ECHO), "too late to be ours");
+        assert!(recent.is_empty());
+    }
 
     #[test]
     fn follows_herdrs_focus_only_when_it_moves() {

@@ -362,9 +362,9 @@ impl SidePanel {
         self.rebuild_files(cx);
     }
 
-    /// A click or Enter on the entry at `path`: a folder opens or folds, a file (an image too) goes to the viewer; a
-    /// link to a folder outside the root does neither.
-    fn activate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    /// A click or Enter on the entry at `path`: a folder opens or folds, a file (an image too) opens in a file tab, a
+    /// preview for a single click (`preview`); a link to a folder outside the root does neither.
+    fn activate(&mut self, path: PathBuf, preview: bool, cx: &mut Context<Self>) {
         let Some(entry) = self.files.as_ref().and_then(|t| t.index_of(&path).map(|i| t.rows[i].clone())) else { return };
         let Row::Entry { entry, .. } = entry else { return };
         if entry.expandable() {
@@ -372,7 +372,7 @@ impl SidePanel {
         } else if entry.is_dir() || entry.kind == tree::EntryKind::Dangling {
             // a link out of the root, or to nothing
         } else {
-            cx.emit(SidePanelEvent::OpenFile(path));
+            cx.emit(SidePanelEvent::OpenFile { path, line: None, preview });
         }
     }
 
@@ -429,7 +429,7 @@ impl SidePanel {
                 None => self.select(first, cx),
             },
             "enter" => match selected {
-                Some(row) => self.activate(row.path().to_path_buf(), cx),
+                Some(row) => self.activate(row.path().to_path_buf(), false, cx),
                 None => self.select(first, cx),
             },
             _ => return false,
@@ -537,12 +537,14 @@ impl SidePanel {
                         .child(div().flex_1().min_w_0().truncate().text_size(px(12.5)).text_color(color).child(entry.name.clone()))
                         .when(outside, |el| el.tooltip(crate::shell::widgets::tip("A link to a folder outside this one", None)))
                         .when(dangling, |el| el.tooltip(crate::shell::widgets::tip("A link to something that is not there", None)))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
                             window.focus(&this.focus, cx);
                             if let Some(tree) = this.files.as_mut() {
                                 tree.selected = Some(click.clone());
                             }
-                            this.activate(click.clone(), cx);
+                            // the second click of a double-click pins the preview the first opened (a folder's
+                            // toggles back, as it always did)
+                            this.activate(click.clone(), e.click_count() < 2, cx);
                             cx.notify();
                         }))
                         // Capture, so a right-click on another row while the menu is up moves the menu there rather
@@ -590,7 +592,7 @@ impl SidePanel {
                 let (open, editor) = (path.clone(), path.clone());
                 el.child(item("file-menu-open", "icons/solar/file-text.svg", "Open").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     close(this);
-                    cx.emit(SidePanelEvent::OpenFile(open.clone()));
+                    cx.emit(SidePanelEvent::OpenFile { path: open.clone(), line: None, preview: false });
                     cx.notify();
                 })))
                 .child(item("file-menu-editor", "icons/solar/pen-new-square.svg", "Open in editor").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {

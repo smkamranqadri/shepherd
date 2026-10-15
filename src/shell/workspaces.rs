@@ -70,7 +70,7 @@ impl Shell {
         self.send_then(Command::CreateWorktree { workspace_id, branch: Some(branch) }, cx, move |shell, result, cx| {
             shell.pending_worktrees.retain(|p| *p != pending);
             match result {
-                Ok(value) => shell.selected_tab = crate::commands::created_tab_id(&value),
+                Ok(value) => shell.show_herdr_tab(crate::commands::created_tab_id(&value), true, cx),
                 Err(err) => crate::ui::toast::error(cx, format!("{err:#}")),
             }
             cx.notify();
@@ -150,8 +150,7 @@ impl Shell {
 
     fn create_workspace(&mut self, cwd: Option<String>, cx: &mut Context<Self>) {
         self.send(Command::NewWorkspace { cwd }, cx, |shell, result, cx| {
-            shell.selected_tab = crate::commands::created_tab_id(result);
-            cx.notify();
+            shell.show_herdr_tab(crate::commands::created_tab_id(result), true, cx);
         });
     }
 

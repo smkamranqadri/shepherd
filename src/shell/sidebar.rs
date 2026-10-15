@@ -166,9 +166,8 @@ impl Shell {
 
     /// Brings the agent's tab up and its pane to the keyboard.
     pub(super) fn show_agent(&mut self, tab_id: String, pane_id: String, cx: &mut Context<Self>) {
-        self.selected_tab = Some(tab_id);
+        self.show_herdr_tab(Some(tab_id), true, cx);
         self.focus_next = Some(pane_id);
-        cx.notify();
     }
 
     pub(super) fn set_agent_sort(&mut self, sort: AgentSort, cx: &mut Context<Self>) {
@@ -334,8 +333,8 @@ impl Shell {
                             this.start_rename(RenameTarget::Workspace(ws_id.clone()), label.clone(), window, cx);
                             return;
                         }
-                        this.selected_tab = target.clone();
-                        cx.notify();
+                        // the workspace as it was left, a file tab it showed included
+                        this.show_herdr_tab(target.clone(), false, cx);
                     }))
                     .on_mouse_down(MouseButton::Right, cx.listener({
                         let id = w.workspace_id.clone();

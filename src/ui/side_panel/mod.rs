@@ -35,8 +35,10 @@ pub enum SidePanelEvent {
     ChooseRoot,
     /// "Use focused pane's folder" under "No folder".
     UsePaneFolder,
-    /// A file clicked in the tree, Enter on it, or its menu's "Open": the Shell shows it in the viewer over the panes.
-    OpenFile(std::path::PathBuf),
+    /// A file clicked in the tree, Enter on it, or its menu's "Open": the Shell shows it in a file tab, at `line`
+    /// when given. A single click opens it as a preview (replaced by the next one, the keyboard left here); a
+    /// double-click, Enter or the menu pins it and gives it the keyboard.
+    OpenFile { path: std::path::PathBuf, line: Option<u32>, preview: bool },
     /// Cmd+Enter (Ctrl+Enter on Linux) on a file, or its menu's "Open in editor": the Shell opens it in the editor,
     /// beside the focused pane.
     OpenInEditor(std::path::PathBuf),

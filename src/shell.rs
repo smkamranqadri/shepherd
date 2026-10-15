@@ -32,8 +32,8 @@ mod right_panel;
 mod sessions;
 mod sidebar;
 mod sync;
+mod file_tabs;
 mod tab_bar;
-mod viewers;
 pub(crate) mod widgets;
 mod workspaces;
 use motion::*;
@@ -128,12 +128,22 @@ pub struct Shell {
     panel_has_pr: bool,
     /// The right panel's Files, Changes and Search tabs.
     side_panel: Entity<crate::ui::side_panel::SidePanel>,
-    /// The file viewers over the pane grid, one per workspace (`roots::root_key`), the most recently opened first.
-    viewers: Vec<(String, Entity<crate::ui::viewer::FileViewer>)>,
-    /// Viewers of workspaces that closed, retired on the next render (which has the window their focus is in).
-    viewers_gone: Vec<Entity<crate::ui::viewer::FileViewer>>,
-    /// The viewer drawn at the last render: when another takes its place, its image leaves gpui's cache.
-    viewer_drawn: Option<gpui::EntityId>,
+    /// Each workspace's file tabs (`roots::root_key`), drawn after its herdr tabs (`file_tabs`).
+    file_tabs: HashMap<String, crate::files::tabs::WorkspaceTabs>,
+    /// The file tabs' views, the most recently shown first; a tab without one gets it when next shown.
+    tab_views: Vec<(crate::files::tabs::TabId, Entity<crate::ui::viewer::FileViewer>)>,
+    /// Views of tabs that closed, retired on the next render (which has the window their focus is in).
+    views_gone: Vec<Entity<crate::ui::viewer::FileViewer>>,
+    /// The file tab drawn at the last render: when another takes its place, its view's image leaves gpui's cache.
+    view_drawn: Option<crate::files::tabs::TabId>,
+    /// The last file tab id handed out.
+    next_tab_id: u64,
+    /// Files' real paths, as file tabs are kept by (`file_tabs::real_path`), for the run.
+    real_paths: HashMap<std::path::PathBuf, std::path::PathBuf>,
+    /// Each workspace's root as last seen by its file tabs: when it moves, clean tabs outside it close.
+    tab_roots: HashMap<String, String>,
+    /// The pinned file tabs kept for the next run.
+    kept_tabs: file_tabs::KeptTabs,
     /// Workspaces (`roots::root_key`) whose root was guessed this run, true while the guess runs: one guess per
     /// workspace and run, so one that found nothing (home, `/`) leaves "No folder" up rather than ask git again.
     root_guesses: std::collections::BTreeMap<String, bool>,
@@ -231,6 +241,8 @@ pub struct Shell {
     popup_surface: Option<(std::sync::Arc<crate::herdr::popup::Surface>, ((u16, u16), (u32, u32)))>,
     /// The tab last given herdr's focus (`follow_shown_tab`).
     focused_tab: Option<String>,
+    /// The tabs Shepherd gave herdr's focus lately, and when: their echoes in later snapshots are not moves.
+    own_focus: Vec<(String, Instant)>,
     /// herdr's Kitty images per pane, as last sent, for panes made after it.
     pane_images: crate::herdr::graphics::PaneImages,
     /// Images no pane shows any more: freed from the window's atlas at the next render (a hidden pane never renders).
@@ -403,7 +415,12 @@ impl Shell {
                 .detach();
                 cx.on_app_quit(|s: &mut Shell, cx| {
                     s.save_frame(cx);
-                    async {}
+                    let kept = s.flush_kept_tabs(cx);
+                    async move {
+                        if let Some(write) = kept {
+                            write.await;
+                        }
+                    }
                 })
                 .detach();
                 let this = cx.entity().downgrade();
@@ -417,7 +434,7 @@ impl Shell {
                     crate::ui::side_panel::SidePanelEvent::Dismiss => s.focus_pane(window, cx),
                     crate::ui::side_panel::SidePanelEvent::ChooseRoot => s.choose_root(window, cx),
                     crate::ui::side_panel::SidePanelEvent::UsePaneFolder => s.use_pane_folder(window, cx),
-                    crate::ui::side_panel::SidePanelEvent::OpenFile(path) => s.open_file(path.clone(), None, window, cx),
+                    crate::ui::side_panel::SidePanelEvent::OpenFile { path, line, preview } => s.open_file(path.clone(), *line, *preview, window, cx),
                     crate::ui::side_panel::SidePanelEvent::OpenInEditor(path) => s.open_in_editor_from_panel(path.clone(), window, cx),
                 })
                 .detach();
@@ -463,9 +480,14 @@ impl Shell {
                     panel_tab: SettingsGlobal::of(cx).settings.panel_tab,
                     panel_has_pr: false,
                     side_panel: side_panel.clone(),
-                    viewers: Vec::new(),
-                    viewers_gone: Vec::new(),
-                    viewer_drawn: None,
+                    file_tabs: HashMap::new(),
+                    tab_views: Vec::new(),
+                    views_gone: Vec::new(),
+                    view_drawn: None,
+                    next_tab_id: 0,
+                    real_paths: HashMap::new(),
+                    tab_roots: HashMap::new(),
+                    kept_tabs: Default::default(),
                     root_guesses: Default::default(),
                     root_menu: None,
                     review_poll: None,
@@ -515,6 +537,7 @@ impl Shell {
                     popup_watch: gpui::Task::ready(()),
                     popup_surface: None,
                     focused_tab: None,
+                    own_focus: Vec::new(),
                     pane_images: Default::default(),
                     retired_images: Vec::new(),
                     client_shell: None,
@@ -538,6 +561,7 @@ impl Shell {
                 shell.connect(cx);
                 shell.refresh_places(cx);
                 shell.refresh_plugin_actions(cx);
+                shell.load_kept_tabs(cx);
                 // Waiting times move on between snapshots.
                 // ponytail: a minute from launch, not from each wait, so a label can lag by up to a minute.
                 cx.spawn(async move |this, cx| loop {
@@ -689,7 +713,7 @@ impl Shell {
                     window.focus(&this.focus, cx);
                     this.run_herdr_command(command, window, cx);
                 }
-                PanelEvent::Run(Run::Tab(tab_id)) => this.selected_tab = Some(tab_id.clone()),
+                PanelEvent::Run(Run::Tab(tab_id)) => this.show_herdr_tab(Some(tab_id.clone()), true, cx),
                 PanelEvent::Run(Run::Branch(branch)) => {
                     let (Some(dir), branch) = (dir.clone(), branch.clone()) else { return };
                     cx.spawn(async move |this, cx| {
@@ -714,12 +738,13 @@ impl Shell {
                         w.active_tab_id.clone().or_else(|| s.tabs_of(id).first().map(|t| t.tab_id.clone()))
                     });
                     match open_tab {
-                        Some(tab) => this.selected_tab = Some(tab),
+                        // the worktree's workspace, as it was left (a file tab it showed included)
+                        Some(tab) => this.show_herdr_tab(Some(tab), false, cx),
                         None => {
                             let command = Command::OpenWorktree { workspace_id: repo.clone(), path: path.clone() };
                             this.send_then(command, cx, |shell, result, cx| {
                                 match result {
-                                    Ok(value) => shell.selected_tab = crate::commands::created_tab_id(&value),
+                                    Ok(value) => shell.show_herdr_tab(crate::commands::created_tab_id(&value), true, cx),
                                     Err(err) => crate::ui::toast::error(cx, format!("{err:#}")),
                                 }
                                 cx.notify();
@@ -804,9 +829,9 @@ impl Shell {
         self.snapshot.as_ref()?.pick_tab_in(self.selected_tab.as_deref(), self.shown_workspace.as_deref()).cloned()
     }
 
-    /// The tab you are looking at: none while the window is inactive or Settings covers the panes.
+    /// The tab you are looking at: none while the window is inactive, or Settings or a file tab covers the panes.
     fn tab_in_view(&self, window_active: bool) -> Option<String> {
-        (window_active && self.settings.is_none()).then(|| self.shown_tab()).flatten().map(|t| t.tab_id)
+        (window_active && self.settings.is_none() && self.shown_file_tab().is_none()).then(|| self.shown_tab()).flatten().map(|t| t.tab_id)
     }
 
     /// Agents that just started waiting or finished out of sight: a notification each, and a place in the Dock count.
@@ -879,6 +904,7 @@ impl Shell {
     }
 
     fn pane_command(&mut self, window: &Window, cx: &mut Context<Self>, make: impl FnOnce(String) -> Command) {
+        self.show_terminals(cx);
         if let Some(pane_id) = self.active_pane(window, cx) {
             self.send(make(pane_id), cx, |_, _, _| {});
         }
@@ -953,6 +979,7 @@ impl Shell {
             }
             // herdr runs these itself: its pane lands in the tab, its popup comes back over the client shell
             CommandKind::Pane | CommandKind::Popup => {
+                self.show_terminals(cx);
                 let panes = self.snapshot.as_ref().map_or(&[][..], |s| &s.panes[..]);
                 self.command_panes.retain(|(_, id)| panes.iter().any(|p| &p.pane_id == id));
                 let open = self.command_panes.iter().find(|(keys, id)| {
@@ -1003,23 +1030,6 @@ impl Shell {
         }
     }
 
-    fn go_to_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        let (Some(snapshot), Some(tab)) = (self.snapshot.as_ref(), self.shown_tab()) else { return };
-        if let Some(target) = snapshot.tabs_of(&tab.workspace_id).get(index) {
-            self.selected_tab = Some(target.tab_id.clone());
-            cx.notify();
-        }
-    }
-
-    fn step_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let (Some(snapshot), Some(tab)) = (self.snapshot.as_ref(), self.shown_tab()) else { return };
-        let tabs = snapshot.tabs_of(&tab.workspace_id);
-        let Some(i) = tabs.iter().position(|t| t.tab_id == tab.tab_id) else { return };
-        let n = tabs.len();
-        self.selected_tab = Some(tabs[if forward { (i + 1) % n } else { (i + n - 1) % n }].tab_id.clone());
-        cx.notify();
-    }
-
     fn step_workspace(&mut self, forward: bool, cx: &mut Context<Self>) {
         let (Some(snapshot), Some(tab)) = (self.snapshot.as_ref(), self.shown_tab()) else { return };
         // sidebar order, so Cmd+Up/Down walk the tree as shown
@@ -1027,14 +1037,14 @@ impl Shell {
         let Some(i) = workspaces.iter().position(|w| w.workspace_id == tab.workspace_id) else { return };
         let n = workspaces.len();
         let next = &workspaces[if forward { (i + 1) % n } else { (i + n - 1) % n }];
-        self.selected_tab = next.active_tab_id.clone().or_else(|| snapshot.tabs_of(&next.workspace_id).first().map(|t| t.tab_id.clone()));
-        cx.notify();
+        let tab = next.active_tab_id.clone().or_else(|| snapshot.tabs_of(&next.workspace_id).first().map(|t| t.tab_id.clone()));
+        // the workspace as it was left, a file tab it showed included
+        self.show_herdr_tab(tab, false, cx);
     }
 
     fn new_tab(&mut self, workspace_id: String, cx: &mut Context<Self>) {
         self.send(Command::NewTab { workspace_id }, cx, |shell, result, cx| {
-            shell.selected_tab = crate::commands::created_tab_id(result);
-            cx.notify();
+            shell.show_herdr_tab(crate::commands::created_tab_id(result), true, cx);
         });
     }
 
@@ -1299,8 +1309,10 @@ impl Render for Shell {
         if std::mem::take(&mut self.popup_closed) && !self.panes.values().any(|p| p.read(cx).focus_handle(cx).is_focused(window)) {
             self.focused = None;
         }
-        let (viewer, viewer_focused) = self.sync_viewers(window, cx);
-        let overlaid = self.settings.is_some() || self.command_panel.as_ref().is_some_and(|p| p.is_open()) || self.floating_open() || viewer_focused;
+        let (viewer, _) = self.sync_file_tabs(window, cx);
+        // a file tab shown in the grid's place keeps the keyboard from herdr's focused pane, as an overlay does
+        let file_shown = self.shown_file_tab().is_some();
+        let overlaid = self.settings.is_some() || self.command_panel.as_ref().is_some_and(|p| p.is_open()) || self.floating_open() || file_shown;
         for f in &shown {
             if !self.panes.contains_key(&f.pane_id) {
                 let id = f.pane_id.clone();
@@ -1319,7 +1331,8 @@ impl Render for Shell {
             }
         }
         // after herdr's focus, so the agent's pane wins; its tab is already the shown one
-        if let Some(id) = self.focus_next.take().filter(|id| self.settings.is_none() && shown.iter().any(|f| &f.pane_id == id)) {
+        // not a pane under a file tab, which is not drawn
+        if let Some(id) = self.focus_next.take().filter(|id| self.settings.is_none() && !file_shown && shown.iter().any(|f| &f.pane_id == id)) {
             let handle = self.panes[&id].read(cx).focus_handle(cx);
             window.focus(&handle, cx);
         }
@@ -1334,7 +1347,7 @@ impl Render for Shell {
             self.focused = None;
         }
         if let Some(viewer) = &viewer {
-            self.viewer_takes_keys(viewer, window, cx);
+            self.view_takes_keys(viewer, window, cx);
         }
         let viewer_markdown = viewer.as_ref().is_some_and(|v| v.read(cx).shows_markdown());
         let shown_ws = tab.as_ref().map(|t| t.workspace_id.clone());
@@ -1351,6 +1364,11 @@ impl Render for Shell {
 
         let tabbar = self.render_tab_bar(&theme, shown_ws.clone(), shown_tab.clone(), sidebar_w, window, cx);
 
+        // A file tab shown: its view in the grid's place. The panes are not drawn, so they are not laid out either
+        // and keep their size (herdr's PTYs are not resized); their views stay, as a hidden tab's do.
+        if viewer.is_some() {
+            (frames, splits) = (Vec::new(), Vec::new());
+        }
         let shown_tab_id = shown_tab.clone().unwrap_or_default();
         let grid_bounds = self.grid_bounds.clone();
         let ring = theme.accent.opacity(0.5);
@@ -1465,7 +1483,7 @@ impl Render for Shell {
             }))
             .children(pane_drop)
             // under herdr's popup, which is modal
-            .children(viewer.map(Shell::viewer_overlay))
+            .children(viewer.map(|v| div().absolute().inset_0().child(v)))
             .children(floating);
 
         let show_bar = SettingsGlobal::of(cx).settings.show_status_bar;
@@ -1541,7 +1559,7 @@ impl Render for Shell {
                 // Cmd+C (Ctrl+C off macOS) over a selection in the review panel copies it, not the pane's; the
                 // viewer, with the keyboard, copies its own
                 let m = &e.keystroke.modifiers;
-                let viewer = s.shown_viewer().is_some_and(|v| v.read(cx).focus_handle(cx).contains_focused(window, cx));
+                let viewer = s.shown_file_view().is_some_and(|v| v.read(cx).focus_handle(cx).contains_focused(window, cx));
                 let copy = if cfg!(target_os = "macos") { m.platform && !(m.shift || m.alt || m.control) } else { m.control && !(m.alt || m.platform) };
                 if copy
                     && !viewer
@@ -1565,7 +1583,11 @@ impl Render for Shell {
                     this.new_tab(tab.workspace_id, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
+            // a file tab shown closes, never a pane or herdr's tab under it
+            .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
+                if this.close_shown_file_tab(window, cx) {
+                    return;
+                }
                 if let Some(tab) = this.shown_tab() {
                     this.send(Command::CloseTab { tab_id: tab.tab_id }, cx, |_, _, _| {});
                 }
@@ -1573,7 +1595,11 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &NewWorkspace, _, cx| this.new_workspace(cx)))
             .on_action(cx.listener(|this, _: &SplitRight, w, cx| this.pane_command(w, cx, |pane_id| Command::Split { pane_id, down: false })))
             .on_action(cx.listener(|this, _: &SplitDown, w, cx| this.pane_command(w, cx, |pane_id| Command::Split { pane_id, down: true })))
-            .on_action(cx.listener(|this, _: &ClosePane, w, cx| this.pane_command(w, cx, |pane_id| Command::ClosePane { pane_id })))
+            .on_action(cx.listener(|this, _: &ClosePane, w, cx| {
+                if !this.close_shown_file_tab(w, cx) {
+                    this.pane_command(w, cx, |pane_id| Command::ClosePane { pane_id });
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleZoom, w, cx| this.pane_command(w, cx, |pane_id| Command::Zoom { pane_id })))
             .on_action(cx.listener(|this, _: &FocusLeft, w, cx| this.pane_command(w, cx, |pane_id| Command::FocusPane { pane_id, direction: Direction::Left })))
             .on_action(cx.listener(|this, _: &FocusRight, w, cx| this.pane_command(w, cx, |pane_id| Command::FocusPane { pane_id, direction: Direction::Right })))

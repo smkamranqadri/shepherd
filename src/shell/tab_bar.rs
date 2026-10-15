@@ -2,7 +2,10 @@
 //! each tab as a colored favicon (Superlogical's tabs), sized to their labels. A new tab grows in, a closed one
 //! stays mounted while it shrinks out (the `Popup` recipe), the active wash slides between tabs, a reorder
 //! slides the tabs to their new places, and a dropped tab flies from where it was let go back into its slot.
+//! The workspace's file tabs (`file_tabs`) follow its herdr tabs past a thin divider: a file's icon, its name (in
+//! italics while a preview), and the same trailing slot, which holds an unsaved-changes dot instead of a status.
 use super::*;
+use crate::files::tabs::TabId;
 use std::cell::RefCell;
 
 /// Zeron's `motion::COLLAPSE` for a tab growing in or shrinking out; the wash and a reorder slide a bit quicker
@@ -29,6 +32,11 @@ const ZOOM_MARK: f32 = 12.;
 const MIN_W: f32 = 96.;
 const MAX_W: f32 = 220.;
 const FONT_SIZE: f32 = 12.5;
+/// The divider between herdr's tabs and the file tabs: its slot's width, and the line's height in it.
+const DIVIDER_W: f32 = 9.;
+const DIVIDER_H: f32 = 16.;
+/// A file tab's icon, in the favicon's slot: the Files tree's size.
+const FILE_ICON: f32 = 16.;
 
 /// Tab-bar state that outlives a frame: the scroll, the tabs as last drawn (closing ones included), the wash,
 /// and the tab being dragged with its ghost's top-left in the window (written by the ghost as it follows the pointer).
@@ -43,9 +51,21 @@ pub(super) struct TabBar {
     revealed: Option<String>,
 }
 
+/// What a slot in the bar is.
+#[derive(Clone, Copy, PartialEq)]
+enum Face {
+    Herdr,
+    /// A file tab: italic while a preview; `dirty` puts a dot in the trailing slot.
+    File { tab: TabId, preview: bool, dirty: bool },
+    /// The line between herdr's tabs and the file tabs.
+    Divider,
+}
+
 /// One tab as drawn.
 #[derive(Clone)]
 struct Shown {
+    face: Face,
+    /// herdr's tab id; a file tab's is `file:<n>`.
     id: String,
     label: String,
     status: AgentStatus,
@@ -305,9 +325,12 @@ impl TabBar {
     }
 }
 
-/// The favicon: the mark on a filled tile of its color, the same size for every kind.
+/// The favicon: the mark on a filled tile of its color, the same size for every kind; a file's icon, bare.
 fn favicon(t: &Shown) -> Div {
-    tile(t.icon, t.tint)
+    match t.face {
+        Face::File { .. } => div().size(px(ICON)).flex_none().flex().items_center().justify_center().child(gpui::img(t.icon).size(px(FILE_ICON)).object_fit(gpui::ObjectFit::Contain)),
+        _ => tile(t.icon, t.tint),
+    }
 }
 
 /// A tab's favicon for `agent`, for lists of agents elsewhere.
@@ -344,11 +367,29 @@ fn face(theme: &Theme, t: &Shown, width: f32, selected: bool) -> Div {
         .font_family(theme.font_ui.clone())
         .text_size(px(FONT_SIZE))
         .text_color(if selected { theme.text } else { theme.text_muted })
+        .when(matches!(t.face, Face::File { preview: true, .. }), |el| el.italic())
         .child(favicon(t))
 }
 
-fn dot_slot(theme: &Theme, status: AgentStatus) -> Div {
-    div().size(px(SLOT)).flex_none().flex().items_center().justify_center().child(status_dot(status, theme))
+/// The trailing slot: a herdr tab's status dot; a file tab's unsaved-changes dot, else nothing.
+fn dot_slot(theme: &Theme, t: &Shown) -> Div {
+    let slot = div().size(px(SLOT)).flex_none().flex().items_center().justify_center();
+    match t.face {
+        Face::File { dirty: true, .. } => slot.child(div().size(px(8.)).rounded_full().bg(theme.text_muted)),
+        Face::File { .. } | Face::Divider => slot,
+        Face::Herdr => slot.child(status_dot(t.status, theme)),
+    }
+}
+
+/// The divider's slot: a hairline, centred.
+fn divider(theme: &Theme, k: f32) -> gpui::AnyElement {
+    let line = div().w(px(1.)).h(px(DIVIDER_H)).bg(theme.border_strong);
+    div().flex_none().h(px(TAB_H)).w(px(DIVIDER_W * k)).mr(px(GAP * k)).opacity(k).flex().items_center().justify_center().child(line).into_any_element()
+}
+
+/// A file tab's id in the bar.
+fn file_entry_id(tab: TabId) -> String {
+    format!("file:{}", tab.0)
 }
 
 /// A tab being dragged along the tab bar: its own face under the pointer, lifted on a card.
@@ -374,7 +415,7 @@ impl Render for DraggedTab {
             .shadow_lg()
             .child(div().flex_1().min_w_0().truncate().child(self.tab.label.clone()))
             .when(self.tab.zoomed, |el| el.child(zoom_mark(theme)))
-            .child(dot_slot(theme, self.tab.status))
+            .child(dot_slot(theme, &self.tab))
     }
 }
 
@@ -390,36 +431,53 @@ impl Shell {
     ) -> Div {
         let now = Instant::now();
         let font = gpui::font(theme.font_ui.clone());
-        let tabs: Vec<Shown> = match (&self.snapshot, &shown_ws) {
+        let label_w = |label: &str, window: &mut Window| {
+            let run = gpui::TextRun { len: label.len(), font: font.clone(), color: theme.text, background_color: None, underline: None, strikethrough: None };
+            f32::from(window.text_system().shape_line(label.to_string().into(), px(FONT_SIZE), &[run], None).width)
+        };
+        let mut tabs: Vec<Shown> = match (&self.snapshot, &shown_ws) {
             (Some(s), Some(ws)) => {
                 let agents = s.agents();
                 s.tabs_of(ws)
                     .into_iter()
                     .map(|t| {
-                        let run = gpui::TextRun {
-                            len: t.label.len(),
-                            font: font.clone(),
-                            color: theme.text,
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        };
-                        let label_w = window.text_system().shape_line(t.label.clone().into(), px(FONT_SIZE), &[run], None).width;
+                        let label_w = label_w(&t.label, window);
                         let agent = agents.iter().find(|p| p.tab_id == t.tab_id).and_then(|p| p.agent.as_deref());
                         let zoomed = s.layouts.iter().any(|l| l.tab_id == t.tab_id && l.zoomed);
                         Shown {
+                            face: Face::Herdr,
                             id: t.tab_id.clone(),
                             label: t.label.clone(),
                             status: t.agent_status,
                             icon: agent_icon(agent),
                             tint: agent_tint(agent, theme),
                             zoomed,
-                            width: tab_width(f32::from(label_w), zoomed),
+                            width: tab_width(label_w, zoomed),
                         }
                     })
                     .collect()
             }
             _ => Vec::new(),
+        };
+        // the workspace's file tabs, past a divider
+        let files_key = shown_ws.as_deref().and_then(|ws| self.tabs_key(ws));
+        let file_tabs = files_key.as_ref().and_then(|k| self.file_tabs.get(k)).map(|t| t.files.clone()).unwrap_or_default();
+        if !file_tabs.is_empty() {
+            let blank = (theme.text_muted, theme.text_muted);
+            tabs.push(Shown { face: Face::Divider, id: "file-divider".into(), label: String::new(), status: AgentStatus::Idle, icon: "", tint: blank, zoomed: false, width: DIVIDER_W });
+        }
+        for f in &file_tabs {
+            let label = f.path.file_name().map_or_else(|| f.path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+            let width = tab_width(label_w(&label, window), false);
+            // ponytail: nothing is dirty until tabs edit (E1)
+            let face = Face::File { tab: f.id, preview: f.preview, dirty: false };
+            let icon = crate::files::icons::material_icon(&label, false, false);
+            tabs.push(Shown { face, id: file_entry_id(f.id), label, status: AgentStatus::Idle, icon, tint: (theme.text_muted, theme.text_muted), zoomed: false, width });
+        }
+        // the bar's selected slot: the file tab shown, else herdr's tab
+        let shown_tab = match self.shown_file_tab() {
+            Some((_, f)) => Some(file_entry_id(f.id)),
+            None => shown_tab,
         };
         self.tab_bar.sync(shown_ws.as_deref(), tabs, now);
 
@@ -459,10 +517,19 @@ impl Shell {
         let mut flying = Vec::new();
         for (entry, (slot_x, full_w, k)) in self.tab_bar.entries.clone().into_iter().zip(layout) {
             let t = entry.tab.clone();
+            if t.face == Face::Divider {
+                items.push(divider(theme, k));
+                continue;
+            }
+            let file = match t.face {
+                Face::File { tab, .. } => files_key.clone().map(|key| (key, tab)),
+                _ => None,
+            };
             let closing = entry.exit.is_some();
             let selected = !closing && shown_tab.as_deref() == Some(t.id.as_str());
-            let editing = (!closing).then(|| self.rename_field(&RenameTarget::Tab(t.id.clone()), cx)).flatten();
-            let draggable = editing.is_none();
+            let editing = (!closing && file.is_none()).then(|| self.rename_field(&RenameTarget::Tab(t.id.clone()), cx)).flatten();
+            // ponytail: file tabs are reordered by drag in X1
+            let draggable = editing.is_none() && file.is_none();
             let full_w = if draggable { full_w } else { MAX_W };
             // While dragged, the ghost carries the tab; while it flies home, a copy over everything does.
             let lifted = lifted_id.as_deref() == Some(t.id.as_str()) || entry.lifted(now);
@@ -479,7 +546,7 @@ impl Shell {
                                 .border_color(theme.border.opacity(1. - t_land))
                                 .child(div().flex_1().min_w_0().truncate().child(t.label.clone()))
                                 .when(t.zoomed, |el| el.child(zoom_mark(theme)))
-                                .child(dot_slot(theme, t.status)),
+                                .child(dot_slot(theme, &t)),
                         ),
                     )
                     .with_priority(1)
@@ -503,7 +570,7 @@ impl Shell {
                         .relative()
                         .rounded(px(6.))
                         .hover(|s| s.bg(theme.hover))
-                        .child(dot_slot(theme, t.status).absolute().inset_0().group_hover(group.clone(), |s| s.opacity(0.)))
+                        .child(dot_slot(theme, &t).absolute().inset_0().group_hover(group.clone(), |s| s.opacity(0.)))
                         .child(
                             div()
                                 .absolute()
@@ -516,15 +583,18 @@ impl Shell {
                                 .child(gpui::svg().path("icons/close.svg").size(px(12.)).text_color(theme.text_muted)),
                         )
                         .when(!closing, |el| {
-                            let id = t.id.clone();
+                            let (id, file) = (t.id.clone(), file.clone());
                             // the tab owns a drag: claim the press so it closes instead of starting one
                             el.on_mouse_down(MouseButton::Left, |_, window, cx| {
                                 window.prevent_default();
                                 cx.stop_propagation();
                             })
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                                 cx.stop_propagation();
-                                this.send(Command::CloseTab { tab_id: id.clone() }, cx, |_, _, _| {});
+                                match &file {
+                                    Some((key, tab)) => this.close_file_tab(key, *tab, window, cx),
+                                    None => this.send(Command::CloseTab { tab_id: id.clone() }, cx, |_, _, _| {}),
+                                }
                             }))
                         }),
                 );
@@ -548,6 +618,21 @@ impl Shell {
                 .child(content);
             if closing {
                 items.push(tab.into_any_element());
+                continue;
+            }
+            // a file tab: a click shows it, a double-click pins it, a middle-click closes it
+            if let Some((key, file)) = file {
+                let (pin, close) = (key.clone(), key.clone());
+                items.push(
+                    tab.on_mouse_down(MouseButton::Middle, cx.listener(move |this, _: &MouseDownEvent, window, cx| this.close_file_tab(&close, file, window, cx)))
+                        .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
+                            this.show_file_tab(&key, file, cx);
+                            if e.click_count() == 2 {
+                                this.pin_file_tab(&pin, file, cx);
+                            }
+                        }))
+                        .into_any_element(),
+                );
                 continue;
             }
             let i = index;
@@ -598,8 +683,7 @@ impl Shell {
                         this.start_rename(RenameTarget::Tab(id.clone()), label.clone(), window, cx);
                         return;
                     }
-                    this.selected_tab = Some(id.clone());
-                    cx.notify();
+                    this.show_herdr_tab(Some(id.clone()), true, cx);
                 }))
                 .into_any_element(),
             );
@@ -705,7 +789,7 @@ mod tests {
     use super::*;
 
     fn tab(id: &str) -> Shown {
-        Shown { id: id.into(), label: id.into(), status: AgentStatus::Idle, icon: "", tint: (gpui::black(), gpui::white()), zoomed: false, width: 100. }
+        Shown { face: Face::Herdr, id: id.into(), label: id.into(), status: AgentStatus::Idle, icon: "", tint: (gpui::black(), gpui::white()), zoomed: false, width: 100. }
     }
 
     #[test]

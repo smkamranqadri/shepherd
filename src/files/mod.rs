@@ -2,6 +2,8 @@
 pub mod content;
 pub mod highlight;
 pub mod icons;
+pub mod open_files;
 pub mod roots;
 pub mod runner;
+pub mod tabs;
 pub mod tree;

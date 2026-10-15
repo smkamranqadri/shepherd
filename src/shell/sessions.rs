@@ -573,7 +573,7 @@ impl Shell {
         self.panes.clear();
         self.recent_panes.clear();
         self.focused = None;
-        self.selected_tab = None;
+        self.show_herdr_tab(None, false, cx);
         self.shown_workspace = None;
         self.marked_seen = None;
         self.focus_next = None;
