@@ -31,6 +31,12 @@ ureq = "3.4.2"
 toml_edit = "0.25"
 emojis = "0.9.0"
 unicode-width = "0.2"
+# The file viewer's highlighting: syntect's parser on fancy-regex (pure Rust, no Oniguruma to build), bat's syntaxes
+# from two-face; no syntect themes, the colours are the terminal palette's.
+syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
+# An image's size from its header, for the viewer's pixel budget (already in the tree, through gpui).
+imagesize = "0.14"
 
 # The Dock, notifications' authorization and Secure Keyboard Entry.
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -166,12 +166,28 @@ struct Selection {
     anchor: usize,
     dragging: bool,
     spans: Vec<Span>,
+    /// When it was made (`next_stamp`): the file viewer's own selection, made later, copies over it.
+    at: u64,
 }
 
 // ponytail: one selection and one list for the app; a second markdown surface would need Zeron's scoped keys
 thread_local! {
     static PAINTED: RefCell<Vec<Painted>> = const { RefCell::new(Vec::new()) };
     static SELECTION: RefCell<Option<Selection>> = const { RefCell::new(None) };
+    static STAMP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A clock for selections: the one made last is the one Cmd+C copies, whichever surface made it.
+pub fn next_stamp() -> u64 {
+    STAMP.with(|s| {
+        s.set(s.get() + 1);
+        s.get()
+    })
+}
+
+/// When the markdown selection was made, while there is one.
+pub fn selection_stamp() -> Option<u64> {
+    SELECTION.with(|s| s.borrow().as_ref().map(|s| s.at))
 }
 
 /// Clears the paint-order list; painted before the first paragraph.
@@ -217,7 +233,7 @@ fn resolve(painted: &[(SharedString, SharedString)], a: (usize, usize), b: (usiz
 }
 
 /// The alphanumeric run around byte `ix` for a double click, or the one character there.
-fn word(text: &str, ix: usize) -> Range<usize> {
+pub(crate) fn word(text: &str, ix: usize) -> Range<usize> {
     let ix = ix.min(text.len());
     let is_word = |c: char| c.is_alphanumeric() || c == '_';
     let start = text[..ix].char_indices().rev().take_while(|(_, c)| is_word(*c)).last().map_or(ix, |(i, _)| i);
@@ -269,7 +285,7 @@ fn paint_selection(window: &mut Window, hitbox: Hitbox, key: &SharedString, text
                 _ => 0..down_text.len(),
             };
             let spans = vec![Span { key: down_key.clone(), range: range.clone(), text: down_text.clone() }];
-            SELECTION.with(|s| *s.borrow_mut() = Some(Selection { anchor_key: down_key.clone(), anchor: range.start, dragging: true, spans }));
+            SELECTION.with(|s| *s.borrow_mut() = Some(Selection { anchor_key: down_key.clone(), anchor: range.start, dragging: true, spans, at: next_stamp() }));
             window.refresh();
         } else if SELECTION.with(|s| s.borrow().as_ref().is_some_and(|s| s.anchor_key == down_key && !s.dragging)) {
             // a press anywhere else (another paragraph claims it right after) clears the selection

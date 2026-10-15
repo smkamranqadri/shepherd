@@ -1324,8 +1324,7 @@ async fn open_at(client: &Client, editor: Option<String>, path: &Path, line: Opt
 
 /// Whether the viewer can show the file: the formats gpui decodes.
 pub fn is_image(path: &Path) -> bool {
-    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
-    matches!(ext.as_deref(), Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "svg" | "ico"))
+    crate::files::content::is_image(path)
 }
 
 /// A clicked path as a file that exists: `~` is home, a relative path is the pane's shell's.

@@ -33,6 +33,7 @@ mod sessions;
 mod sidebar;
 mod sync;
 mod tab_bar;
+mod viewers;
 pub(crate) mod widgets;
 mod workspaces;
 use motion::*;
@@ -127,6 +128,12 @@ pub struct Shell {
     panel_has_pr: bool,
     /// The right panel's Files, Changes and Search tabs.
     side_panel: Entity<crate::ui::side_panel::SidePanel>,
+    /// The file viewers over the pane grid, one per workspace (`roots::root_key`), the most recently opened first.
+    viewers: Vec<(String, Entity<crate::ui::viewer::FileViewer>)>,
+    /// Viewers of workspaces that closed, retired on the next render (which has the window their focus is in).
+    viewers_gone: Vec<Entity<crate::ui::viewer::FileViewer>>,
+    /// The viewer drawn at the last render: when another takes its place, its image leaves gpui's cache.
+    viewer_drawn: Option<gpui::EntityId>,
     /// Workspaces (`roots::root_key`) whose root was guessed this run, true while the guess runs: one guess per
     /// workspace and run, so one that found nothing (home, `/`) leaves "No folder" up rather than ask git again.
     root_guesses: std::collections::BTreeMap<String, bool>,
@@ -410,7 +417,8 @@ impl Shell {
                     crate::ui::side_panel::SidePanelEvent::Dismiss => s.focus_pane(window, cx),
                     crate::ui::side_panel::SidePanelEvent::ChooseRoot => s.choose_root(window, cx),
                     crate::ui::side_panel::SidePanelEvent::UsePaneFolder => s.use_pane_folder(window, cx),
-                    crate::ui::side_panel::SidePanelEvent::OpenFile(path) => crate::terminal::pane::open_in_editor(path.clone(), None, None, s.active_pane(window, cx), cx),
+                    crate::ui::side_panel::SidePanelEvent::OpenFile(path) => s.open_file(path.clone(), None, window, cx),
+                    crate::ui::side_panel::SidePanelEvent::OpenInEditor(path) => s.open_in_editor_from_panel(path.clone(), window, cx),
                 })
                 .detach();
                 let mut shell = Shell {
@@ -455,6 +463,9 @@ impl Shell {
                     panel_tab: SettingsGlobal::of(cx).settings.panel_tab,
                     panel_has_pr: false,
                     side_panel: side_panel.clone(),
+                    viewers: Vec::new(),
+                    viewers_gone: Vec::new(),
+                    viewer_drawn: None,
                     root_guesses: Default::default(),
                     root_menu: None,
                     review_poll: None,
@@ -1288,7 +1299,8 @@ impl Render for Shell {
         if std::mem::take(&mut self.popup_closed) && !self.panes.values().any(|p| p.read(cx).focus_handle(cx).is_focused(window)) {
             self.focused = None;
         }
-        let overlaid = self.settings.is_some() || self.command_panel.as_ref().is_some_and(|p| p.is_open()) || self.floating_open();
+        let (viewer, viewer_focused) = self.sync_viewers(window, cx);
+        let overlaid = self.settings.is_some() || self.command_panel.as_ref().is_some_and(|p| p.is_open()) || self.floating_open() || viewer_focused;
         for f in &shown {
             if !self.panes.contains_key(&f.pane_id) {
                 let id = f.pane_id.clone();
@@ -1321,6 +1333,10 @@ impl Render for Shell {
             window.focus(&self.focus, cx);
             self.focused = None;
         }
+        if let Some(viewer) = &viewer {
+            self.viewer_takes_keys(viewer, window, cx);
+        }
+        let viewer_markdown = viewer.as_ref().is_some_and(|v| v.read(cx).shows_markdown());
         let shown_ws = tab.as_ref().map(|t| t.workspace_id.clone());
         let shown_tab = tab.as_ref().map(|t| t.tab_id.clone());
         let sidebar_w = self.sidebar_now();
@@ -1448,6 +1464,8 @@ impl Render for Shell {
                     )
             }))
             .children(pane_drop)
+            // under herdr's popup, which is modal
+            .children(viewer.map(Shell::viewer_overlay))
             .children(floating);
 
         let show_bar = SettingsGlobal::of(cx).settings.show_status_bar;
@@ -1511,20 +1529,22 @@ impl Render for Shell {
         let files_shown = side_shown && self.shown_panel_tab() == crate::settings::PanelTab::Files;
         let active = window.is_window_active();
         self.side_panel.update(cx, |p, cx| p.set_files_shown(files_shown, active, cx));
-        if !(pr_shown && !on_page) {
+        if !(pr_shown && !on_page) && !viewer_markdown {
             // a hidden panel's selection is not Cmd+C's to copy
             crate::ui::markdown::forget();
         }
         let root = div()
             .id("root")
             .track_focus(&self.focus)
-            .capture_key_down(cx.listener(|s, e: &gpui::KeyDownEvent, _, cx| {
+            .capture_key_down(cx.listener(|s, e: &gpui::KeyDownEvent, window, cx| {
                 s.touch(cx);
-                // Cmd+C (Ctrl+C off macOS) over a selection in the review panel copies it, not the pane's
+                // Cmd+C (Ctrl+C off macOS) over a selection in the review panel copies it, not the pane's; the
+                // viewer, with the keyboard, copies its own
                 let m = &e.keystroke.modifiers;
+                let viewer = s.shown_viewer().is_some_and(|v| v.read(cx).focus_handle(cx).contains_focused(window, cx));
                 let copy = if cfg!(target_os = "macos") { m.platform && !(m.shift || m.alt || m.control) } else { m.control && !(m.alt || m.platform) };
                 if copy
-                    && e.keystroke.key == "c"
+                    && !viewer
                     && let Some(text) = crate::ui::markdown::selected_text()
                 {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
@@ -1610,6 +1630,9 @@ impl Render for Shell {
                 this.end_panel_drag(cx);
                 this.end_agents_drag(cx);
             }))
+            // one reset of the selectable markdown's paint list for the frame, before the PR tab's description
+            // and logs and the viewer's preview paint theirs
+            .child(crate::ui::markdown::frame_reset())
             .child(self.drag_strip())
             .children(self.resize_cursor())
             .when(sidebar_w > 0. && !on_page, |el| {

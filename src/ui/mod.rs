@@ -9,6 +9,7 @@ pub mod settings;
 pub mod side_panel;
 pub mod statusbar;
 pub mod toast;
+pub mod viewer;
 
 use crate::theme::Theme;
 use gpui::{ElementId, px};

@@ -125,7 +125,7 @@ impl Shell {
     }
 
     /// The shown place's key (`Place::key`), once the places are listed.
-    fn shown_place(&self) -> Option<String> {
+    pub(super) fn shown_place(&self) -> Option<String> {
         self.places.iter().find(|p| self.places_shown(p)).map(|p| p.key())
     }
 
@@ -493,8 +493,6 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .gap(px(16.))
-                    // one reset for the description's and the logs' selectable text, before either paints
-                    .child(crate::ui::markdown::frame_reset())
                     .children(body);
                 (body.into_any_element(), footer)
             }

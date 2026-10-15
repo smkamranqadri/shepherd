@@ -35,8 +35,11 @@ pub enum SidePanelEvent {
     ChooseRoot,
     /// "Use focused pane's folder" under "No folder".
     UsePaneFolder,
-    /// A file clicked in the tree, or its menu's "Open in editor": the Shell opens it beside the focused pane.
+    /// A file clicked in the tree, Enter on it, or its menu's "Open": the Shell shows it in the viewer over the panes.
     OpenFile(std::path::PathBuf),
+    /// Cmd+Enter (Ctrl+Enter on Linux) on a file, or its menu's "Open in editor": the Shell opens it in the editor,
+    /// beside the focused pane.
+    OpenInEditor(std::path::PathBuf),
 }
 
 pub struct SidePanel {
@@ -166,6 +169,12 @@ impl Render for SidePanel {
             .key_context("SidePanel")
             .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, _, cx| {
                 let m = &e.keystroke.modifiers;
+                if e.keystroke.key == "enter" && crate::platform::link_modifier(m) && !m.alt && !m.shift && this.tab == PanelTab::Files && !this.context.remote {
+                    if this.open_selected_in_editor(cx) {
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
                 if m.platform || m.control || m.alt || m.shift {
                     return;
                 }
@@ -175,7 +184,8 @@ impl Render for SidePanel {
                 } else if this.tab == PanelTab::Files && !this.context.remote && this.files_key(&e.keystroke.key, cx) {
                     cx.stop_propagation();
                 }
-            }))            .size_full()
+            }))
+            .size_full()
             .flex()
             .flex_col()
             .child(body)

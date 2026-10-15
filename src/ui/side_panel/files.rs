@@ -362,8 +362,8 @@ impl SidePanel {
         self.rebuild_files(cx);
     }
 
-    /// A click or Enter on the entry at `path`: a folder opens or folds, a file goes to the editor; a link to a
-    /// folder outside the root does neither.
+    /// A click or Enter on the entry at `path`: a folder opens or folds, a file (an image too) goes to the viewer; a
+    /// link to a folder outside the root does neither.
     fn activate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let Some(entry) = self.files.as_ref().and_then(|t| t.index_of(&path).map(|i| t.rows[i].clone())) else { return };
         let Row::Entry { entry, .. } = entry else { return };
@@ -371,15 +371,20 @@ impl SidePanel {
             self.toggle_folder(path, cx);
         } else if entry.is_dir() || entry.kind == tree::EntryKind::Dangling {
             // a link out of the root, or to nothing
-        } else if crate::terminal::pane::is_image(&path) {
-            // ponytail: until the viewer (M4), images go to the system's viewer, not to an editor (nvim would
-            // show their bytes)
-            self.rt.spawn(async move {
-                let _ = tokio::process::Command::new(crate::platform::OPEN).arg(&path).status().await;
-            });
         } else {
             cx.emit(SidePanelEvent::OpenFile(path));
         }
+    }
+
+    /// Cmd+Enter (Ctrl+Enter on Linux): the selected file to the editor. True when a file was selected.
+    pub(super) fn open_selected_in_editor(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(tree) = self.files.as_ref() else { return false };
+        let Some(Row::Entry { path, entry, .. }) = tree.selected_index().map(|i| &tree.rows[i]) else { return false };
+        if entry.is_dir() || entry.kind == tree::EntryKind::Dangling {
+            return false;
+        }
+        cx.emit(SidePanelEvent::OpenInEditor(path.clone()));
+        true
     }
 
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -567,10 +572,15 @@ impl SidePanel {
                 cx.notify();
             }))
             .when(file, |el| {
-                let path = path.clone();
-                el.child(item("file-menu-editor", "icons/solar/pen-new-square.svg", "Open in editor").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                let (open, editor) = (path.clone(), path.clone());
+                el.child(item("file-menu-open", "icons/solar/file-text.svg", "Open").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     close(this);
-                    cx.emit(SidePanelEvent::OpenFile(path.clone()));
+                    cx.emit(SidePanelEvent::OpenFile(open.clone()));
+                    cx.notify();
+                })))
+                .child(item("file-menu-editor", "icons/solar/pen-new-square.svg", "Open in editor").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    close(this);
+                    cx.emit(SidePanelEvent::OpenInEditor(editor.clone()));
                     cx.notify();
                 })))
             })
