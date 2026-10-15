@@ -405,3 +405,23 @@ pub(crate) fn row(theme: &Theme, selected: bool, id: impl Into<gpui::ElementId>)
         .when(selected, |el| el.bg(theme.selected))
         .when(!selected, |el| el.hover(move |s| s.bg(hover)))
 }
+
+/// The small "DEV" pill of a dev build, its tooltip the commit it was built from.
+pub(crate) fn dev_badge(theme: &Theme) -> Stateful<Div> {
+    let tooltip = match option_env!("GIT_HASH") {
+        Some(hash) => format!("Dev build · {hash}"),
+        None => "Dev build".to_string(),
+    };
+    div()
+        .id("dev-badge")
+        .flex_none()
+        .ml(px(6.))
+        .px(px(5.))
+        .rounded(px(4.))
+        .bg(theme.warning.opacity(0.18))
+        .text_size(px(9.))
+        .font_weight(gpui::FontWeight::BOLD)
+        .text_color(theme.warning)
+        .child("DEV")
+        .tooltip(tip(tooltip, None))
+}

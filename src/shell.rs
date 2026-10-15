@@ -328,7 +328,7 @@ impl Shell {
             }),
             app_owns_titlebar_drag: true,
             window_background: window_background(SettingsGlobal::of(cx).settings.translucent_window),
-            app_id: Some("dev.freethinkel.shepherd".into()),
+            app_id: Some(if is_dev_build() { "dev.freethinkel.shepherd-dev" } else { "dev.freethinkel.shepherd" }.into()),
             // off macOS the titlebar is Shepherd's own, buttons and all, not the desktop's bar over it
             window_decorations: (!cfg!(target_os = "macos")).then_some(gpui::WindowDecorations::Client),
             ..Default::default()
@@ -1126,10 +1126,21 @@ pub(crate) fn window_background(translucent: bool) -> WindowBackgroundAppearance
     if translucent { WindowBackgroundAppearance::Blurred } else { WindowBackgroundAppearance::Opaque }
 }
 
+/// Whether this is a dev build, which says so (title, app id, a DEV badge): a debug build, unless `SHEPHERD_DEV_BADGE`
+/// is `0` or `1` to force it off or on.
+pub(crate) fn is_dev_build() -> bool {
+    static DEV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEV.get_or_init(|| match std::env::var("SHEPHERD_DEV_BADGE").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => cfg!(debug_assertions),
+    })
+}
+
 /// AppKit lays the traffic lights out again while the window is inactive (a screen recorder takes focus), and gpui
 /// moves them back only when it becomes key; setting the title (hidden) re-applies `traffic_light_position`.
 fn reapply_traffic_lights(window: &mut Window) {
-    window.set_window_title("Shepherd");
+    window.set_window_title(if is_dev_build() { "Shepherd (dev)" } else { "Shepherd" });
 }
 
 /// How long the Mac may sit without a key or a pointer move before Shepherd gives its panes' size away.

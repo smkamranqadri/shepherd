@@ -468,6 +468,7 @@ impl Shell {
                     .text_color(theme.text_faint)
                     // the herdr session shown, as Arc names the space
                     .child(div().flex_1().truncate().child(self.place_label(cx)))
+                    .when(is_dev_build(), |el| el.child(dev_badge(theme)))
                     // the place's own snapshot hasn't come yet: the list is its last, or none
                     .when(waiting, |el| el.child(crate::ui::loader::mini_spinner(2., theme.text_faint, window))),
             )
