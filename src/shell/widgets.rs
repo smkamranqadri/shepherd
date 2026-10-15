@@ -219,7 +219,7 @@ pub(super) trait Pick: StatefulInteractiveElement + Sized {
 impl Pick for Stateful<Div> {}
 
 /// A row of the sidebar's `…` menu: icon, label, a check on the current choice.
-pub(super) fn menu_choice(theme: &Theme, id: &'static str, icon: &'static str, label: &'static str, checked: bool) -> Stateful<Div> {
+pub(crate) fn menu_choice(theme: &Theme, id: &'static str, icon: &'static str, label: &'static str, checked: bool) -> Stateful<Div> {
     row(theme, false, id)
         .h(px(28.))
         .rounded(px(6.))
@@ -262,7 +262,7 @@ pub(crate) fn tip(text: impl Into<SharedString>, action: Option<&'static str>) -
 }
 
 /// Zeron's titlebar button: 24 px, a 16 px muted icon, a wash on hover. It occludes the drag strip under it.
-pub(super) fn titlebar_button(theme: &Theme, id: &'static str, icon: &'static str) -> Stateful<Div> {
+pub(crate) fn titlebar_button(theme: &Theme, id: &'static str, icon: &'static str) -> Stateful<Div> {
     let hover = theme.hover;
     div()
         .id(id)

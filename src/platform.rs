@@ -18,6 +18,21 @@ pub const OPEN: &str = if cfg!(target_os = "macos") {
     "xdg-open"
 };
 
+/// The command that shows `path` in the file manager: Finder and Explorer select it (`open -R`, `explorer
+/// /select,`); Linux has no portable way to select a file (the FileManager1 D-Bus call is not everywhere), so its
+/// folder opens.
+pub fn reveal_command(path: &std::path::Path) -> (&'static str, Vec<std::ffi::OsString>) {
+    if cfg!(target_os = "macos") {
+        return ("open", vec!["-R".into(), path.into()]);
+    }
+    if cfg!(windows) {
+        let mut select = std::ffi::OsString::from("/select,");
+        select.push(path);
+        return (OPEN, vec![select]);
+    }
+    (OPEN, vec![path.parent().unwrap_or(path).into()])
+}
+
 /// The terminal's own shortcut for `key` (copy, paste, find, find next): Cmd+key on macOS, Ctrl+Shift+key elsewhere
 /// (`terminal::keys::app_shortcut`).
 pub fn terminal_chord(key: &str, mods: &Modifiers) -> Option<&'static str> {

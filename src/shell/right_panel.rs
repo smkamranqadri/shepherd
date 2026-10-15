@@ -396,6 +396,28 @@ impl Shell {
         Some(gpui::deferred(anchored).with_priority(1).into_any_element())
     }
 
+    /// The Files tab's header buttons: hidden files, git-ignored files (each lit while shown, and saved), and a
+    /// refresh that reads the open folders again and asks git afresh (the poll only asks when names change).
+    fn files_header(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let settings = &SettingsGlobal::of(cx).settings;
+        let (hidden, ignored) = (settings.panel_show_hidden, settings.panel_show_ignored);
+        let toggle = |id: &'static str, icon: &'static str, on: bool, label: &'static str| {
+            titlebar_button(theme, id, icon).when(on, |el| el.bg(theme.selected)).tooltip(tip(label, None))
+        };
+        vec![
+            toggle("files-hidden", "icons/solar/eye.svg", hidden, if hidden { "Hide hidden files" } else { "Show hidden files" })
+                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| save_from_sidebar(cx, |s| s.panel_show_hidden = !hidden)))
+                .into_any_element(),
+            toggle("files-ignored", "icons/solar/eye-closed.svg", ignored, if ignored { "Hide git-ignored files" } else { "Show git-ignored files" })
+                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| save_from_sidebar(cx, |s| s.panel_show_ignored = !ignored)))
+                .into_any_element(),
+            titlebar_button(theme, "files-refresh", "icons/solar/refresh.svg")
+                .tooltip(tip("Refresh", None))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.side_panel.update(cx, |p, cx| p.refresh_files(cx))))
+                .into_any_element(),
+        ]
+    }
+
     /// The panel, and its edge: drag to resize, double-click for the default width.
     pub(super) fn render_right_panel(&mut self, theme: &Theme, shown: &ShownReview, window: &mut Window, cx: &mut Context<Self>) -> [AnyElement; 2] {
         let tab = self.shown_panel_tab();
@@ -436,6 +458,7 @@ impl Shell {
         }).collect();
         let (title, actions): (SharedString, Vec<AnyElement>) = match tab {
             PanelTab::Pr => self.review_header(theme, shown, window, cx),
+            PanelTab::Files if root.is_some() => (tab.label().into(), self.files_header(theme, cx)),
             other => (other.label().into(), Vec::new()),
         };
         let header = div()

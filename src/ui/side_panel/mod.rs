@@ -1,6 +1,8 @@
 //! The right panel's Files, Changes and Search tabs: one entity beside the Shell, which keeps the panel's frame (its
 //! tab strip, edge and width) and the PR tab. It holds what those tabs show and the work that fills them, so a
 //! keystroke in Search re-renders the panel, not the window.
+mod files;
+
 use crate::settings::PanelTab;
 use crate::theme::Theme;
 use gpui::{Context, EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Render, SharedString, Styled, Window, div, prelude::*, px};
@@ -33,26 +35,41 @@ pub enum SidePanelEvent {
     ChooseRoot,
     /// "Use focused pane's folder" under "No folder".
     UsePaneFolder,
+    /// A file clicked in the tree, or its menu's "Open in editor": the Shell opens it beside the focused pane.
+    OpenFile(std::path::PathBuf),
 }
 
 pub struct SidePanel {
     focus: FocusHandle,
-    /// Where processes (`files::runner`) run.
-    #[allow(dead_code)] // the tabs' work (M2 on) runs there
+    /// Where processes (`files::runner`) and folder reads run.
     rt: Handle,
     tab: PanelTab,
     context: PanelContext,
+    /// The Files tab's tree of the context's root, once the tab has shown it.
+    files: Option<files::FileTree>,
+    file_menu: Option<crate::ui::Popup<files::FileMenu>>,
+    /// The Files tab is on screen in the active window: its open folders are polled.
+    files_live: bool,
 }
 
 impl SidePanel {
     pub fn new(rt: Handle, tab: PanelTab, cx: &mut Context<Self>) -> SidePanel {
-        SidePanel { focus: cx.focus_handle(), rt, tab, context: PanelContext::default() }
+        // the poll's clock: a tick does nothing unless the Files tab is live
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(files::POLL).await;
+            if this.update(cx, |p, cx| p.poll_files(cx)).is_err() {
+                return;
+            }
+        })
+        .detach();
+        SidePanel { focus: cx.focus_handle(), rt, tab, context: PanelContext::default(), files: None, file_menu: None, files_live: false }
     }
 
     /// Takes the Shell's view of things; called every render, so it notifies only on a change.
     pub fn set_context(&mut self, context: PanelContext, cx: &mut Context<Self>) {
         if self.context != context {
             self.context = context;
+            self.sync_files(cx);
             cx.notify();
         }
     }
@@ -60,6 +77,7 @@ impl SidePanel {
     pub fn set_tab(&mut self, tab: PanelTab, cx: &mut Context<Self>) {
         if self.tab != tab {
             self.tab = tab;
+            self.sync_files(cx);
             cx.notify();
         }
     }
@@ -105,8 +123,8 @@ fn notice(theme: &Theme, title: impl Into<SharedString>, hint: impl Into<SharedS
 }
 
 impl Render for SidePanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = &Theme::of(cx).clone();
         let body = if self.context.remote {
             notice(theme, "Files on herdr machines aren't supported yet", "Local only for now.").into_any_element()
         } else if self.context.root.is_none() && (self.context.guessing || self.context.workspace_id.is_none()) {
@@ -130,9 +148,11 @@ impl Render for SidePanel {
                 .child(notice(theme, "No folder", "Pick the folder this workspace's files, changes and search are in."))
                 .child(buttons)
                 .into_any_element()
+        } else if self.tab == PanelTab::Files {
+            self.render_files(theme, window, cx)
         } else {
             let (title, hint) = match self.tab {
-                PanelTab::Files => ("Files", "The workspace's folder will be listed here."),
+                PanelTab::Files => ("Files", ""),
                 PanelTab::Changes => ("Changes", "The workspace's git changes will be listed here."),
                 PanelTab::Search => ("Search", "Search across the workspace's folder will be here."),
                 // the Shell draws the PR tab itself
@@ -144,14 +164,18 @@ impl Render for SidePanel {
             .id("side-panel")
             .track_focus(&self.focus)
             .key_context("SidePanel")
-            .on_key_down(cx.listener(|_, e: &gpui::KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, _, cx| {
                 let m = &e.keystroke.modifiers;
-                if e.keystroke.key == "escape" && !(m.platform || m.control || m.alt || m.shift) {
+                if m.platform || m.control || m.alt || m.shift {
+                    return;
+                }
+                if e.keystroke.key == "escape" {
                     cx.emit(SidePanelEvent::Dismiss);
                     cx.stop_propagation();
+                } else if this.tab == PanelTab::Files && !this.context.remote && this.files_key(&e.keystroke.key, cx) {
+                    cx.stop_propagation();
                 }
-            }))
-            .size_full()
+            }))            .size_full()
             .flex()
             .flex_col()
             .child(body)

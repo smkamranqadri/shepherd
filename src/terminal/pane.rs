@@ -754,33 +754,12 @@ impl PaneTerminal {
         let editor = cx.try_global::<crate::settings::SettingsGlobal>().and_then(|s| s.settings.editor.clone());
         let (client, pane_id) = (client.clone(), self.pane_id.clone());
         let opened = rt.spawn(async move {
-            let pane = client.call("pane.get", serde_json::json!({"pane_id": pane_id})).await.map(|r| r["pane"].clone()).unwrap_or_default();
-            let cwd = pane["foreground_cwd"].as_str().or(pane["cwd"].as_str()).unwrap_or("/");
-            let path = resolve(&path, Path::new(cwd))?;
+            let cwd = pane_cwd(&client, &pane_id).await;
+            let path = resolve(&path, Path::new(&cwd))?;
             if is_image(&path) {
                 return Some(path);
             }
-            // a folder goes to Finder, not the editor
-            if path.is_dir() {
-                let _ = tokio::process::Command::new("open").arg(&path).status().await;
-                return None;
-            }
-            if is_nvim(editor.as_deref()) {
-                // A terminal editor gets a pane to the right; its shell drops typeahead until the prompt is drawn.
-                let params = serde_json::json!({"target_pane_id": pane_id, "direction": "right", "focus": true, "cwd": cwd});
-                let r = client.call("pane.split", params).await.ok()?;
-                let new_pane = r["pane"]["pane_id"].as_str()?;
-                let prompt = serde_json::json!({"type": "regex", "value": "\\S"});
-                let wait = serde_json::json!({"pane_id": new_pane, "source": "recent", "match": prompt, "timeout_ms": 5000});
-                let _ = client.call("pane.wait_for_output", wait).await;
-                let text = nvim_command(editor.as_deref().unwrap_or("nvim"), &path, line, col);
-                let _ = client.call("pane.send_input", serde_json::json!({"pane_id": new_pane, "text": text, "keys": ["enter"]})).await;
-                return None;
-            }
-            let argv = editor_argv(editor.as_deref(), &path, line, col);
-            if let Ok(mut child) = tokio::process::Command::new(&argv[0]).args(&argv[1..]).spawn() {
-                let _ = child.wait().await;
-            }
+            open_at(&client, editor, &path, line, col, Some((&pane_id, &cwd))).await;
             None
         });
         cx.spawn(async move |this, cx| {
@@ -1293,8 +1272,58 @@ impl Preview {
     }
 }
 
+/// Opens `path` (absolute, and there) in the user's editor at its line and column, as a Cmd+click on a path in a
+/// pane does: the right panel's Files tab and a pane's links share it. `pane_id` is the pane nvim opens beside
+/// (without one, nvim has no terminal to run in, and the first GUI editor installed opens it instead); a folder goes
+/// to the file manager.
+pub fn open_in_editor(path: PathBuf, line: Option<u32>, col: Option<u32>, pane_id: Option<String>, cx: &App) {
+    let Some(PaneQueries(client, rt)) = cx.try_global::<PaneQueries>() else { return };
+    let editor = cx.try_global::<crate::settings::SettingsGlobal>().and_then(|s| s.settings.editor.clone());
+    let client = client.clone();
+    rt.spawn(async move {
+        let pane = match pane_id {
+            Some(id) => Some((pane_cwd(&client, &id).await, id)),
+            None => None,
+        };
+        open_at(&client, editor, &path, line, col, pane.as_ref().map(|(cwd, id)| (id.as_str(), cwd.as_str()))).await;
+    });
+}
+
+/// The folder a pane's shell (or the program in front of it) is in, as herdr knows it; `/` when it does not.
+async fn pane_cwd(client: &Client, pane_id: &str) -> String {
+    let pane = client.call("pane.get", serde_json::json!({"pane_id": pane_id})).await.map(|r| r["pane"].clone()).unwrap_or_default();
+    pane["foreground_cwd"].as_str().or(pane["cwd"].as_str()).unwrap_or("/").to_string()
+}
+
+/// `open_in_editor`'s work, on the runtime: `pane` is the pane nvim splits and the folder its new pane starts in.
+async fn open_at(client: &Client, editor: Option<String>, path: &Path, line: Option<u32>, col: Option<u32>, pane: Option<(&str, &str)>) {
+    // a folder goes to Finder, not the editor
+    if path.is_dir() {
+        let _ = tokio::process::Command::new(crate::platform::OPEN).arg(path).status().await;
+        return;
+    }
+    let nvim = is_nvim(editor.as_deref());
+    if let Some((pane_id, cwd)) = pane.filter(|_| nvim) {
+        // A terminal editor gets a pane to the right; its shell drops typeahead until the prompt is drawn.
+        let params = serde_json::json!({"target_pane_id": pane_id, "direction": "right", "focus": true, "cwd": cwd});
+        let Ok(r) = client.call("pane.split", params).await else { return };
+        let Some(new_pane) = r["pane"]["pane_id"].as_str() else { return };
+        let prompt = serde_json::json!({"type": "regex", "value": "\\S"});
+        let wait = serde_json::json!({"pane_id": new_pane, "source": "recent", "match": prompt, "timeout_ms": 5000});
+        let _ = client.call("pane.wait_for_output", wait).await;
+        let text = nvim_command(editor.as_deref().unwrap_or("nvim"), path, line, col);
+        let _ = client.call("pane.send_input", serde_json::json!({"pane_id": new_pane, "text": text, "keys": ["enter"]})).await;
+        return;
+    }
+    // nvim with no pane to open beside: the GUI editors, as with no editor set
+    let argv = editor_argv(if nvim { None } else { editor.as_deref() }, path, line, col);
+    if let Ok(mut child) = tokio::process::Command::new(&argv[0]).args(&argv[1..]).spawn() {
+        let _ = child.wait().await;
+    }
+}
+
 /// Whether the viewer can show the file: the formats gpui decodes.
-fn is_image(path: &Path) -> bool {
+pub fn is_image(path: &Path) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
     matches!(ext.as_deref(), Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "svg" | "ico"))
 }

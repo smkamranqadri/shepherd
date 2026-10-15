@@ -33,7 +33,7 @@ mod sessions;
 mod sidebar;
 mod sync;
 mod tab_bar;
-mod widgets;
+pub(crate) mod widgets;
 mod workspaces;
 use motion::*;
 use sync::sync_loop;
@@ -410,6 +410,7 @@ impl Shell {
                     crate::ui::side_panel::SidePanelEvent::Dismiss => s.focus_pane(window, cx),
                     crate::ui::side_panel::SidePanelEvent::ChooseRoot => s.choose_root(window, cx),
                     crate::ui::side_panel::SidePanelEvent::UsePaneFolder => s.use_pane_folder(window, cx),
+                    crate::ui::side_panel::SidePanelEvent::OpenFile(path) => crate::terminal::pane::open_in_editor(path.clone(), None, None, s.active_pane(window, cx), cx),
                 })
                 .detach();
                 let mut shell = Shell {
@@ -1507,6 +1508,9 @@ impl Render for Shell {
         if !side_shown && self.side_panel.read(cx).focus_handle(cx).contains_focused(window, cx) {
             self.focus_pane(window, cx);
         }
+        let files_shown = side_shown && self.shown_panel_tab() == crate::settings::PanelTab::Files;
+        let active = window.is_window_active();
+        self.side_panel.update(cx, |p, cx| p.set_files_shown(files_shown, active, cx));
         if !(pr_shown && !on_page) {
             // a hidden panel's selection is not Cmd+C's to copy
             crate::ui::markdown::forget();
