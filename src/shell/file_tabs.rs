@@ -169,9 +169,14 @@ impl Shell {
     /// which gives the tab the keyboard. Tabs are kept by the file's real path (`real_path`), so a file reached
     /// through a symlinked root and through its git top level is one tab.
     pub(super) fn open_file(&mut self, path: PathBuf, line: Option<u32>, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_file_at(path, line, None, preview, window, cx);
+    }
+
+    /// `open_file`, going to `fragment` (a markdown link's `#heading`) once the file is in.
+    fn open_file_at(&mut self, path: PathBuf, line: Option<u32>, fragment: Option<String>, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(key) = self.shown_tabs_key() else { return };
         if let Some(real) = self.real_paths.get(&path).cloned() {
-            return self.open_real(key, real, line, preview, window, cx);
+            return self.open_real(key, real, line, fragment, preview, window, cx);
         }
         let real = real_path(&self.rt, path.clone());
         cx.spawn_in(window, async move |this, cx| {
@@ -183,7 +188,7 @@ impl Shell {
                 s.real_paths.insert(path, real.clone());
                 // another workspace or place shown meanwhile: the file is not opened into that one
                 if s.shown_tabs_key().as_deref() == Some(key.as_str()) {
-                    s.open_real(key, real, line, preview, window, cx);
+                    s.open_real(key, real, line, fragment, preview, window, cx);
                 }
             });
         })
@@ -191,7 +196,8 @@ impl Shell {
     }
 
     /// `open_file` with the file's real path in hand.
-    fn open_real(&mut self, key: String, path: PathBuf, line: Option<u32>, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
+    #[allow(clippy::too_many_arguments)]
+    fn open_real(&mut self, key: String, path: PathBuf, line: Option<u32>, fragment: Option<String>, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.restore_tabs(&key, cx);
         let tabs = self.file_tabs.entry(key.clone()).or_default();
         // ponytail: nothing is dirty until tabs edit (E1)
@@ -209,6 +215,9 @@ impl Shell {
             }
             None => self.make_view(id, path, line, window, cx),
         };
+        if let Some(fragment) = fragment {
+            view.update(cx, |v, cx| v.go_to(fragment, cx));
+        }
         if !preview {
             window.focus(&view.read(cx).focus_handle(cx), cx);
         }
@@ -228,6 +237,8 @@ impl Shell {
                 s.show_terminals(cx);
                 crate::terminal::pane::open_in_editor(path.clone(), *line, None, pane, cx);
             }
+            // a markdown link to another file of the root: a tab of its own, which takes the keyboard
+            ViewerEvent::OpenFile { path, line, fragment } => s.open_file_at(path.clone(), *line, fragment.clone(), false, window, cx),
         })
         .detach();
         view.update(cx, |v, cx| v.open(path, line, root, window, cx));

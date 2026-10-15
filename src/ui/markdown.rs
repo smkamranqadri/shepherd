@@ -1,6 +1,10 @@
 //! Zeron's markdown, drawn (adapted from Zeron's `crates/ui/src/markdown/render.rs` and `selection.rs`, MIT): bold,
-//! italic, code, struck and linked runs in one wrapped text per paragraph, links opening in the browser, and text
-//! selection across the paragraphs: a drag selects, a double click a word, a triple click a paragraph; Cmd+C copies.
+//! italic, code, struck and linked runs in one wrapped text per paragraph, and text selection across the paragraphs:
+//! a drag selects, a double click a word, a triple click a paragraph; Cmd+C copies.
+//!
+//! A link goes where [`resolve_link`] says (uherdr's `MarkdownLink`): http(s) and mailto to the browser or mail; a file
+//! inside the workspace root, and a `#heading`, to whoever drew the markdown ([`Links`]); anything else, a file
+//! outside the root or another scheme from an untrusted README, nowhere, drawn faint with the reason as its tooltip.
 //!
 //! gpui selects no plain text, so each paragraph registers itself in a per-frame list in paint order (document
 //! order); a drag anchored in one resolves against that list into a span per paragraph, washed under its glyphs.
@@ -13,20 +17,155 @@ use gpui::{
 };
 use std::cell::RefCell;
 use std::ops::Range;
+use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
-/// `blocks`, keyed under `key` (their paragraphs' selection keys and element ids start with it). A view of them
-/// paints one [`frame_reset`] before the first, however many times it renders some.
-pub fn render(blocks: &[Block], key: &str, theme: &Theme) -> Vec<AnyElement> {
-    blocks.iter().enumerate().map(|(i, b)| block(b, &format!("{key}-{i}"), theme)).collect()
+/// Where a link leads, worked out from its `href` by [`resolve_link`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Link {
+    /// Opens in the browser (or mail).
+    External(String),
+    /// A file inside the root, with the `#fragment` after its path (a heading, or a line as `L12`).
+    File { path: PathBuf, fragment: Option<String> },
+    /// A heading in the same document.
+    Anchor(String),
+    /// Followed nowhere, for this reason.
+    Disabled(String),
 }
 
-fn block(b: &Block, key: &str, theme: &Theme) -> AnyElement {
+/// What `href` does in a document at `place` (the markdown file and the workspace root, both absolute): `None` (the
+/// PR tab's description, which is no file) follows web links only. A leading `/` is the root, as GitHub takes it
+/// for a repository; `..` and `.` are resolved by the text, not the disk.
+pub fn resolve_link(href: &str, place: Option<(&Path, &Path)>) -> Link {
+    let href = href.trim();
+    if href.is_empty() {
+        return Link::Disabled("Empty link".into());
+    }
+    if let Some(scheme) = scheme(href) {
+        return match scheme.as_str() {
+            "http" | "https" | "mailto" => Link::External(href.to_string()),
+            _ => Link::Disabled(format!("{scheme}: links don't open from here")),
+        };
+    }
+    let Some((document, root)) = place else { return Link::Disabled("Only web links open from here".into()) };
+    if let Some(anchor) = href.strip_prefix('#') {
+        return Link::Anchor(decode(anchor));
+    }
+    let (target, fragment) = match href.split_once('#') {
+        Some((target, fragment)) => (target, Some(decode(fragment)).filter(|f| !f.is_empty())),
+        None => (href, None),
+    };
+    let target = decode(target.split_once('?').map_or(target, |(t, _)| t));
+    let base = if target.starts_with('/') { root } else { document.parent().unwrap_or(root) };
+    let path = normalize(&base.join(target.trim_start_matches('/')));
+    if !path.starts_with(normalize(root)) {
+        return Link::Disabled("Outside this workspace's folder".into());
+    }
+    Link::File { path, fragment }
+}
+
+/// `href`'s scheme, lowercased, when it starts with one (`https:`, `file:`, `vscode:`, …).
+fn scheme(href: &str) -> Option<String> {
+    let (scheme, _) = href.split_once(':')?;
+    let mut chars = scheme.chars();
+    (chars.next()?.is_ascii_alphabetic() && chars.all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))).then(|| scheme.to_ascii_lowercase())
+}
+
+fn decode(text: &str) -> String {
+    percent_encoding::percent_decode_str(text).decode_utf8().map_or_else(|_| text.to_string(), |t| t.into_owned())
+}
+
+/// `path` with `.` dropped and `..` taking the folder before it (never above `/`).
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::from("/");
+    for part in path.components() {
+        match part {
+            Component::Normal(name) => out.push(name),
+            Component::ParentDir => {
+                out.pop();
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A line in a link's fragment, GitHub's way (`L12`, or `L12-L20` for its first): 1-based.
+pub fn fragment_line(fragment: &str) -> Option<u32> {
+    let digits = fragment.strip_prefix('L')?;
+    let digits = digits.split_once('-').map_or(digits, |(first, _)| first);
+    digits.parse().ok().filter(|n| *n > 0)
+}
+
+/// A heading's anchor, GitHub's way: lowercased, spaces as `-`, punctuation but `-` and `_` dropped.
+pub fn slug(text: &str) -> String {
+    text.trim()
+        .chars()
+        .filter_map(|c| match c {
+            ' ' => Some('-'),
+            c if c.is_alphanumeric() || c == '-' || c == '_' => Some(c),
+            _ => None,
+        })
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The top-level block a `#anchor` leads to in `blocks`: the heading whose slug it is (the second of two alike is
+/// `-1`, as GitHub numbers them).
+pub fn anchor_block(blocks: &[Block], anchor: &str) -> Option<usize> {
+    let anchor = anchor.to_lowercase();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    blocks.iter().position(|b| {
+        let Block::Heading { runs, .. } = b else { return false };
+        let base = slug(&runs_text(runs));
+        let n = seen.entry(base.clone()).or_insert(0);
+        let id = if *n == 0 { base } else { format!("{base}-{n}") };
+        *n += 1;
+        id == anchor
+    })
+}
+
+/// Follows a `File` or an `Anchor` link.
+type Follow = Rc<dyn Fn(Link, &mut Window, &mut App)>;
+
+/// How a surface's links are followed: where its markdown sits, and who opens a file or jumps to a heading.
+#[derive(Clone, Default)]
+pub struct Links {
+    /// The markdown file and the workspace root, absolute; `None` follows web links only.
+    place: Option<Rc<(PathBuf, PathBuf)>>,
+    follow: Option<Follow>,
+}
+
+impl Links {
+    /// Web links only (the PR tab's description).
+    pub fn web() -> Links {
+        Links::default()
+    }
+
+    /// Links in `document` under `root`: `follow` takes a `File` or an `Anchor` (the web opens here).
+    pub fn local(document: PathBuf, root: PathBuf, follow: impl Fn(Link, &mut Window, &mut App) + 'static) -> Links {
+        Links { place: Some(Rc::new((document, root))), follow: Some(Rc::new(follow)) }
+    }
+
+    fn resolve(&self, href: &str) -> Link {
+        resolve_link(href, self.place.as_deref().map(|(d, r)| (d.as_path(), r.as_path())))
+    }
+}
+
+/// `blocks`, keyed under `key` (their paragraphs' selection keys and element ids start with it), their links
+/// followed as `links` says. A view of them paints one [`frame_reset`] before the first, however many times it
+/// renders some.
+pub fn render(blocks: &[Block], key: &str, links: &Links, theme: &Theme) -> Vec<AnyElement> {
+    blocks.iter().enumerate().map(|(i, b)| block(b, &format!("{key}-{i}"), links, theme)).collect()
+}
+
+fn block(b: &Block, key: &str, links: &Links, theme: &Theme) -> AnyElement {
     match b {
-        Block::Paragraph { runs } => text(runs, key, theme.text_muted, false, theme),
+        Block::Paragraph { runs } => text(runs, key, theme.text_muted, false, links, theme),
         Block::Heading { level, runs } => div()
             .pt(px(4.))
             .text_size(px(if *level <= 1 { 15. } else if *level == 2 { 14. } else { 13. }))
-            .child(text(runs, key, theme.text, true, theme))
+            .child(text(runs, key, theme.text, true, links, theme))
             .into_any_element(),
         Block::CodeBlock { code: c, .. } => code(c, key, px(11.5), theme),
         Block::BlockQuote { children } => div()
@@ -36,7 +175,7 @@ fn block(b: &Block, key: &str, theme: &Theme) -> AnyElement {
             .flex()
             .flex_col()
             .gap(px(6.))
-            .children(children.iter().enumerate().map(|(i, b)| block(b, &format!("{key}-{i}"), theme)))
+            .children(children.iter().enumerate().map(|(i, b)| block(b, &format!("{key}-{i}"), links, theme)))
             .into_any_element(),
         Block::List { ordered_start, items } => div()
             .flex()
@@ -55,7 +194,7 @@ fn block(b: &Block, key: &str, theme: &Theme) -> AnyElement {
                             .flex()
                             .flex_col()
                             .gap(px(4.))
-                            .children(item.iter().enumerate().map(|(j, b)| block(b, &format!("{key}-{i}-{j}"), theme))),
+                            .children(item.iter().enumerate().map(|(j, b)| block(b, &format!("{key}-{i}-{j}"), links, theme))),
                     )
             }))
             .into_any_element(),
@@ -63,7 +202,7 @@ fn block(b: &Block, key: &str, theme: &Theme) -> AnyElement {
             let row = |cells: &[Vec<InlineRun>], r: usize, head: bool| {
                 div().flex().border_t_1().border_color(theme.border).children(cells.iter().enumerate().map(|(c, cell)| {
                     let color = if head { theme.text } else { theme.text_muted };
-                    div().flex_1().min_w_0().px(px(6.)).py(px(4.)).child(text(cell, &format!("{key}-{r}-{c}"), color, head, theme))
+                    div().flex_1().min_w_0().px(px(6.)).py(px(4.)).child(text(cell, &format!("{key}-{r}-{c}"), color, head, links, theme))
                 }))
             };
             div()
@@ -88,18 +227,18 @@ pub fn code(code: &str, key: &str, size: Pixels, theme: &Theme) -> AnyElement {
         .bg(theme.wash(0.05))
         .overflow_hidden()
         .text_size(size)
-        .child(text_in(&[run], key, theme.text_muted, false, theme.font_terminal.clone(), theme))
+        .child(text_in(&[run], key, theme.text_muted, false, theme.font_terminal.clone(), &Links::web(), theme))
         .into_any_element()
 }
 
-fn text(runs: &[InlineRun], key: &str, color: gpui::Hsla, bold: bool, theme: &Theme) -> AnyElement {
-    text_in(runs, key, color, bold, theme.font_ui.clone(), theme)
+fn text(runs: &[InlineRun], key: &str, color: gpui::Hsla, bold: bool, links: &Links, theme: &Theme) -> AnyElement {
+    text_in(runs, key, color, bold, theme.font_ui.clone(), links, theme)
 }
 
-/// One paragraph: its runs styled, its links clickable, selectable.
-fn text_in(runs: &[InlineRun], key: &str, color: gpui::Hsla, bold: bool, family: SharedString, theme: &Theme) -> AnyElement {
+/// One paragraph: its runs styled, its links clickable (a disabled one faint, its reason its tooltip), selectable.
+fn text_in(runs: &[InlineRun], key: &str, color: gpui::Hsla, bold: bool, family: SharedString, follow: &Links, theme: &Theme) -> AnyElement {
     let flat: SharedString = runs_text(runs).into();
-    let mut links: Vec<(Range<usize>, String)> = Vec::new();
+    let mut links: Vec<(Range<usize>, Link)> = Vec::new();
     let mut at = 0;
     let text_runs: Vec<TextRun> = runs
         .iter()
@@ -107,8 +246,11 @@ fn text_in(runs: &[InlineRun], key: &str, color: gpui::Hsla, bold: bool, family:
             let s = &r.style;
             let range = at..at + r.text.len();
             at = range.end;
-            if let Some(url) = &s.link {
-                links.push((range, url.clone()));
+            // a link's colour says whether it goes anywhere
+            let link = s.link.as_ref().map(|href| follow.resolve(href));
+            let tint = link.as_ref().map(|l| if matches!(l, Link::Disabled(_)) { theme.text_faint } else { theme.accent });
+            if let Some(link) = link {
+                links.push((range, link));
             }
             TextRun {
                 len: r.text.len(),
@@ -118,9 +260,9 @@ fn text_in(runs: &[InlineRun], key: &str, color: gpui::Hsla, bold: bool, family:
                     style: if s.italic { FontStyle::Italic } else { FontStyle::Normal },
                     ..gpui::font(if s.code { theme.font_terminal.clone() } else { family.clone() })
                 },
-                color: if s.link.is_some() { theme.accent } else { color },
+                color: tint.unwrap_or(color),
                 background_color: s.code.then(|| theme.wash(0.06)),
-                underline: s.link.is_some().then(|| UnderlineStyle { thickness: px(1.), color: Some(theme.accent.opacity(0.5)), wavy: false }),
+                underline: tint.map(|tint| UnderlineStyle { thickness: px(1.), color: Some(tint.opacity(0.5)), wavy: false }),
                 strikethrough: s.strikethrough.then(|| StrikethroughStyle { thickness: px(1.), color: None }),
             }
         })
@@ -138,9 +280,24 @@ fn text_in(runs: &[InlineRun], key: &str, color: gpui::Hsla, bold: bool, family:
         .absolute()
         .size_full()
     };
-    let urls: Vec<String> = links.iter().map(|(_, url)| url.clone()).collect();
-    let ranges = links.into_iter().map(|(range, _)| range).collect();
-    let text = InteractiveText::new(gpui::ElementId::Name(key), styled).on_click(ranges, move |ix, _, cx: &mut App| cx.open_url(&urls[ix]));
+    let (live, dead): (Vec<_>, Vec<_>) = links.into_iter().partition(|(_, link)| !matches!(link, Link::Disabled(_)));
+    let ranges = live.iter().map(|(range, _)| range.clone()).collect();
+    let targets: Vec<Link> = live.into_iter().map(|(_, link)| link).collect();
+    let follow = follow.follow.clone();
+    let mut text = InteractiveText::new(gpui::ElementId::Name(key), styled).on_click(ranges, move |ix, window, cx: &mut App| match &targets[ix] {
+        Link::External(url) => cx.open_url(url),
+        link => {
+            if let Some(follow) = &follow {
+                follow(link.clone(), window, cx);
+            }
+        }
+    });
+    if !dead.is_empty() {
+        text = text.tooltip(move |ix, window, cx| {
+            let (_, Link::Disabled(why)) = dead.iter().find(|(range, _)| range.contains(&ix))? else { return None };
+            Some(crate::shell::widgets::tip(why.clone(), None)(window, cx))
+        });
+    }
     div().relative().cursor(CursorStyle::IBeam).child(underlay).child(text).into_any_element()
 }
 
@@ -382,6 +539,51 @@ mod tests {
         assert_eq!(join(&spans), "st\nsecond\nth");
         assert_eq!(spans.iter().map(|s| s.key.as_ref()).collect::<Vec<_>>(), ["a", "b", "c"]);
         assert!(resolve(&painted, (1, 2), (1, 2)).is_empty());
+    }
+
+    #[test]
+    fn links_resolve_to_the_web_a_file_in_the_root_a_heading_or_nowhere() {
+        let (doc, root) = (Path::new("/w/docs/guide.md"), Path::new("/w"));
+        let at = Some((doc, root));
+        let file = |p: &str, f: Option<&str>| Link::File { path: p.into(), fragment: f.map(String::from) };
+        assert_eq!(resolve_link("https://x.dev/a?b#c", at), Link::External("https://x.dev/a?b#c".into()));
+        assert_eq!(resolve_link(" HTTP://x.dev ", at), Link::External("HTTP://x.dev".into()));
+        assert_eq!(resolve_link("mailto:a@b.c", at), Link::External("mailto:a@b.c".into()));
+        assert_eq!(resolve_link("intro.md", at), file("/w/docs/intro.md", None));
+        assert_eq!(resolve_link("./intro.md#set-up", at), file("/w/docs/intro.md", Some("set-up")));
+        assert_eq!(resolve_link("../src/main.rs#L12", at), file("/w/src/main.rs", Some("L12")));
+        assert_eq!(resolve_link("/README.md", at), file("/w/README.md", None), "a leading / is the root");
+        assert_eq!(resolve_link("my%20notes.md?plain=1#a%20b", at), file("/w/docs/my notes.md", Some("a b")));
+        assert_eq!(resolve_link("../", at), file("/w", None));
+        assert_eq!(resolve_link("#usage", at), Link::Anchor("usage".into()));
+        assert_eq!(resolve_link("intro.md#", at), file("/w/docs/intro.md", None));
+        assert_eq!(resolve_link("../../etc/passwd", at), Link::Disabled("Outside this workspace's folder".into()));
+        assert_eq!(resolve_link("/../../etc/passwd", at), Link::Disabled("Outside this workspace's folder".into()));
+        assert_eq!(resolve_link("../../wx/a.md", at), Link::Disabled("Outside this workspace's folder".into()), "a sibling sharing the prefix");
+        assert_eq!(resolve_link("file:///etc/passwd", at), Link::Disabled("file: links don't open from here".into()));
+        assert_eq!(resolve_link("vscode://open?x", at), Link::Disabled("vscode: links don't open from here".into()));
+        assert_eq!(resolve_link("javascript:alert(1)", at), Link::Disabled("javascript: links don't open from here".into()));
+        assert_eq!(resolve_link("", at), Link::Disabled("Empty link".into()));
+        // no file to be relative to: the web only
+        assert_eq!(resolve_link("https://x.dev", None), Link::External("https://x.dev".into()));
+        assert!(matches!(resolve_link("docs/a.md", None), Link::Disabled(_)));
+        assert!(matches!(resolve_link("#usage", None), Link::Disabled(_)));
+    }
+
+    #[test]
+    fn fragments_name_lines_and_headings() {
+        assert_eq!(fragment_line("L12"), Some(12));
+        assert_eq!(fragment_line("L3-L9"), Some(3));
+        assert_eq!(fragment_line("L0"), None);
+        assert_eq!(fragment_line("usage"), None);
+        assert_eq!(slug(" Set up: the `CLI` (v2) "), "set-up-the-cli-v2");
+        assert_eq!(slug("Über_alles"), "über_alles");
+        let heading = |t: &str| Block::Heading { level: 2, runs: vec![InlineRun { text: t.into(), style: Default::default() }] };
+        let blocks = [heading("Usage"), Block::Rule, heading("Usage"), heading("Set up")];
+        assert_eq!(anchor_block(&blocks, "usage"), Some(0));
+        assert_eq!(anchor_block(&blocks, "usage-1"), Some(2));
+        assert_eq!(anchor_block(&blocks, "Set-Up"), Some(3));
+        assert_eq!(anchor_block(&blocks, "nope"), None);
     }
 
     #[test]

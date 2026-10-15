@@ -10,6 +10,7 @@ use crate::files::content::{self, Content, MAX_TEXT, Text};
 use crate::files::highlight::{self, Highlights, Token};
 use crate::shell::widgets::{tip, titlebar_button};
 use crate::theme::Theme;
+use crate::ui::markdown::{Link, Links};
 use crate::ui::review::Block;
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, DispatchPhase, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
@@ -43,6 +44,8 @@ pub enum ViewerEvent {
     /// "Open in editor", at a line when the viewer has one to give: the Shell shows the terminals (the editor's pane
     /// opens among them) and opens the file.
     OpenInEditor { path: PathBuf, line: Option<u32> },
+    /// A markdown link to another file in the root: the Shell opens it in a tab, at its line or `#fragment`.
+    OpenFile { path: PathBuf, line: Option<u32>, fragment: Option<String> },
 }
 
 /// A selection in the code view: where the press landed and where the drag is, as (line, byte in the line).
@@ -98,6 +101,8 @@ struct Loaded {
     content: Content,
     blocks: Option<Vec<Block>>,
     columns: usize,
+    /// The root as the disk has it (a link to it followed): what the file's real path and its links are under.
+    real_root: Option<PathBuf>,
 }
 
 /// A line as drawn, worked out once (when it first shows, and again when its highlight lands): every frame after
@@ -200,6 +205,10 @@ pub struct FileViewer {
     path: PathBuf,
     /// The root the header shows the path under (the Files tab's), if the file is in it.
     root: Option<PathBuf>,
+    /// `root` with its links followed, once the load has it: a markdown link may lead to a file under it.
+    real_root: Option<PathBuf>,
+    /// A `#fragment` to go to once the text is in (a heading in the preview, or `L12`).
+    goto_fragment: Option<String>,
     /// Bumped by every open: a load or highlight that started for another file is dropped when it lands.
     generation: u64,
     shown: Shown,
@@ -243,6 +252,8 @@ impl FileViewer {
             rt,
             path: PathBuf::new(),
             root: None,
+            real_root: None,
+            goto_fragment: None,
             generation: 0,
             shown: Shown::Loading,
             text: Arc::default(),
@@ -277,7 +288,8 @@ impl FileViewer {
         self.release(Some(window), cx);
         self.generation += 1;
         self.cancel = Arc::default();
-        (self.path, self.root, self.shown) = (path.clone(), root, Shown::Loading);
+        (self.path, self.root, self.shown) = (path.clone(), root.clone(), Shown::Loading);
+        (self.real_root, self.goto_fragment) = (None, None);
         (self.text, self.highlights, self.blocks, self.columns) = (Arc::default(), Highlights::default(), None, 0);
         self.drawn.clear();
         (self.sel, self.dragging, self.preview) = (None, false, true);
@@ -295,10 +307,12 @@ impl FileViewer {
                     }
                     _ => (None, 0),
                 };
-                Loaded { content, blocks, columns }
+                // the file's path is its real one (the Shell opens tabs by it): so is the root its links are under
+                let real_root = blocks.as_ref().and(root).and_then(|r| r.canonicalize().ok());
+                Loaded { content, blocks, columns, real_root }
             });
             // ponytail: a read that never ends keeps its blocking thread; the viewer says so and moves on
-            let failed = |why: &str| Loaded { content: Content::Failed(why.into()), blocks: None, columns: 0 };
+            let failed = |why: &str| Loaded { content: Content::Failed(why.into()), blocks: None, columns: 0, real_root: None };
             match tokio::time::timeout(LOAD_TIMEOUT, read).await {
                 Ok(Ok(loaded)) => loaded,
                 Ok(Err(_)) => failed("Could not read this file"),
@@ -338,6 +352,7 @@ impl FileViewer {
                 self.text = Arc::new(text);
                 self.columns = loaded.columns;
                 self.blocks = loaded.blocks;
+                self.real_root = loaded.real_root;
                 self.highlight(cx);
                 if let Some(line) = self.goto.take() {
                     self.scroll.scroll_to_item(line.min(self.text.len().saturating_sub(1)), ScrollStrategy::Center);
@@ -346,7 +361,56 @@ impl FileViewer {
             }
             other => Shown::Other(other),
         };
+        if let Some(fragment) = self.goto_fragment.take() {
+            self.go_to_fragment(&fragment, cx);
+        }
         cx.notify();
+    }
+
+    /// Goes to `fragment` (a heading's anchor, or a line as `L12`) once the text is in: a markdown link's, after
+    /// the Shell opened its file here.
+    pub fn go_to(&mut self, fragment: String, cx: &mut Context<Self>) {
+        if self.is_text() {
+            self.go_to_fragment(&fragment, cx);
+        } else {
+            self.goto_fragment = Some(fragment);
+        }
+    }
+
+    /// A line shows in the code view (a markdown file's source); a heading scrolls the preview to it.
+    fn go_to_fragment(&mut self, fragment: &str, cx: &mut Context<Self>) {
+        if !self.is_text() {
+            return;
+        }
+        if let Some(line) = crate::ui::markdown::fragment_line(fragment) {
+            if self.shows_markdown() {
+                (self.preview, self.sel) = (false, None);
+            }
+            self.scroll.scroll_to_item((line as usize - 1).min(self.text.len().saturating_sub(1)), ScrollStrategy::Center);
+        } else if let Some(ix) = self.blocks.as_deref().and_then(|b| crate::ui::markdown::anchor_block(b, fragment)) {
+            self.preview = true;
+            // the preview's first child is the space above the blocks
+            self.preview_scroll.scroll_to_top_of_item(ix + 1);
+        }
+        cx.notify();
+    }
+
+    /// A link in the preview, clicked: a heading here or a line of this file is gone to, another file in the root is
+    /// the Shell's to open (the web opened in `ui::markdown`).
+    fn follow(&mut self, link: Link, cx: &mut Context<Self>) {
+        match link {
+            Link::Anchor(anchor) => self.go_to_fragment(&anchor, cx),
+            Link::File { path, fragment } if path == self.path => {
+                if let Some(fragment) = fragment {
+                    self.go_to_fragment(&fragment, cx);
+                }
+            }
+            Link::File { path, fragment } => {
+                let line = fragment.as_deref().and_then(crate::ui::markdown::fragment_line);
+                cx.emit(ViewerEvent::OpenFile { path, line, fragment: fragment.filter(|_| line.is_none()) });
+            }
+            Link::External(_) | Link::Disabled(_) => {}
+        }
     }
 
     /// Highlights the lines on the runtime's blocking pool; plain until it lands, dropped if another file opened.
@@ -652,7 +716,7 @@ impl FileViewer {
     fn body(&mut self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let content = match &self.shown {
             Shown::Loading => return div().into_any_element(),
-            Shown::Text if self.shows_markdown() => return self.preview(theme),
+            Shown::Text if self.shows_markdown() => return self.preview(theme, cx),
             Shown::Text => return self.code(theme, window, cx),
             Shown::Other(content) => content,
         };
@@ -691,9 +755,23 @@ impl FileViewer {
         }
     }
 
-    /// Markdown's preview: Zeron's blocks, selectable through `ui::markdown`, in a column a page wide.
-    fn preview(&self, theme: &Theme) -> AnyElement {
+    /// Markdown's preview: Zeron's blocks, selectable through `ui::markdown`, in a column a page wide. Each block
+    /// is a child of the scrolled element, so a `#heading` link scrolls to its block.
+    fn preview(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let blocks = self.blocks.as_deref().unwrap_or_default();
+        let links = match &self.real_root {
+            Some(root) => {
+                let this = cx.entity().downgrade();
+                Links::local(self.path.clone(), root.clone(), move |link, _, cx| {
+                    let _ = this.update(cx, |v, cx| v.follow(link, cx));
+                })
+            }
+            // no root: a relative link has nowhere it may lead
+            None => Links::web(),
+        };
+        // with the gap, 20 px above the first block and below the last
+        let space = || div().h(px(8.)).flex_none().into_any_element();
+        let column = |block: AnyElement| div().w_full().max_w(px(820.)).mx_auto().px(px(24.)).child(block).into_any_element();
         div()
             .id("viewer-md")
             .size_full()
@@ -701,17 +779,12 @@ impl FileViewer {
             .track_scroll(&self.preview_scroll)
             .font_family(theme.font_ui.clone())
             .text_size(px(13.5))
-            .child(
-                div()
-                    .max_w(px(820.))
-                    .mx_auto()
-                    .px(px(24.))
-                    .py(px(20.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(12.))
-                    .children(crate::ui::markdown::render(blocks, "viewer-md", theme)),
-            )
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(space())
+            .children(crate::ui::markdown::render(blocks, "viewer-md", &links, theme).into_iter().map(column))
+            .child(space())
             .into_any_element()
     }
 

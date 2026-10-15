@@ -324,7 +324,7 @@ fn description(
         .flex()
         .flex_col()
         .gap(px(6.))
-        .children(crate::ui::markdown::render(&parsed(body), "review-md", theme))
+        .children(crate::ui::markdown::render(&parsed(body), "review-md", &crate::ui::markdown::Links::web(), theme))
         .child(
             canvas(
                 move |bounds, window, _| {
