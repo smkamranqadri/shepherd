@@ -4,8 +4,21 @@
 use super::*;
 use super::review::ShownReview;
 use crate::settings::{PANEL_MAX, PANEL_MIN, PANEL_WIDTH, PanelTab};
+use crate::files::roots::{self, WorkspaceRoot, root_key};
+use crate::files::runner::Host;
 use crate::ui::side_panel::PanelContext;
 use gpui::AnyElement;
+use std::path::PathBuf;
+
+/// Where a workspace's root is kept (`roots::root_key`) and what the workspace looked like (`roots::fingerprint`),
+/// taken when a guess or the chooser starts so its answer lands on that workspace.
+#[derive(Clone)]
+struct RootSlot {
+    place: String,
+    workspace: String,
+    key: String,
+    fingerprint: String,
+}
 
 impl Shell {
     /// `ToggleReview`: shows or hides the panel on the tab it had.
@@ -111,20 +124,290 @@ impl Shell {
         }
     }
 
+    /// The shown place's key (`Place::key`), once the places are listed.
+    fn shown_place(&self) -> Option<String> {
+        self.places.iter().find(|p| self.places_shown(p)).map(|p| p.key())
+    }
+
+    /// Where the shown workspace's root is kept and what it must fit; `None` until the places are listed (before
+    /// then the place has no key that `prune_roots` would also use) and the snapshot lists the workspace.
+    fn root_slot(&self) -> Option<RootSlot> {
+        let place = self.shown_place()?;
+        let workspace = self.shown_workspace.clone()?;
+        let w = self.snapshot.as_ref()?.workspaces.iter().find(|w| w.workspace_id == workspace)?;
+        let fingerprint = roots::fingerprint(&w.label, w.worktree.as_ref().map(|t| t.checkout_path.as_str()));
+        Some(RootSlot { key: root_key(&place, &workspace), place, workspace, fingerprint })
+    }
+
+    /// `slot`'s workspace is still the one shown place's snapshot lists: an answer that took a while (a guess, the
+    /// folder chooser) is not saved for a workspace closed or a place left meanwhile.
+    fn slot_live(&self, slot: &RootSlot) -> bool {
+        self.shown_place().as_deref() == Some(slot.place.as_str()) && self.snapshot.as_ref().is_some_and(|s| s.workspaces.iter().any(|w| w.workspace_id == slot.workspace))
+    }
+
     /// What the side panel's tabs need to know of the shown place and workspace; handed over every render.
     pub(super) fn panel_context(&self, window: &Window, cx: &App) -> PanelContext {
-        let place = self.places.iter().find(|p| self.places_shown(p)).map(|p| p.key()).unwrap_or_else(|| self.client.path().to_string_lossy().into_owned());
-        let active_dir = crate::ui::statusbar::pane_dir(self.snapshot.as_ref(), self.active_pane(window, cx).as_deref());
-        let machine = SettingsGlobal::of(cx).settings.herdr_machine.is_some();
-        let remote = machine || active_dir.as_deref().is_some_and(|d| crate::herdr::split(d).0.is_some());
-        // ponytail: the root guess (M2) fills `guess_dirs`
-        PanelContext { place, workspace_id: self.shown_workspace.clone(), guess_dirs: Vec::new(), active_dir, remote }
+        // before the places are listed, the session's socket, which is a session's key
+        let place = self.shown_place().unwrap_or_else(|| self.client.path().to_string_lossy().into_owned());
+        let snapshot = self.snapshot.as_ref();
+        let active_dir = crate::ui::statusbar::pane_dir(snapshot, self.active_pane(window, cx).as_deref());
+        // this window's place, not the app's last (`herdr_machine`): another window may show a session
+        let remote = self.machine_label.is_some() || active_dir.as_deref().is_some_and(|d| crate::herdr::split(d).0.is_some());
+        let workspace_id = self.shown_workspace.clone();
+        // the worktree herdr made the workspace for, then the first tab's focused pane: the pane you happen to be in
+        // may have wandered off to a dependency's folder, the workspace's first one rarely has
+        let guess_dirs = workspace_id.as_deref().zip(snapshot).map(|(ws, snapshot)| {
+            let worktree = snapshot.workspaces.iter().find(|w| w.workspace_id == ws).and_then(|w| w.worktree.as_ref());
+            let worktree = worktree.map(|t| t.checkout_path.as_str()).filter(|p| !p.is_empty()).map(crate::herdr::locate);
+            let first = snapshot.tabs_of(ws).first().and_then(|t| snapshot.layouts.iter().find(|l| l.tab_id == t.tab_id));
+            let first = first.and_then(|l| crate::ui::statusbar::pane_dir(Some(snapshot), Some(&l.focused_pane_id)));
+            worktree.into_iter().chain(first).collect()
+        });
+        let slot = self.root_slot();
+        let stored = slot.as_ref().and_then(|s| SettingsGlobal::of(cx).settings.workspace_roots.get(&s.key).filter(|r| r.fits(&s.fingerprint)));
+        let root = stored.map(|r| r.path.clone());
+        // no slot yet is a root not known yet, as a guess running is
+        let guessing = slot.is_none_or(|s| self.root_guesses.get(&s.key) == Some(&true));
+        PanelContext { place, workspace_id, guess_dirs: guess_dirs.unwrap_or_default(), active_dir, remote, root, guessing }
+    }
+
+    /// Guesses the shown workspace's root (`roots::guess`) when it has none that fits, once per workspace and run;
+    /// true when a guess started. Its answer is saved only for a workspace still there, and not over a folder chosen
+    /// by hand meanwhile.
+    fn guess_root(&mut self, context: &PanelContext, cx: &mut Context<Self>) -> bool {
+        if context.remote || context.root.is_some() || context.guess_dirs.is_empty() {
+            return false;
+        }
+        let Some(slot) = self.root_slot() else { return false };
+        if self.root_guesses.contains_key(&slot.key) {
+            return false;
+        }
+        self.root_guesses.insert(slot.key.clone(), true);
+        let dirs: Vec<String> = context.guess_dirs.iter().map(|d| crate::herdr::split(d).1.to_string()).collect();
+        let job = self.rt.spawn(async move { roots::guess(&Host::Local, &dirs, &crate::platform::home()).await });
+        cx.spawn(async move |this, cx| {
+            let root = job.await.ok().flatten();
+            let _ = this.update(cx, |this, cx| {
+                // `prune_roots` took the mark: the workspace closed while git answered
+                if this.root_guesses.get(&slot.key) != Some(&true) {
+                    return;
+                }
+                if !this.slot_live(&slot) {
+                    // the place was left: guessed again when it is back
+                    this.root_guesses.remove(&slot.key);
+                    return;
+                }
+                this.root_guesses.insert(slot.key.clone(), false);
+                let chosen = SettingsGlobal::of(cx).settings.workspace_roots.get(&slot.key).is_some_and(|r| r.fits(&slot.fingerprint));
+                if let Some(root) = root.filter(|_| !chosen) {
+                    let root = WorkspaceRoot { path: root.to_string_lossy().into_owned(), fingerprint: slot.fingerprint };
+                    save_from_sidebar(cx, |s| {
+                        s.workspace_roots.insert(slot.key, root);
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        true
+    }
+
+    /// Drops the roots of the shown place's workspaces that are gone, as of its latest snapshot. A snapshot without
+    /// workspaces is a server still starting (or one restarted empty), not a reason to forget them all.
+    pub(super) fn prune_roots(&mut self, cx: &mut Context<Self>) {
+        let (Some(place), Some(snapshot)) = (self.shown_place(), self.snapshot.as_ref()) else { return };
+        if snapshot.workspaces.is_empty() {
+            return;
+        }
+        let live: Vec<String> = snapshot.workspaces.iter().map(|w| w.workspace_id.clone()).collect();
+        let live: Vec<&str> = live.iter().map(String::as_str).collect();
+        // a workspace id herdr gives again later is guessed afresh, and a guess running for a closed one is dropped
+        roots::prune(&mut self.root_guesses, &place, &live);
+        let mut kept = SettingsGlobal::of(cx).settings.workspace_roots.clone();
+        if roots::prune(&mut kept, &place, &live) {
+            save_from_sidebar(cx, |s| s.workspace_roots = kept);
+        }
+    }
+
+    /// `ChooseRoot`, and the panel's "Choose folder…": the system's folder chooser, its pick the shown workspace's
+    /// root. The panel opens on Files to show it, unless it shows Changes or Search; opened only for this (the chord
+    /// pressed in a pane), keyboard focus goes back to the pane when the chooser closes.
+    pub(super) fn choose_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let opened = !self.panel_open || self.shown_panel_tab() == PanelTab::Pr;
+        if opened {
+            self.open_panel_tab(PanelTab::Files, window, cx);
+        }
+        let remote = self.panel_context(window, cx).remote;
+        // the workspace asked for, not the one shown when the chooser closes
+        let Some(slot) = self.root_slot().filter(|_| !remote) else {
+            if remote {
+                crate::ui::toast::error(cx, "Files on herdr machines aren't supported yet");
+            }
+            return;
+        };
+        let picked = cx.prompt_for_paths(gpui::PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Use Folder".into()) });
+        cx.spawn_in(window, async move |this, cx| {
+            let picked = picked.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match picked {
+                    Ok(Ok(Some(paths))) => {
+                        if let Some(path) = paths.into_iter().next() {
+                            this.set_root(slot, path, cx);
+                        }
+                    }
+                    // a Linux desktop without the file chooser portal (a bare window manager) has no dialog to show
+                    Ok(Err(e)) => crate::ui::toast::error(cx, format!("The folder chooser didn't open ({e:#}). Use the focused pane's folder from the panel's … menu.")),
+                    // cancelled
+                    _ => {}
+                }
+                if opened && this.side_panel_focused(window, cx) {
+                    this.focus_pane(window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// "Use focused pane's folder": the folder the focused pane is in, as it is (not its repo's top).
+    pub(super) fn use_pane_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let context = self.panel_context(window, cx);
+        let (Some(slot), Some(dir)) = (self.root_slot(), context.active_dir.as_deref()) else { return };
+        if !context.remote {
+            self.set_root(slot, PathBuf::from(crate::herdr::split(dir).1), cx);
+        }
+    }
+
+    /// Keeps `path` as the root of `slot`'s workspace, unless it is `/`, home or above it. That check resolves
+    /// symlinks, which an automount or a hung network share can stall: it runs off the main thread.
+    fn set_root(&mut self, slot: RootSlot, path: PathBuf, cx: &mut Context<Self>) {
+        let home = crate::platform::home();
+        let check = {
+            let (path, home) = (path.clone(), home.clone());
+            self.rt.spawn_blocking(move || roots::is_too_broad(&path, &home))
+        };
+        cx.spawn(async move |this, cx| {
+            let broad = check.await.unwrap_or(true);
+            let _ = this.update(cx, |this, cx| {
+                let path = path.to_string_lossy().into_owned();
+                if broad {
+                    let short = crate::ui::statusbar::short_path(&path, Some(&home));
+                    return crate::ui::toast::error(cx, format!("{short} holds too much to list: choose a project's folder"));
+                }
+                if !this.slot_live(&slot) {
+                    return;
+                }
+                let root = WorkspaceRoot { path, fingerprint: slot.fingerprint };
+                save_from_sidebar(cx, |s| {
+                    s.workspace_roots.insert(slot.key, root);
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The root's row over Files, Changes and Search: where they look, and the `…` menu that changes it.
+    fn root_row(&self, theme: &Theme, root: &str, cx: &mut Context<Self>) -> Div {
+        let short = crate::ui::statusbar::short_path(root, Some(&crate::platform::home()));
+        let open = self.root_menu.as_ref().is_some_and(|m| m.is_open());
+        div()
+            .h(px(30.))
+            .flex_none()
+            .pl(px(12.))
+            .pr(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(gpui::svg().path("icons/folder.svg").size(px(14.)).flex_none().text_color(theme.text_muted))
+            .child(
+                div()
+                    .id("panel-root-path")
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(12.))
+                    .text_color(theme.text_muted)
+                    .child(short)
+                    .tooltip(tip(root.to_string(), None)),
+            )
+            .child(
+                titlebar_button(theme, "panel-root-menu", "icons/more-horizontal.svg")
+                    .tooltip(tip("Folder", None))
+                    .when(open, |el| el.bg(theme.hover))
+                    // Capture, so a press on the open menu's trigger closes it instead of the menu's click-outside
+                    // closing it and the click reopening it (as the sidebar's view menu).
+                    .capture_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        match this.root_menu.as_mut() {
+                            Some(menu) if menu.is_open() => menu.close(),
+                            _ => this.root_menu = Some(crate::ui::Popup::new(e.position)),
+                        }
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// The root row's `…` menu, while it is up; only drawn with the row (`root` is the row's folder).
+    fn root_menu(&self, theme: &Theme, root: &str, active_dir: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.root_menu.as_ref()?;
+        let at = menu.value;
+        let root = root.to_string();
+        let close = |this: &mut Shell| {
+            if let Some(m) = this.root_menu.as_mut() {
+                m.close()
+            }
+        };
+        let item = |id: &'static str, icon: &'static str, label: &'static str| menu_choice(theme, id, icon, label, false);
+        let card = menu_card(theme, "root-menu", 220.)
+            .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                close(this);
+                cx.notify();
+            }))
+            .child(item("root-menu-choose", "icons/solar/folder-open.svg", "Choose folder…").on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                close(this);
+                this.choose_root(window, cx);
+            })))
+            .when(active_dir, |el| {
+                el.child(item("root-menu-pane", "icons/terminal.svg", "Use focused pane's folder").on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    close(this);
+                    this.use_pane_folder(window, cx);
+                })))
+            })
+            .child(div().mx(px(-4.)).my(px(4.)).h(px(1.)).bg(theme.border))
+            .child(item("root-menu-copy", "icons/solar/copy.svg", "Copy path").on_click(cx.listener({
+                let root = root.clone();
+                move |this, _: &ClickEvent, _, cx| {
+                    close(this);
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(root.clone()));
+                    cx.notify();
+                }
+            })))
+            .child(item("root-menu-reveal", "icons/folder.svg", "Reveal in file manager").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                close(this);
+                let root = root.clone();
+                this.rt.spawn(async move {
+                    let _ = tokio::process::Command::new(crate::platform::OPEN).arg(&root).status().await;
+                });
+                cx.notify();
+            })));
+        let anchored = gpui::anchored().position(at).snap_to_window_with_margin(px(8.)).child(crate::ui::menu_motion("root-menu-in", menu, card));
+        Some(gpui::deferred(anchored).with_priority(1).into_any_element())
     }
 
     /// The panel, and its edge: drag to resize, double-click for the default width.
     pub(super) fn render_right_panel(&mut self, theme: &Theme, shown: &ShownReview, window: &mut Window, cx: &mut Context<Self>) -> [AnyElement; 2] {
         let tab = self.shown_panel_tab();
-        let context = self.panel_context(window, cx);
+        let mut context = self.panel_context(window, cx);
+        context.guessing |= self.guess_root(&context, cx);
+        let root = context.root.clone().filter(|_| tab != PanelTab::Pr && !context.remote);
+        if root.is_none() {
+            // its row went (the PR tab, a workspace without a root, a machine's): the menu goes with it
+            self.root_menu = None;
+        }
+        let root_row = root.as_deref().map(|root| self.root_row(theme, root, cx));
+        let root_menu = root.as_deref().and_then(|root| self.root_menu(theme, root, context.active_dir.is_some(), cx));
         self.side_panel.update(cx, |p, cx| {
             p.set_context(context, cx);
             p.set_tab(tab, cx);
@@ -192,7 +475,10 @@ impl Shell {
                     .children(body);
                 (body.into_any_element(), footer)
             }
-            _ => (div().flex_1().min_h_0().child(self.side_panel.clone()).into_any_element(), None),
+            _ => {
+                let body = div().flex_1().min_h_0().flex().flex_col().children(root_row).child(div().flex_1().min_h_0().child(self.side_panel.clone()));
+                (body.into_any_element(), None)
+            }
         };
 
         let width = self.panel_width;
@@ -208,7 +494,8 @@ impl Shell {
             .border_color(theme.border)
             .child(header)
             .child(body)
-            .children(footer);
+            .children(footer)
+            .children(root_menu);
         let edge = div()
             .id("panel-resize")
             .on_hover(cx.listener(|this, on: &bool, _, cx| this.hover_seam("panel-resize", *on, cx)))

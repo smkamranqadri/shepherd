@@ -127,6 +127,11 @@ pub struct Shell {
     panel_has_pr: bool,
     /// The right panel's Files, Changes and Search tabs.
     side_panel: Entity<crate::ui::side_panel::SidePanel>,
+    /// Workspaces (`roots::root_key`) whose root was guessed this run, true while the guess runs: one guess per
+    /// workspace and run, so one that found nothing (home, `/`) leaves "No folder" up rather than ask git again.
+    root_guesses: std::collections::BTreeMap<String, bool>,
+    /// The panel's root row's `…` menu, at the button.
+    root_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
     /// The shown branch (its review's key), while its checks run: asked again every `REVIEW_POLL`.
     review_poll: Option<String>,
     /// The shown branch's key at the last render and whether its checks ran: when they stop, CI finished.
@@ -403,6 +408,8 @@ impl Shell {
                 let side_panel = cx.new(|cx| crate::ui::side_panel::SidePanel::new(rt.clone(), tab, cx));
                 cx.subscribe_in(&side_panel, window, |s: &mut Shell, _, event: &crate::ui::side_panel::SidePanelEvent, window, cx| match event {
                     crate::ui::side_panel::SidePanelEvent::Dismiss => s.focus_pane(window, cx),
+                    crate::ui::side_panel::SidePanelEvent::ChooseRoot => s.choose_root(window, cx),
+                    crate::ui::side_panel::SidePanelEvent::UsePaneFolder => s.use_pane_folder(window, cx),
                 })
                 .detach();
                 let mut shell = Shell {
@@ -447,6 +454,8 @@ impl Shell {
                     panel_tab: SettingsGlobal::of(cx).settings.panel_tab,
                     panel_has_pr: false,
                     side_panel: side_panel.clone(),
+                    root_guesses: Default::default(),
+                    root_menu: None,
                     review_poll: None,
                     review_last: None,
                     review_acting: Default::default(),
@@ -1231,6 +1240,7 @@ impl Render for Shell {
         crate::ui::reap_popup(&mut self.usage_menu, window);
         crate::ui::reap_popup(&mut self.statusbar_menu, window);
         crate::ui::reap_popup(&mut self.tab_menu, window);
+        crate::ui::reap_popup(&mut self.root_menu, window);
         crate::ui::reap_popup(&mut self.worktree_dialog, window);
         crate::ui::reap_popup(&mut self.remove_confirm, window);
         crate::ui::reap_popup(&mut self.merge_confirm, window);
@@ -1567,10 +1577,10 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ShowChanges, w, cx| this.show_panel_tab(crate::settings::PanelTab::Changes, w, cx)))
             .on_action(cx.listener(|this, _: &ShowSearch, w, cx| this.show_panel_tab(crate::settings::PanelTab::Search, w, cx)))
             .on_action(cx.listener(|this, _: &ShowPullRequest, w, cx| this.show_panel_tab(crate::settings::PanelTab::Pr, w, cx)))
-            // ponytail: until Quick Open (M7), reveal (M8) and the folder chooser (M2) land, these open the Files tab
+            // ponytail: until Quick Open (M7) and reveal (M8) land, these open the Files tab
             .on_action(cx.listener(|this, _: &QuickOpen, w, cx| this.open_panel_tab(crate::settings::PanelTab::Files, w, cx)))
             .on_action(cx.listener(|this, _: &RevealActiveFile, w, cx| this.open_panel_tab(crate::settings::PanelTab::Files, w, cx)))
-            .on_action(cx.listener(|this, _: &ChooseRoot, w, cx| this.open_panel_tab(crate::settings::PanelTab::Files, w, cx)))
+            .on_action(cx.listener(|this, _: &ChooseRoot, w, cx| this.choose_root(w, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.toggle_settings_here(window, cx)))
             .on_action(cx.listener(|this, _: &CommandPanel, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Commands, w, cx)))
             .on_action(cx.listener(|this, _: &ChangeTheme, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Themes, w, cx)))

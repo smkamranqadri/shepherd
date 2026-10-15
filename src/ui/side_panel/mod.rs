@@ -19,11 +19,20 @@ pub struct PanelContext {
     pub active_dir: Option<String>,
     /// The workspace is on a herdr machine: its files are not this computer's to list.
     pub remote: bool,
+    /// The workspace's root (`files::roots`), chosen or guessed; `None` until one is.
+    pub root: Option<String>,
+    /// The root is being guessed, or cannot be yet (the places or the snapshot still loading): "No folder" waits for
+    /// the answer rather than flash before it.
+    pub guessing: bool,
 }
 
 pub enum SidePanelEvent {
     /// Esc: keyboard focus goes back to the pane.
     Dismiss,
+    /// "Choose folder…" under "No folder": the Shell opens the folder chooser, as `ChooseRoot` does.
+    ChooseRoot,
+    /// "Use focused pane's folder" under "No folder".
+    UsePaneFolder,
 }
 
 pub struct SidePanel {
@@ -64,6 +73,23 @@ impl Focusable for SidePanel {
     }
 }
 
+/// A quiet button under a notice: a hairline, a wash on hover (the Shell's buttons are its own module's).
+fn notice_button(theme: &Theme, id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
+    let hover = theme.hover;
+    div()
+        .id(id)
+        .px(px(12.))
+        .py(px(6.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(theme.border)
+        .text_size(px(12.))
+        .text_color(theme.text)
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover))
+        .child(label)
+}
+
 /// A tab's message in the middle of the panel: a title and a line under it.
 fn notice(theme: &Theme, title: impl Into<SharedString>, hint: impl Into<SharedString>) -> impl IntoElement {
     div()
@@ -83,6 +109,27 @@ impl Render for SidePanel {
         let theme = Theme::of(cx);
         let body = if self.context.remote {
             notice(theme, "Files on herdr machines aren't supported yet", "Local only for now.").into_any_element()
+        } else if self.context.root.is_none() && (self.context.guessing || self.context.workspace_id.is_none()) {
+            div().into_any_element()
+        } else if self.context.root.is_none() {
+            // no guess took (home, `/`, no pane yet): the folder is the user's to pick
+            let buttons = div()
+                .pt(px(14.))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(6.))
+                .child(notice_button(theme, "root-choose", "Choose folder…").on_click(cx.listener(|_, _, _, cx| cx.emit(SidePanelEvent::ChooseRoot))))
+                .when(self.context.active_dir.is_some(), |el| {
+                    el.child(notice_button(theme, "root-use-pane", "Use focused pane's folder").on_click(cx.listener(|_, _, _, cx| cx.emit(SidePanelEvent::UsePaneFolder))))
+                });
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(notice(theme, "No folder", "Pick the folder this workspace's files, changes and search are in."))
+                .child(buttons)
+                .into_any_element()
         } else {
             let (title, hint) = match self.tab {
                 PanelTab::Files => ("Files", "The workspace's folder will be listed here."),

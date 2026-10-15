@@ -49,8 +49,9 @@ pub struct Settings {
     pub panel_show_hidden: bool,
     /// The Files tab lists what git ignores.
     pub panel_show_ignored: bool,
-    /// Each workspace's folder in the right panel, by `files::roots::root_key` (its place and id).
-    pub workspace_roots: BTreeMap<String, String>,
+    /// Each workspace's folder in the right panel, by `files::roots::root_key` (its place and id); a bare path (as
+    /// the first builds saved them) still reads.
+    pub workspace_roots: BTreeMap<String, crate::files::roots::WorkspaceRoot>,
     pub agent_sort: AgentSort,
     /// The sidebar's Agents section; General settings hide it.
     pub show_agents: bool,
@@ -607,7 +608,7 @@ mod tests {
         assert!(err.is_none());
         assert_eq!((s.panel_open, s.panel_width, s.panel_tab), (true, PANEL_MAX, PanelTab::Files));
         let mut s = Settings { panel_width: 400., panel_tab: PanelTab::Changes, ..s };
-        s.workspace_roots.insert("sock\nw1".into(), "/src/app".into());
+        s.workspace_roots.insert("sock\nw1".into(), crate::files::roots::WorkspaceRoot { path: "/src/app".into(), fingerprint: "label:app".into() });
         s.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"review_open\": true") && text.contains("\"review_width\": 400.0"), "{text}");
