@@ -83,6 +83,9 @@ pub struct Settings {
     pub dock_badge: bool,
     /// A finished selection in a pane goes to the clipboard and clears, as in herdr.
     pub copy_on_select: bool,
+    /// Linux: Ctrl+V pastes in a pane, and Ctrl+C copies a selection (without one it is ^C). Off, they are the
+    /// terminal's: vim's visual block, the shell's literal insert.
+    pub ctrl_copy_paste: bool,
     /// macOS Secure Keyboard Entry while a Shepherd window is in front: other apps cannot read the keys typed.
     pub secure_input: bool,
     /// The window lets the desktop show through: blurred on macOS, and elsewhere as the compositor does it. On by
@@ -311,6 +314,7 @@ impl Default for Settings {
             notify_sound: true,
             dock_badge: true,
             copy_on_select: true,
+            ctrl_copy_paste: false,
             secure_input: false,
             translucent_window: cfg!(target_os = "macos"),
             window_buttons: true,

@@ -991,6 +991,10 @@ impl PaneTerminal {
             return;
         }
         let mods = &ks.modifiers;
+        // the opt-in Ctrl+V / Ctrl+C off macOS: the terminal's own paste and copy, the copy then clearing the
+        // selection; else (Ctrl+C with nothing selected) the key goes on to the app as any other
+        let enabled = cx.try_global::<crate::settings::SettingsGlobal>().is_some_and(|s| s.settings.ctrl_copy_paste);
+        let ctrl_key = crate::platform::ctrl_copy_paste(&ks.key, mods, enabled, self.emulator.has_selection(), crate::platform::Os::CURRENT);
         if ks.key == "f" && app_shortcut(mods) {
             self.open_search(window, cx);
             cx.stop_propagation();
@@ -1001,7 +1005,7 @@ impl PaneTerminal {
             cx.stop_propagation();
             return;
         }
-        if ks.key == "v" && app_shortcut(mods) {
+        if (ks.key == "v" && app_shortcut(mods)) || ctrl_key == crate::platform::PaneKey::Paste {
             // ponytail: always bracketed; herdr's frames do not tell us whether the app asked for it.
             if let Some(item) = cx.read_from_clipboard() {
                 match item.text() {
@@ -1015,9 +1019,14 @@ impl PaneTerminal {
             cx.stop_propagation();
             return;
         }
-        if ks.key == "c" && app_shortcut(mods) {
+        let clear = ctrl_key == crate::platform::PaneKey::Copy;
+        if (ks.key == "c" && app_shortcut(mods)) || clear {
             if let Some(text) = self.emulator.selection_text() {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
+                if clear {
+                    self.emulator.clear_selection();
+                    cx.notify();
+                }
                 cx.stop_propagation();
             }
             return;

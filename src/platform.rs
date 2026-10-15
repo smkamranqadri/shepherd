@@ -94,6 +94,38 @@ pub fn terminal_chord(key: &str, mods: &Modifiers) -> Option<&'static str> {
     }
 }
 
+/// The operating system, as far as the terminal's keys care.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Os {
+    Linux,
+    Mac,
+}
+
+impl Os {
+    pub const CURRENT: Os = if cfg!(target_os = "macos") { Os::Mac } else { Os::Linux };
+}
+
+/// What a pane does with a key before the terminal gets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneKey {
+    Copy,
+    Paste,
+    PassThrough,
+}
+
+/// The opt-in Ctrl+C / Ctrl+V of a Linux pane: Ctrl+V pastes, and Ctrl+C copies only while something is selected
+/// (otherwise it is the shell's ^C). macOS has Cmd for both, so it never takes these.
+pub fn ctrl_copy_paste(key: &str, mods: &Modifiers, enabled: bool, has_selection: bool, os: Os) -> PaneKey {
+    if os != Os::Linux || !enabled || !mods.control || mods.shift || mods.alt || mods.platform {
+        return PaneKey::PassThrough;
+    }
+    match key {
+        "v" => PaneKey::Paste,
+        "c" if has_selection => PaneKey::Copy,
+        _ => PaneKey::PassThrough,
+    }
+}
+
 /// The modifier that turns a link under the pointer into a click target: Cmd on macOS, Ctrl elsewhere.
 pub fn link_modifier(mods: &Modifiers) -> bool {
     crate::terminal::keys::link_modifier(mods)
@@ -105,6 +137,23 @@ mod tests {
 
     fn m(control: bool, shift: bool, platform: bool) -> Modifiers {
         Modifiers { control, shift, platform, ..Default::default() }
+    }
+
+    #[test]
+    fn ctrl_copy_paste_decisions() {
+        use PaneKey::*;
+        let ctrl = m(true, false, false);
+        assert_eq!(ctrl_copy_paste("v", &ctrl, true, false, Os::Linux), Paste);
+        assert_eq!(ctrl_copy_paste("c", &ctrl, true, true, Os::Linux), Copy);
+        assert_eq!(ctrl_copy_paste("c", &ctrl, true, false, Os::Linux), PassThrough, "no selection: ^C");
+        assert_eq!(ctrl_copy_paste("v", &ctrl, false, true, Os::Linux), PassThrough, "setting off");
+        assert_eq!(ctrl_copy_paste("c", &ctrl, false, true, Os::Linux), PassThrough, "setting off");
+        assert_eq!(ctrl_copy_paste("v", &ctrl, true, true, Os::Mac), PassThrough);
+        assert_eq!(ctrl_copy_paste("c", &ctrl, true, true, Os::Mac), PassThrough);
+        assert_eq!(ctrl_copy_paste("x", &ctrl, true, true, Os::Linux), PassThrough);
+        assert_eq!(ctrl_copy_paste("v", &m(false, false, false), true, true, Os::Linux), PassThrough);
+        assert_eq!(ctrl_copy_paste("v", &m(true, true, false), true, true, Os::Linux), PassThrough, "Ctrl+Shift+V is the chord's");
+        assert_eq!(ctrl_copy_paste("c", &m(true, false, true), true, true, Os::Linux), PassThrough);
     }
 
     #[test]

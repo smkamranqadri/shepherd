@@ -1056,6 +1056,18 @@ impl Render for SettingsView {
                                 |_, _: &ClickEvent, _, cx| update(cx, |s| s.copy_on_select = !s.copy_on_select),
                             ))),
                     )
+                    // Cmd already does this on macOS
+                    .when(!cfg!(target_os = "macos"), |el| el.child(
+                        card_row(&theme, false)
+                            .child(row_text(
+                                &theme,
+                                "Ctrl+C and Ctrl+V copy and paste in terminals",
+                                "Ctrl+V pastes, and Ctrl+C copies a selection (with none it still sends ^C), as Ctrl+Shift+V and Ctrl+Shift+C do. Vim's Ctrl+V visual block and the shell's Ctrl+V literal insert stop working while this is on.",
+                            ))
+                            .child(toggle(&theme, "ctrl-copy-paste", settings.ctrl_copy_paste).on_click(cx.listener(
+                                |_, _: &ClickEvent, _, cx| update(cx, |s| s.ctrl_copy_paste = !s.ctrl_copy_paste),
+                            ))),
+                    ))
                     // Secure Keyboard Entry is macOS's
                     .when(cfg!(target_os = "macos"), |el| el.child(
                         card_row(&theme, false)
