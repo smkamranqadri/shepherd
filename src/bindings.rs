@@ -92,6 +92,8 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("Tab9", "cmd-9"),
     ("PreviousTab", "cmd-{"),
     ("NextTab", "cmd-}"),
+    ("PreviousTab", "ctrl-shift-tab"),
+    ("NextTab", "ctrl-tab"),
     ("PreviousWorkspace", "cmd-up"),
     ("NextWorkspace", "cmd-down"),
     // the sessions and machines of the sidebar's bar; Cmd+Opt+Up/Down is taken, by focus up and down
@@ -143,6 +145,9 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("Tab9", "alt-9"),
     ("PreviousTab", "ctrl-pageup"),
     ("NextTab", "ctrl-pagedown"),
+    // Ghostty's next and previous tab too
+    ("PreviousTab", "ctrl-shift-tab"),
+    ("NextTab", "ctrl-tab"),
     ("PreviousWorkspace", "ctrl-shift-pageup"),
     ("NextWorkspace", "ctrl-shift-pagedown"),
     // the sessions and machines of the sidebar's bar: the workspace chords with Alt
@@ -368,6 +373,14 @@ mod tests {
 
     fn chord<'a>(eff: &'a [(String, String)], action: &str) -> Option<&'a str> {
         eff.iter().find(|(a, _)| a == action).map(|(_, k)| k.as_str())
+    }
+
+    #[test]
+    fn ctrl_tab_steps_through_the_tabs() {
+        let eff = effective(&user(&[]));
+        let bound = |action: &str, chord: &str| eff.iter().any(|(a, k)| a == action && Some(k.as_str()) == normalize(chord).as_deref());
+        assert!(bound("NextTab", "ctrl-tab"));
+        assert!(bound("PreviousTab", "ctrl-shift-tab"));
     }
 
     #[test]
