@@ -673,6 +673,11 @@ impl FileViewer {
                 self.notice(theme, "This file is too long to show", hint, true, cx)
             }
             Content::TooManyPixels(w, h) => self.notice(theme, "This image is too large to show", format!("{w} × {h} pixels"), true, cx),
+            Content::TooManyFrames(w, h, frames) => {
+                // `frames` stops one past the budget: the animation may hold more
+                let hint = format!("{frames} or more frames of {w} × {h} pixels");
+                self.notice(theme, "This animation is too large to show", hint, true, cx)
+            }
             Content::UnknownSize => self.notice(theme, "This image can't be shown", "Its header does not say its size.", true, cx),
             Content::Failed(why) => {
                 let editor = why == NOT_RESPONDING;

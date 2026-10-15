@@ -1,8 +1,9 @@
 //! What the viewer makes of a file: text (markdown among it), an image, or something it will not show (binary, too
 //! large), told from its name, its size and its first bytes. Every read is bounded: a text file over `MAX_TEXT` is
 //! never read whole, an image over `MAX_IMAGE` bytes or `MAX_PIXELS` pixels (as its header says) is not decoded, so a stray multi-GB log
-//! or a 30k × 30k PNG cannot take Shepherd's memory with it.
-use std::io::Read;
+//! or a 30k × 30k PNG cannot take Shepherd's memory with it. An animation's pixels are all its frames' (gpui decodes
+//! every frame of a GIF or an animated WebP up front), counted from its blocks without decoding them.
+use std::io::{self, BufRead, Read};
 use std::path::Path;
 
 /// The most text the viewer reads: 5 MB, a 100k-line source file and then some (VS Code's own large-file line).
@@ -148,6 +149,8 @@ pub enum Content {
     TooLarge(u64),
     /// An image whose pixels are over `MAX_PIXELS` or a side over `MAX_SIDE`.
     TooManyPixels(u32, u32),
+    /// An animation whose frames (the third) together are over `MAX_PIXELS`, though one alone is not.
+    TooManyFrames(u32, u32, u64),
     /// Text of more than `MAX_LINES` lines.
     TooManyLines(usize),
     /// An image whose header does not say its size: it is not handed to a decoder that would find out by decoding.
@@ -203,7 +206,13 @@ pub fn load(path: &Path) -> Content {
         FileKind::Image => match imagesize::size(path) {
             Ok(size) => {
                 let (w, h) = (u32::try_from(size.width).unwrap_or(u32::MAX), u32::try_from(size.height).unwrap_or(u32::MAX));
-                if over_budget(w, h) { Content::TooManyPixels(w, h) } else { Content::Image(w, h) }
+                if over_budget(w, h) {
+                    return Content::TooManyPixels(w, h);
+                }
+                // every frame is decoded at the full size: count them, as far as one past the budget
+                let pixels = u64::from(w) * u64::from(h);
+                let frames = frames(io::BufReader::new(head.as_slice().chain(file)), MAX_PIXELS / pixels + 1);
+                if pixels * frames > MAX_PIXELS { Content::TooManyFrames(w, h, frames) } else { Content::Image(w, h) }
             }
             Err(_) => Content::UnknownSize,
         },
@@ -232,6 +241,101 @@ fn is_svg(path: &Path) -> bool {
 
 fn over_budget(w: u32, h: u32) -> bool {
     u64::from(w) * u64::from(h) > MAX_PIXELS || w.max(h) > MAX_SIDE || w == 0 || h == 0
+}
+
+/// How many frames the image in `r` holds, as gpui's decoders would find them, counting no further than `limit`: a
+/// GIF's image descriptors (its extensions and pixel data skipped block by block), an animated WebP's `ANMF` chunks
+/// (skipped by their sizes); 1 for any other format or a still. A damaged file counts up to the damage. Reads, never
+/// holds, what it skips.
+pub fn frames(mut r: impl BufRead, limit: u64) -> u64 {
+    let mut magic = [0u8; 12];
+    let Ok(()) = r.read_exact(&mut magic[..6]) else { return 1 };
+    let counted = if &magic[..4] == b"GIF8" {
+        gif_frames(&mut r, limit)
+    } else if &magic[..4] == b"RIFF" && r.read_exact(&mut magic[6..]).is_ok() && &magic[8..] == b"WEBP" {
+        webp_frames(&mut r, limit)
+    } else {
+        return 1;
+    };
+    counted.max(1)
+}
+
+fn skip(r: &mut impl BufRead, n: u64) -> io::Result<()> {
+    if io::copy(&mut (&mut *r).take(n), &mut io::sink())? < n {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(())
+}
+
+fn byte(r: &mut impl BufRead) -> io::Result<u8> {
+    let mut b = [0u8];
+    r.read_exact(&mut b)?;
+    Ok(b[0])
+}
+
+/// A GIF's frames, its 6-byte signature read: the screen descriptor and its colour table, then blocks to the trailer.
+fn gif_frames(r: &mut impl BufRead, limit: u64) -> u64 {
+    let mut count = 0;
+    let _ = gif_scan(r, limit, &mut count);
+    count
+}
+
+fn gif_scan(r: &mut impl BufRead, limit: u64, count: &mut u64) -> io::Result<()> {
+    let mut screen = [0u8; 7];
+    r.read_exact(&mut screen)?;
+    skip(r, colour_table(screen[4]))?;
+    while *count < limit {
+        match byte(r)? {
+            0x21 => {
+                byte(r)?;
+                sub_blocks(r)?;
+            }
+            0x2C => {
+                let mut image = [0u8; 9];
+                r.read_exact(&mut image)?;
+                skip(r, colour_table(image[8]))?;
+                // the LZW minimum code size, then the pixels
+                byte(r)?;
+                sub_blocks(r)?;
+                *count += 1;
+            }
+            // the trailer, or something no GIF holds
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
+/// A colour table's size from a GIF descriptor's packed byte, when it has one.
+fn colour_table(packed: u8) -> u64 {
+    if packed & 0x80 != 0 { 3 << ((packed & 7) + 1) } else { 0 }
+}
+
+/// The data sub-blocks after a GIF extension or image: sized blocks up to an empty one.
+fn sub_blocks(r: &mut impl BufRead) -> io::Result<()> {
+    loop {
+        match byte(r)? {
+            0 => return Ok(()),
+            n => skip(r, u64::from(n))?,
+        }
+    }
+}
+
+/// An animated WebP's frames, its 12-byte RIFF header read: one `ANMF` chunk each (none in a still).
+fn webp_frames(r: &mut impl BufRead, limit: u64) -> u64 {
+    let mut count = 0;
+    let mut chunk = [0u8; 8];
+    while count < limit && r.read_exact(&mut chunk).is_ok() {
+        if &chunk[..4] == b"ANMF" {
+            count += 1;
+        }
+        let size = u64::from(u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]));
+        // a chunk is padded to an even size
+        if skip(r, size + (size & 1)).is_err() {
+            break;
+        }
+    }
+    count
 }
 
 /// An SVG's size from its root tag in `head`: `width` and `height` in pixels (bare or `px`), else its `viewBox`'s,
@@ -372,6 +476,83 @@ mod tests {
         let wide = dir.path().join("w.png");
         image::GrayImage::new(MAX_SIDE + 1, 1).save(&wide).unwrap();
         assert_eq!(load(&wide), Content::TooManyPixels(MAX_SIDE + 1, 1));
+    }
+
+    /// A GIF of `w` x `h` and `frames` frames of one pixel's data each, with a colour table, a comment and a
+    /// frame's control extension before each: what a frame count must step over.
+    fn gif(w: u16, h: u16, frames: usize) -> Vec<u8> {
+        let mut b = b"GIF89a".to_vec();
+        b.extend(w.to_le_bytes());
+        b.extend(h.to_le_bytes());
+        // a global colour table of 2 entries
+        b.extend([0x80, 0, 0]);
+        b.extend([0; 6]);
+        b.extend([0x21, 0xFE, 3, b'h', b'i', b'!', 0]);
+        for _ in 0..frames {
+            b.extend([0x21, 0xF9, 4, 0, 10, 0, 0, 0]);
+            b.push(0x2C);
+            b.extend([0; 4]);
+            b.extend(w.to_le_bytes());
+            b.extend(h.to_le_bytes());
+            // a local colour table of 4 entries, whose bytes include 0x2C to be skipped
+            b.push(0x81);
+            b.extend([0x2C; 12]);
+            b.extend([2, 2, 0x4C, 0x01, 0]);
+        }
+        b.push(0x3B);
+        b
+    }
+
+    /// A WebP with `frames` `ANMF` chunks (odd-sized, padded) after a `VP8X` header chunk of `w` x `h`.
+    fn webp(w: u32, h: u32, frames: usize) -> Vec<u8> {
+        let mut body = b"WEBP".to_vec();
+        body.extend(b"VP8X");
+        body.extend(10u32.to_le_bytes());
+        body.extend([0x02, 0, 0, 0]);
+        body.extend(&(w - 1).to_le_bytes()[..3]);
+        body.extend(&(h - 1).to_le_bytes()[..3]);
+        body.extend(b"ANIM");
+        body.extend(6u32.to_le_bytes());
+        body.extend([0; 6]);
+        for _ in 0..frames {
+            body.extend(b"ANMF");
+            body.extend(3u32.to_le_bytes());
+            body.extend([b'A', b'N', b'M', 0]);
+        }
+        let mut b = b"RIFF".to_vec();
+        b.extend((body.len() as u32).to_le_bytes());
+        b.extend(body);
+        b
+    }
+
+    #[test]
+    fn frames_are_counted_from_the_blocks() {
+        assert_eq!(frames(&gif(2, 2, 3)[..], 100), 3);
+        assert_eq!(frames(&gif(2, 2, 300)[..], 10), 10, "no further than the limit");
+        assert_eq!(frames(&gif(2, 2, 1)[..], 100), 1);
+        assert_eq!(frames(&webp(2, 2, 5)[..], 100), 5);
+        assert_eq!(frames(&webp(2, 2, 0)[..], 100), 1, "a still");
+        // cut short: the frames up to the cut
+        let cut = gif(2, 2, 4);
+        assert_eq!(frames(&cut[..cut.len() - 30], 100), 3);
+        assert_eq!(frames(&b"\x89PNG\r\n\x1a\n"[..], 100), 1);
+        assert_eq!(frames(&b"GIF"[..], 100), 1);
+    }
+
+    #[test]
+    fn an_animation_over_the_pixel_budget_is_not_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.gif");
+        // 2000 x 2000 is 4 MP a frame: four fit, five do not
+        std::fs::write(&path, gif(2000, 2000, 4)).unwrap();
+        assert_eq!(load(&path), Content::Image(2000, 2000));
+        std::fs::write(&path, gif(2000, 2000, 300)).unwrap();
+        assert_eq!(load(&path), Content::TooManyFrames(2000, 2000, 5));
+        let webp_path = dir.path().join("a.webp");
+        std::fs::write(&webp_path, webp(2000, 2000, 5)).unwrap();
+        assert_eq!(load(&webp_path), Content::TooManyFrames(2000, 2000, 5));
+        std::fs::write(&webp_path, webp(2000, 2000, 2)).unwrap();
+        assert_eq!(load(&webp_path), Content::Image(2000, 2000));
     }
 
     /// A baseline JPEG's start (SOI, SOF0) declaring `w` x `h`: enough for a header reader.
