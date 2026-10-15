@@ -228,6 +228,19 @@ impl SidePanel {
         self.changes.as_ref()?.answer().map(|a| a.status.changes.len())
     }
 
+    /// The change at `(group, path)` (from the repository's top) as the last status listed it, if it still does.
+    pub fn change_now(&self, group: Group, path: &str) -> Option<Change> {
+        self.changes.as_ref()?.find(group, path).cloned()
+    }
+
+    /// The file at `path`'s Staged and Changes entries: both, and its diff tab offers All, Staged and Unstaged, each
+    /// with its own rename source.
+    pub fn entries(&self, path: &str) -> crate::files::diff::Entries {
+        let Some(answer) = self.changes.as_ref().and_then(ChangeList::answer) else { return Default::default() };
+        let entry = |group| answer.status.changes.iter().find(|c| c.group == group && c.path == path).cloned();
+        crate::files::diff::Entries { staged: entry(Group::Staged), changes: entry(Group::Changes) }
+    }
+
     /// The Shell's word on whether the panel (whose tab strip carries the badge) is open, whether it shows the
     /// Changes tab, and whether the window is active. Coming into view asks git at once, as does the tab coming
     /// into view (which also lifts a halt after a timeout); the tab going out of view takes the menu down.
@@ -286,6 +299,11 @@ impl SidePanel {
                 }
                 return;
             }
+        }
+        // the shown diff tab reads its diff again, changed or not: git's status may not see a second edit of a file
+        // already listed, nor a diff's lines move
+        if answer.is_ok() {
+            cx.emit(SidePanelEvent::ChangesPolled);
         }
         let was_stale = list.stale.take().is_some();
         if list.result.as_ref() == Some(&answer) {
@@ -588,14 +606,17 @@ impl SidePanel {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
             cx.notify();
         };
-        let openable = change.openable();
+        // a change opens its diff (a deleted file's too, its lines removed); a conflict its file, with the markers
+        let conflict = change.group == Group::Conflicts;
+        let openable = if conflict { change.openable() } else { !change.is_folder() };
+        let open = if conflict { "Open file" } else { "Open changes" };
         let card = menu_card(theme, "change-menu", 200.)
             .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
                 close(this);
                 cx.notify();
             }))
             .when(openable, |el| {
-                el.child(item("change-menu-open", "icons/solar/file-text.svg", "Open file").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                el.child(item("change-menu-open", "icons/solar/file-text.svg", open).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     close(this);
                     this.open_change(change.clone(), false, cx);
                     cx.notify();
@@ -780,6 +801,25 @@ mod tests {
         assert_eq!(renamed.orig.as_deref(), Some("old name.txt"));
         let openable: Vec<_> = answer.status.changes.iter().filter(|c| !c.openable()).map(|c| c.path.as_str()).collect();
         assert_eq!(openable, ["gone1.txt", "nested/"]);
+    }
+
+    /// A rename staged then edited (`RM`) keeps its source on the Staged entry; a rename in the work tree of a file
+    /// added with `git add -N` (`.R`) on its Changes entry.
+    #[tokio::test]
+    async fn rename_sources_go_with_their_entries() {
+        if !has_git() {
+            return;
+        }
+        let (_dir, repo) = repo(&["a.txt", "c.txt"]);
+        sh(&repo, &["mv", "a.txt", "b.txt"]);
+        write(&repo, "b.txt", "a.txt\nline two\nline three\nmore\n");
+        std::fs::rename(repo.join("c.txt"), repo.join("d.txt")).unwrap();
+        sh(&repo, &["add", "-N", "d.txt"]);
+        let answer = read_status(repo).await.unwrap();
+        let find = |group, path: &str| answer.status.changes.iter().find(|c| c.group == group && c.path == path).cloned();
+        assert_eq!(find(Group::Staged, "b.txt").and_then(|c| c.orig).as_deref(), Some("a.txt"));
+        assert_eq!(find(Group::Changes, "b.txt").map(|c| c.orig), Some(None));
+        assert_eq!(find(Group::Changes, "d.txt").and_then(|c| c.orig).as_deref(), Some("c.txt"), "{:?}", answer.status.changes);
     }
 
     #[tokio::test]

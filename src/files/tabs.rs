@@ -3,6 +3,7 @@
 //! shows. Opening follows VS Code's preview tabs: a single click opens a preview (its label in italics) that the
 //! next single click replaces while it has no unsaved changes; a double-click, Enter, or a double-click on the tab
 //! pins it. Pure: the Shell keeps the views and asks these what to show.
+use super::status::Group;
 use std::path::{Path, PathBuf};
 
 /// The most file tabs a workspace keeps: opening one more closes the leftmost one that is neither shown nor dirty.
@@ -13,10 +14,12 @@ pub const MAX_TABS: usize = 40;
 pub struct TabId(pub u64);
 
 /// What a file tab shows.
-// TODO(C2): `Diff { group, staged }`, once C1's status types (the change's group) are in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabKind {
     File,
+    /// The diff of the file's change in a Changes group (its id is `diff:{group}:{path}`): never kept for the next
+    /// run, as its change may be gone by then.
+    Diff(Group),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +29,27 @@ pub struct FileTab {
     pub kind: TabKind,
     /// A preview: replaced by the next file opened as one, unless it was pinned (or has unsaved changes) first.
     pub preview: bool,
+}
+
+impl FileTab {
+    /// The tab's label: the file's name, and a diff's group after it.
+    pub fn label(&self) -> String {
+        let name = self.path.file_name().map_or_else(|| self.path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+        match self.kind {
+            TabKind::File => name,
+            TabKind::Diff(group) => format!("{name} ({})", diff_label(group)),
+        }
+    }
+}
+
+/// What a diff tab's label says of its group.
+fn diff_label(group: Group) -> &'static str {
+    match group {
+        Group::Conflicts => "merge",
+        Group::Staged => "staged",
+        Group::Changes => "changes",
+        Group::Untracked => "new",
+    }
 }
 
 /// One workspace's file tabs, in the strip's order, and the one shown (`None`: the terminals).
@@ -280,5 +304,27 @@ mod tests {
         assert_eq!(t.remembered(), (vec![p("a")], None), "a shown preview is not");
         t.open(p("a"), TabKind::File, true, |_| false, &mut n);
         assert_eq!(t.remembered(), (vec![p("a")], Some(p("a"))));
+    }
+
+    #[test]
+    fn diff_tabs_are_never_kept_and_sit_beside_their_file() {
+        let (mut t, mut n) = (WorkspaceTabs::default(), 0);
+        let file = t.open(p("a"), TabKind::File, false, |_| false, &mut n);
+        let staged = t.open(p("a"), TabKind::Diff(Group::Staged), false, |_| false, &mut n);
+        let changes = t.open(p("a"), TabKind::Diff(Group::Changes), false, |_| false, &mut n);
+        assert_eq!(t.files.len(), 3, "a file and each of its groups' diffs are tabs of their own");
+        assert_ne!(staged, changes);
+        assert_eq!(t.remembered(), (vec![p("a")], None), "a pinned diff, shown, is not kept");
+        t.active = Some(file);
+        assert_eq!(t.remembered(), (vec![p("a")], Some(p("a"))));
+        // a preview diff replaced by a preview of a file, in place
+        let preview = t.open(p("b"), TabKind::Diff(Group::Untracked), true, |_| false, &mut n);
+        assert_eq!(t.open(p("c"), TabKind::File, true, |_| false, &mut n), preview);
+        assert_eq!(t.get(preview).map(|f| f.kind), Some(TabKind::File));
+        assert_eq!(t.get(changes).map(FileTab::label).as_deref(), Some("a (changes)"));
+        // restoring brings back files only
+        let mut fresh = WorkspaceTabs::default();
+        fresh.restore(&[p("a")], None, &mut n);
+        assert!(fresh.files.iter().all(|f| f.kind == TabKind::File));
     }
 }

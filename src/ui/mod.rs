@@ -1,4 +1,5 @@
 pub mod command_panel;
+pub mod diff_view;
 pub mod divider;
 pub mod edge_fade;
 pub mod loader;

@@ -106,22 +106,22 @@ struct Loaded {
 }
 
 /// A line as drawn, worked out once (when it first shows, and again when its highlight lands): every frame after
-/// only splits its runs at the selection.
-struct Drawn {
+/// only splits its runs at the selection. The diff tab draws its lines with it too.
+pub(crate) struct Drawn {
     /// Tabs widened, cut after `MAX_SHOWN` characters with a `…`.
-    text: SharedString,
+    pub(crate) text: SharedString,
     /// The drawn bytes before the `…` (all of them when uncut).
-    body: usize,
+    pub(crate) body: usize,
     /// The line's bytes the drawn text covers (up to the cut).
     raw_cut: usize,
     /// Where the line's tabs are (before the cut), for mapping a byte either way in a binary search.
     tabs: Vec<u32>,
     /// The tokens over `0..body`, in drawn bytes, gaps as `Plain`, in order.
-    runs: Vec<(Range<usize>, Token)>,
+    pub(crate) runs: Vec<(Range<usize>, Token)>,
 }
 
 impl Drawn {
-    fn new(line: &str, spans: &[highlight::Span]) -> Drawn {
+    pub(crate) fn new(line: &str, spans: &[highlight::Span]) -> Drawn {
         let raw_cut = line.char_indices().nth(MAX_SHOWN).map_or(line.len(), |(i, _)| i);
         let tabs: Vec<u32> = line.as_bytes()[..raw_cut].iter().enumerate().filter(|(_, b)| **b == b'\t').map(|(i, _)| i as u32).collect();
         let mut text = line[..raw_cut].replace('\t', &" ".repeat(TAB));
@@ -151,7 +151,7 @@ impl Drawn {
     }
 
     /// A byte of the line as a byte of the drawn text; past the cut, the cut.
-    fn to_shown(&self, raw: usize) -> usize {
+    pub(crate) fn to_shown(&self, raw: usize) -> usize {
         let raw = raw.min(self.raw_cut);
         raw + self.tabs.partition_point(|t| (*t as usize) < raw) * (TAB - 1)
     }
@@ -188,7 +188,7 @@ impl Drawn {
 }
 
 /// A line's width in columns as drawn: tabs widened, wide characters two, cut after `MAX_SHOWN` with a `…`.
-fn columns(line: &str) -> usize {
+pub(crate) fn columns(line: &str) -> usize {
     let mut width = 0;
     for (count, c) in line.chars().enumerate() {
         if count == MAX_SHOWN {
@@ -905,7 +905,7 @@ impl FileViewer {
 const NOT_RESPONDING: &str = "Not responding";
 
 /// The colour `token` draws in: the terminal's palette, so the code matches the panes beside it.
-fn token_color(token: Token, theme: &Theme) -> gpui::Hsla {
+pub(crate) fn token_color(token: Token, theme: &Theme) -> gpui::Hsla {
     let ansi = &theme.terminal.ansi;
     match token {
         Token::Plain => theme.terminal.foreground,

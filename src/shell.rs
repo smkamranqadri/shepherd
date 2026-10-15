@@ -132,9 +132,11 @@ pub struct Shell {
     /// Each workspace's file tabs (`roots::root_key`), drawn after its herdr tabs (`file_tabs`).
     file_tabs: HashMap<String, crate::files::tabs::WorkspaceTabs>,
     /// The file tabs' views, the most recently shown first; a tab without one gets it when next shown.
-    tab_views: Vec<(crate::files::tabs::TabId, Entity<crate::ui::viewer::FileViewer>)>,
+    tab_views: Vec<(crate::files::tabs::TabId, file_tabs::TabView)>,
     /// Views of tabs that closed, retired on the next render (which has the window their focus is in).
-    views_gone: Vec<Entity<crate::ui::viewer::FileViewer>>,
+    views_gone: Vec<file_tabs::TabView>,
+    /// Each diff tab's change, by its tab: what its view is made from when (again) shown.
+    diff_specs: HashMap<crate::files::tabs::TabId, crate::ui::diff_view::DiffSpec>,
     /// The file tab drawn at the last render: when another takes its place, its view's image leaves gpui's cache.
     view_drawn: Option<crate::files::tabs::TabId>,
     /// The last file tab id handed out.
@@ -445,15 +447,11 @@ impl Shell {
                     crate::ui::side_panel::SidePanelEvent::UsePaneFolder => s.use_pane_folder(window, cx),
                     crate::ui::side_panel::SidePanelEvent::OpenFile { path, line, preview } => s.open_file(path.clone(), *line, *preview, window, cx),
                     crate::ui::side_panel::SidePanelEvent::OpenInEditor(path) => s.open_in_editor_from_panel(path.clone(), window, cx),
-                    // TODO(C2): a change opens its diff tab; until then its file as the working tree has it, and one
-                    // the tree lacks (or a submodule's or nested repository's folder) has nothing to show
-                    crate::ui::side_panel::SidePanelEvent::OpenChange { path, change, preview } => {
-                        if change.openable() {
-                            s.open_file(path.clone(), None, *preview, window, cx);
-                        }
-                    }
+                    // its diff in a tab; a conflict's file, with its markers
+                    crate::ui::side_panel::SidePanelEvent::OpenChange { path, change, preview } => s.open_change(path.clone(), change.clone(), *preview, window, cx),
                     // the badge is in the Shell's tab strip
                     crate::ui::side_panel::SidePanelEvent::ChangesCounted => cx.notify(),
+                    crate::ui::side_panel::SidePanelEvent::ChangesPolled => s.reload_shown_diff(true, cx),
                 })
                 .detach();
                 let (this, handle) = (cx.entity().downgrade(), window.window_handle());
@@ -507,6 +505,7 @@ impl Shell {
                     file_tabs: HashMap::new(),
                     tab_views: Vec::new(),
                     views_gone: Vec::new(),
+                    diff_specs: HashMap::new(),
                     view_drawn: None,
                     next_tab_id: 0,
                     real_paths: HashMap::new(),
@@ -1404,7 +1403,7 @@ impl Render for Shell {
         if let Some(viewer) = &viewer {
             self.view_takes_keys(viewer, window, cx);
         }
-        let viewer_markdown = viewer.as_ref().is_some_and(|v| v.read(cx).shows_markdown());
+        let viewer_markdown = viewer.as_ref().is_some_and(|v| v.shows_markdown(cx));
         let shown_ws = tab.as_ref().map(|t| t.workspace_id.clone());
         let shown_tab = tab.as_ref().map(|t| t.tab_id.clone());
         let sidebar_w = self.sidebar_now();
@@ -1538,7 +1537,7 @@ impl Render for Shell {
             }))
             .children(pane_drop)
             // under herdr's popup, which is modal
-            .children(viewer.map(|v| div().absolute().inset_0().child(v)))
+            .children(viewer.map(|v| div().absolute().inset_0().child(v.element())))
             .children(floating);
 
         let show_bar = SettingsGlobal::of(cx).settings.show_status_bar;
@@ -1619,7 +1618,7 @@ impl Render for Shell {
                 // Cmd+C (Ctrl+C off macOS) over a selection in the review panel copies it, not the pane's; the
                 // viewer, with the keyboard, copies its own
                 let m = &e.keystroke.modifiers;
-                let viewer = s.shown_file_view().is_some_and(|v| v.read(cx).focus_handle(cx).contains_focused(window, cx));
+                let viewer = s.shown_file_view().is_some_and(|v| v.focus_handle(cx).contains_focused(window, cx));
                 let copy = if cfg!(target_os = "macos") { m.platform && !(m.shift || m.alt || m.control) } else { m.control && !(m.alt || m.platform) };
                 if copy
                     && !viewer

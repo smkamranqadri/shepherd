@@ -49,6 +49,8 @@ pub struct Settings {
     pub panel_show_hidden: bool,
     /// The Files tab lists what git ignores.
     pub panel_show_ignored: bool,
+    /// Diff tabs show the two versions side by side, not one above the other.
+    pub diff_split: bool,
     /// Each workspace's folder in the right panel, by `files::roots::root_key` (its place and id); a bare path (as
     /// the first builds saved them) still reads.
     pub workspace_roots: BTreeMap<String, crate::files::roots::WorkspaceRoot>,
@@ -297,6 +299,7 @@ impl Default for Settings {
             panel_tab: PanelTab::Files,
             panel_show_hidden: false,
             panel_show_ignored: false,
+            diff_split: false,
             workspace_roots: BTreeMap::new(),
             agent_sort: AgentSort::default(),
             show_agents: true,

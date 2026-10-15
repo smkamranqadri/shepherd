@@ -44,11 +44,13 @@ pub enum SidePanelEvent {
     /// beside the focused pane.
     OpenInEditor(std::path::PathBuf),
     /// A change clicked in the Changes tab, or its menu's "Open file": `path` is its file in the root. The Shell
-    /// opens the file as it is in the working tree (nothing for one the tree lacks, or a folder) until C2 gives
-    /// changes diff tabs. `preview` as `OpenFile`'s: a single click's tab is replaced by the next.
+    /// opens its diff in a tab (a conflict's file with its markers; nothing for a folder). `preview` as
+    /// `OpenFile`'s: a single click's tab is replaced by the next.
     OpenChange { path: std::path::PathBuf, change: crate::files::status::Change, preview: bool },
     /// The Changes tab's count (its badge, which the Shell draws in the tab strip) changed: the Shell redraws.
     ChangesCounted,
+    /// git status answered (changed or not): the shown diff tab reads its diff again.
+    ChangesPolled,
 }
 
 pub struct SidePanel {

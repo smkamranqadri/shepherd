@@ -6,10 +6,17 @@
 //! Views are made when a tab is first shown (its file read then, not when it is restored), and the most recently
 //! shown `MAX_VIEWS` are kept; the pinned tabs are kept for the next run in `open-files.json`
 //! (`files::open_files`), written a second after the last change and only when it changed.
+//!
+//! A change in the Changes tab opens its diff (`ui::diff_view`) as a file tab of its own kind (`TabKind::Diff`),
+//! by the same preview rules, never kept for the next run; the shown one reads its diff again on every Changes
+//! poll and whenever it comes into view.
 use super::*;
 use crate::files::open_files::{self, Remembered};
 use crate::files::roots::{self, root_key};
+use crate::files::status::{Change, Group};
 use crate::files::tabs::{self, FileTab, StripEntry, TabId, TabKind, WorkspaceTabs};
+use crate::files::diff::Entries;
+use crate::ui::diff_view::{DiffEvent, DiffSpec, DiffView};
 use crate::ui::viewer::{FileViewer, ViewerEvent};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -36,6 +43,50 @@ fn real_path(rt: &tokio::runtime::Handle, path: PathBuf) -> impl std::future::Fu
         }
     });
     async move { job.await.unwrap_or(fallback) }
+}
+
+/// A file tab's view: a file's viewer, or a change's diff.
+#[derive(Clone)]
+pub(super) enum TabView {
+    File(Entity<FileViewer>),
+    Diff(Entity<DiffView>),
+}
+
+impl TabView {
+    pub(super) fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
+        match self {
+            TabView::File(v) => v.read(cx).focus_handle(cx),
+            TabView::Diff(v) => v.read(cx).focus_handle(cx),
+        }
+    }
+
+    /// Markdown's preview is on screen: its selection is `ui::markdown`'s, which must not be forgotten.
+    pub(super) fn shows_markdown(&self, cx: &App) -> bool {
+        matches!(self, TabView::File(v) if v.read(cx).shows_markdown())
+    }
+
+    pub(super) fn element(&self) -> gpui::AnyElement {
+        match self {
+            TabView::File(v) => v.clone().into_any_element(),
+            TabView::Diff(v) => v.clone().into_any_element(),
+        }
+    }
+
+    /// Out of sight: an image leaves gpui's cache, a large diff goes (read again when shown), a menu closes.
+    fn hide(&self, window: Option<&mut Window>, cx: &mut App) {
+        match self {
+            TabView::File(v) => v.update(cx, |v, cx| v.evict_image(window, cx)),
+            TabView::Diff(v) => v.update(cx, |v, _| v.hide()),
+        }
+    }
+
+    /// Leaving for good: its image, highlight or read let go.
+    fn release(&self, window: Option<&mut Window>, cx: &mut App) {
+        match self {
+            TabView::File(v) => v.update(cx, |v, cx| v.release(window, cx)),
+            TabView::Diff(v) => v.update(cx, |v, _| v.release()),
+        }
+    }
 }
 
 /// The file tabs kept for the next run, as last read and changed since.
@@ -77,12 +128,12 @@ impl Shell {
     }
 
     /// The shown file tab's view, if it has been made.
-    pub(super) fn shown_file_view(&self) -> Option<Entity<FileViewer>> {
+    pub(super) fn shown_file_view(&self) -> Option<TabView> {
         let (_, tab) = self.shown_file_tab()?;
         self.view_of(tab.id)
     }
 
-    fn view_of(&self, id: TabId) -> Option<Entity<FileViewer>> {
+    fn view_of(&self, id: TabId) -> Option<TabView> {
         self.tab_views.iter().find(|(t, _)| *t == id).map(|(_, v)| v.clone())
     }
 
@@ -205,13 +256,18 @@ impl Shell {
         tabs.trim(id, |_| false);
         self.drop_dead_views(cx);
         let view = match self.view_of(id) {
-            Some(view) => {
+            Some(TabView::File(view)) => {
                 // a replaced preview's view shows the new file; the same file again reads it afresh only to go to `line`
                 if view.read(cx).path() != path || line.is_some() {
                     let root = self.panel_context(window, cx).root.map(PathBuf::from);
                     view.update(cx, |v, cx| v.open(path, line, root, window, cx));
                 }
                 view
+            }
+            // a diff's preview replaced by a file: a viewer in its place
+            Some(diff) => {
+                self.drop_view(id, diff, window, cx);
+                self.make_view(id, path, line, window, cx)
             }
             None => self.make_view(id, path, line, window, cx),
         };
@@ -223,6 +279,88 @@ impl Shell {
         }
         self.remember_tabs(&key, cx);
         cx.notify();
+    }
+
+    /// A change clicked in the Changes tab (or its menu's Open): its diff in a tab, as a preview or pinned as
+    /// `open_file`'s files; a conflict's file itself, its markers in it; nothing for a folder.
+    pub(super) fn open_change(&mut self, path: PathBuf, change: Change, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if change.group == Group::Conflicts {
+            if change.openable() {
+                self.open_file(path, None, preview, window, cx);
+            }
+            return;
+        }
+        if change.is_folder() {
+            return;
+        }
+        let Some(key) = self.shown_tabs_key() else { return };
+        self.restore_tabs(&key, cx);
+        let root = self.panel_context(window, cx).root.map(PathBuf::from).or_else(|| path.parent().map(PathBuf::from)).unwrap_or_default();
+        let entries = self.side_panel.read(cx).entries(&change.path);
+        let spec = DiffSpec { root, path: path.clone(), change };
+        let tabs = self.file_tabs.entry(key.clone()).or_default();
+        // ponytail: nothing is dirty until tabs edit (E1)
+        let id = tabs.open(path, TabKind::Diff(spec.change.group), preview, |_| false, &mut self.next_tab_id);
+        tabs.trim(id, |_| false);
+        self.diff_specs.insert(id, spec.clone());
+        self.drop_dead_views(cx);
+        let view = match self.view_of(id) {
+            // the same change again reads it afresh; a replaced preview's view shows the new one
+            Some(TabView::Diff(view)) => {
+                view.update(cx, |v, cx| v.open(spec, entries, cx));
+                TabView::Diff(view)
+            }
+            Some(file) => {
+                self.drop_view(id, file, window, cx);
+                self.make_diff_view(id, spec, entries, window, cx)
+            }
+            None => self.make_diff_view(id, spec, entries, window, cx),
+        };
+        if !preview {
+            window.focus(&view.focus_handle(cx), cx);
+        }
+        self.remember_tabs(&key, cx);
+        cx.notify();
+    }
+
+    /// The view in tab `id`'s slot goes (the tab shows another kind now).
+    fn drop_view(&mut self, id: TabId, view: TabView, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab_views.retain(|(t, _)| *t != id);
+        self.retire_view(view, window, cx);
+    }
+
+    /// A diff view for the tab `id`, kept first among the views.
+    fn make_diff_view(&mut self, id: TabId, spec: DiffSpec, entries: Entries, window: &mut Window, cx: &mut Context<Self>) -> TabView {
+        let rt = self.rt.clone();
+        let view = cx.new(|cx| DiffView::new(rt, spec, entries, cx));
+        cx.subscribe_in(&view, window, |s: &mut Shell, _, event: &DiffEvent, window, cx| match event {
+            // "Open file": a pinned tab of the file, at its first change, which takes the keyboard
+            DiffEvent::OpenFile { path, line } => s.open_file(path.clone(), *line, false, window, cx),
+            DiffEvent::OpenInEditor { path, line } => {
+                let pane = s.active_pane(window, cx);
+                s.show_terminals(cx);
+                crate::terminal::pane::open_in_editor(path.clone(), *line, None, pane, cx);
+            }
+        })
+        .detach();
+        let view = TabView::Diff(view);
+        self.keep_view(id, view.clone(), cx);
+        view
+    }
+
+    /// The shown diff tab reads its diff again (a Changes poll answered, `poll`, or it came into view), with its
+    /// change as the list has it now.
+    pub(super) fn reload_shown_diff(&mut self, poll: bool, cx: &mut Context<Self>) {
+        let Some((_, tab)) = self.shown_file_tab() else { return };
+        let (id, TabKind::Diff(group)) = (tab.id, tab.kind) else { return };
+        let (Some(TabView::Diff(view)), Some(spec)) = (self.view_of(id), self.diff_specs.get_mut(&id)) else { return };
+        let panel = self.side_panel.read(cx);
+        let now = panel.change_now(group, &spec.change.path);
+        let entries = panel.entries(&spec.change.path);
+        if let Some(change) = &now {
+            spec.change = change.clone();
+        }
+        view.update(cx, |v, cx| v.reload(now, entries, poll, cx));
     }
 
     /// A view for the tab `id`, reading `path`, kept first among the views.
@@ -242,19 +380,24 @@ impl Shell {
         })
         .detach();
         view.update(cx, |v, cx| v.open(path, line, root, window, cx));
-        self.tab_views.insert(0, (id, view.clone()));
-        // the least recently shown go first; one with unsaved changes stays
+        self.keep_view(id, TabView::File(view.clone()), cx);
+        view
+    }
+
+    /// Keeps `view` first among the views; the least recently shown past `MAX_VIEWS` go, but not one with unsaved
+    /// changes.
+    fn keep_view(&mut self, id: TabId, view: TabView, cx: &App) {
+        self.tab_views.insert(0, (id, view));
         while self.tab_views.len() > MAX_VIEWS {
             let Some(at) = self.tab_views.iter().rposition(|(t, v)| *t != id && !Self::view_dirty(v, cx)) else { break };
             let (_, gone) = self.tab_views.remove(at);
             self.views_gone.push(gone);
         }
-        view
     }
 
     /// The view has unsaved changes: it is never dropped to save memory.
     // ponytail: always false until tabs edit (E1)
-    fn view_dirty(_view: &Entity<FileViewer>, _cx: &App) -> bool {
+    fn view_dirty(_view: &TabView, _cx: &App) -> bool {
         false
     }
 
@@ -285,6 +428,7 @@ impl Shell {
             let (_, view) = self.tab_views.remove(at);
             self.retire_view(view, window, cx);
         }
+        self.diff_specs.remove(&id);
         self.remember_tabs(key, cx);
         cx.notify();
     }
@@ -293,6 +437,9 @@ impl Shell {
     /// unsaved changes stays (E1 asks before its tab goes).
     fn drop_dead_views(&mut self, cx: &App) {
         let live: HashSet<TabId> = self.file_tabs.values().flat_map(|t| t.files.iter().map(|f| f.id)).collect();
+        // a diff tab's change goes with it (or with its slot, now a file's)
+        let diffs: HashSet<TabId> = self.file_tabs.values().flat_map(|t| t.files.iter().filter(|f| matches!(f.kind, TabKind::Diff(_))).map(|f| f.id)).collect();
+        self.diff_specs.retain(|id, _| diffs.contains(id));
         let (keep, gone): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.tab_views).into_iter().partition(|(id, v)| live.contains(id) || Self::view_dirty(v, cx));
         self.tab_views = keep;
@@ -300,9 +447,9 @@ impl Shell {
     }
 
     /// A view leaving for good: its image and highlight let go, and the keyboard back to the pane if it had it.
-    fn retire_view(&mut self, view: Entity<FileViewer>, window: &mut Window, cx: &mut Context<Self>) {
-        let focused = view.read(cx).focus_handle(cx).contains_focused(window, cx);
-        view.update(cx, |v, cx| v.release(Some(window), cx));
+    fn retire_view(&mut self, view: TabView, window: &mut Window, cx: &mut Context<Self>) {
+        let focused = view.focus_handle(cx).contains_focused(window, cx);
+        view.release(Some(window), cx);
         if focused {
             self.focus_pane(window, cx);
         }
@@ -337,7 +484,7 @@ impl Shell {
     /// Each render, before the panes take focus: retires the views that went; puts back the shown workspace's kept
     /// tabs the first time it shows; makes the shown tab's view if it has none; a view no longer drawn lets go of
     /// its image and gives the pane back the keyboard it had. Returns the view drawn, and whether it has the keyboard.
-    pub(super) fn sync_file_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> (Option<Entity<FileViewer>>, bool) {
+    pub(super) fn sync_file_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> (Option<TabView>, bool) {
         for view in std::mem::take(&mut self.views_gone) {
             self.retire_view(view, window, cx);
         }
@@ -345,28 +492,38 @@ impl Shell {
             self.restore_tabs(&key, cx);
             self.follow_root(&key, cx);
         }
-        let shown = self.shown_file_tab().map(|(_, t)| (t.id, t.path.clone()));
-        let drawn = shown.as_ref().map(|(id, _)| *id);
-        let view = shown.map(|(id, path)| match self.tab_views.iter().position(|(t, _)| *t == id) {
+        let shown = self.shown_file_tab().map(|(_, t)| (t.id, t.path.clone(), t.kind));
+        let drawn = shown.as_ref().map(|(id, ..)| *id);
+        let view = shown.map(|(id, path, kind)| match self.tab_views.iter().position(|(t, _)| *t == id) {
             Some(0) => self.tab_views[0].1.clone(),
             Some(at) => {
                 let kept = self.tab_views.remove(at);
                 self.tab_views.insert(0, kept.clone());
                 kept.1
             }
-            None => self.make_view(id, path, None, window, cx),
+            None => match (kind, self.diff_specs.get(&id).cloned()) {
+                (TabKind::Diff(_), Some(spec)) => {
+                    let entries = self.side_panel.read(cx).entries(&spec.change.path);
+                    self.make_diff_view(id, spec, entries, window, cx)
+                }
+                _ => TabView::File(self.make_view(id, path, None, window, cx)),
+            },
         });
         if self.view_drawn != drawn {
             if let Some(hidden) = self.view_drawn.and_then(|id| self.view_of(id)) {
-                hidden.update(cx, |v, cx| v.evict_image(Some(window), cx));
+                hidden.hide(Some(window), cx);
             }
             self.view_drawn = drawn;
+            // a diff coming into view reads its diff again: it may have changed while out of sight
+            if matches!(view, Some(TabView::Diff(_))) {
+                self.reload_shown_diff(false, cx);
+            }
         }
-        let hidden_focused = self.tab_views.iter().any(|(id, v)| Some(*id) != drawn && v.read(cx).focus_handle(cx).contains_focused(window, cx));
+        let hidden_focused = self.tab_views.iter().any(|(id, v)| Some(*id) != drawn && v.focus_handle(cx).contains_focused(window, cx));
         if hidden_focused && self.settings.is_none() {
             self.focus_pane(window, cx);
         }
-        let focused = view.as_ref().is_some_and(|v| v.read(cx).focus_handle(cx).contains_focused(window, cx));
+        let focused = view.as_ref().is_some_and(|v| v.focus_handle(cx).contains_focused(window, cx));
         (view, focused)
     }
 
@@ -415,10 +572,10 @@ impl Shell {
 
     /// After the panes took focus: a pane (or the window, with none) that has the keyboard hands it to the shown
     /// file tab's view, drawn in their place. A popup's terminal, the side panel or the command panel keep theirs.
-    pub(super) fn view_takes_keys(&mut self, view: &Entity<FileViewer>, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn view_takes_keys(&mut self, view: &TabView, window: &mut Window, cx: &mut Context<Self>) {
         let pane = self.panes.values().any(|p| p.read(cx).focus_handle(cx).is_focused(window));
         if pane || self.focus.is_focused(window) {
-            window.focus(&view.read(cx).focus_handle(cx), cx);
+            window.focus(&view.focus_handle(cx), cx);
         }
     }
 

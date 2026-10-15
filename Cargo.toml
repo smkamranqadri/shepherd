@@ -35,6 +35,9 @@ unicode-width = "0.2"
 # from two-face; no syntect themes, the colours are the terminal palette's.
 syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
+# A diff tab's changed words: Myers over a line pair's words, under a deadline (Apache-2.0; no `text` feature, the
+# tab cuts the words itself).
+similar = { version = "2.7", default-features = false }
 # An image's size from its header, for the viewer's pixel budget (already in the tree, through gpui).
 imagesize = "0.14"
 

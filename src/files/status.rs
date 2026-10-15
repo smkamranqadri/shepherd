@@ -170,8 +170,10 @@ pub fn parse_status_v2(out: &[u8], prefix: &str) -> Status {
             }
         }
         if y != '.' {
-            // the rename is the index's: the work tree's edit is to the file under its new name
-            push(&mut status, change(Group::Changes, y));
+            // a rename in the index (`RM`): the work tree's edit is to the file under its new name, and the source is
+            // the Staged entry's; a rename in the work tree (`.R`, a file added with `git add -N`) is this entry's own
+            let orig = if y == 'R' { orig.clone() } else { None };
+            push(&mut status, Change { orig, ..change(Group::Changes, y) });
         }
     }
     if status.branch.is_none() {
@@ -306,6 +308,16 @@ mod tests {
         assert!(out_row.absent() && !out_row.openable());
         // lib/y.rs, lib/out.rs's edit, the copy, application.txt
         assert_eq!(s.outside_root, 4);
+    }
+
+    /// `RM`: the source is the index's rename, on the Staged entry only; `.R`: the work tree's, on the Changes one.
+    #[test]
+    fn a_rename_source_goes_with_the_entry_whose_rename_it_is() {
+        let out = nul(&[&format!("2 RM N... {H} R90 b.rs"), "a.rs", &format!("2 .R N... {H} R100 d.rs"), "c.rs"]);
+        let s = parse_status_v2(&out, "");
+        assert_eq!(find(&s, Group::Staged, "b.rs").orig.as_deref(), Some("a.rs"));
+        assert_eq!(find(&s, Group::Changes, "b.rs").orig, None);
+        assert_eq!(find(&s, Group::Changes, "d.rs").orig.as_deref(), Some("c.rs"));
     }
 
     #[test]
