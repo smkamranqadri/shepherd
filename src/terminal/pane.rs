@@ -1310,12 +1310,16 @@ pub enum Opener {
     Gui(Vec<String>),
     /// No editor to be found.
     Nothing,
+    /// The editor set (this command) runs in a terminal, and there is no pane to open it beside.
+    NeedsPane(String),
 }
 
 /// Picks how to open `path` (`is_dir` when it is a folder). `editor` is the setting; with none set, macOS takes the
-/// first of Zed, Cursor and VS Code installed, else the file's default app, as it always has; Linux takes nvim in a
-/// pane beside the focused one, else `$VISUAL`/`$EDITOR` there, else a GUI editor. nvim set but no pane to open
-/// beside falls back to the GUI editors. `installed` finds a program on the PATH.
+/// first of Zed, Cursor and VS Code installed, else the file's default app, as it always has; Linux takes
+/// `env_editor` (`$VISUAL`, else `$EDITOR`) in a pane beside the focused one (in a window of its own when it is a
+/// GUI editor, such as `code --wait`), else nvim there, else a GUI editor. A
+/// terminal editor set (nvim, vim, Helix, `emacs -nw`…) opens in a pane beside the focused one, and with no pane it
+/// is `NeedsPane`, not a GUI editor the user didn't pick. `installed` finds a program on the PATH.
 #[allow(clippy::too_many_arguments)]
 pub fn choose_opener(
     path: &Path,
@@ -1338,18 +1342,21 @@ pub fn choose_opener(
         None => Opener::Nothing,
     };
     match editor.map(str::trim).filter(|e| !e.is_empty()) {
-        Some(e) if is_nvim(Some(e)) => {
+        Some(e) if is_terminal_editor(e) => {
             if has_pane {
                 Opener::Split(e.to_string())
             } else {
-                fallback()
+                Opener::NeedsPane(e.to_string())
             }
         }
         Some(e) => Opener::Gui(editor_argv_with(&e.split_whitespace().map(String::from).collect::<Vec<_>>(), &target, installed)),
         None if mac => fallback(),
-        None => match (has_pane, installed("nvim"), env_editor.map(str::trim).filter(|e| !e.is_empty())) {
-            (true, Some(_), _) => Opener::Split("nvim".into()),
-            (true, None, Some(e)) => Opener::Split(e.to_string()),
+        None => match (has_pane, env_editor.map(str::trim).filter(|e| !e.is_empty()), installed("nvim")) {
+            // a GUI editor in $VISUAL (`code --wait`) gets its own window, not a pane running it
+            (_, Some(e), _) if is_gui_editor(e) => Opener::Gui(editor_argv_with(&e.split_whitespace().map(String::from).collect::<Vec<_>>(), &target, installed)),
+            // anything else is taken to want a terminal (omarchy-launch-editor --inline is a script)
+            (true, Some(e), _) => Opener::Split(e.to_string()),
+            (true, None, Some(_)) => Opener::Split("nvim".into()),
             _ => fallback(),
         },
     }
@@ -1364,6 +1371,9 @@ async fn open_at(client: &Client, editor: Option<String>, path: &Path, line: Opt
         Opener::FileManager => crate::platform::launch(&[crate::platform::OPEN.into(), path.into()]).await,
         Opener::Gui(argv) => crate::platform::launch(&argv.into_iter().map(Into::into).collect::<Vec<_>>()).await,
         Opener::Nothing => Err("No editor to open it in: set one in Settings, or install nvim or VS Code".into()),
+        Opener::NeedsPane(editor) => {
+            Err(format!("{editor} runs in a terminal: focus a pane to open it beside, or set a GUI editor in Settings"))
+        }
         Opener::Split(editor) => {
             let Some((pane_id, cwd)) = pane else { return Err("No pane to open the editor beside".into()) };
             // A terminal editor gets a pane to the right; its shell drops typeahead until the prompt is drawn.
@@ -1420,10 +1430,14 @@ fn gui_editor(target: &str, installed: &dyn Fn(&str) -> Option<String>) -> Optio
     installed("cursor").or_else(|| installed("code")).map(|code| vec![code, "-g".into(), target.into()])
 }
 
-/// The editor command's words (its program found on the PATH) with `target` last.
+/// The editor command's words (its program found on the PATH) with `target` last; VS Code and its forks are given
+/// `-g` so they read `target`'s `:line:col`.
 fn editor_argv_with(words: &[String], target: &str, installed: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
     let program = if words[0].contains('/') { None } else { installed(&words[0]) };
-    [vec![program.unwrap_or_else(|| words[0].clone())], words[1..].to_vec(), vec![target.into()]].concat()
+    let name = words[0].rsplit('/').next().unwrap_or_default();
+    let goto = matches!(name, "code" | "code-insiders" | "codium" | "cursor" | "windsurf") && !words.iter().any(|w| w == "-g" || w == "--goto");
+    let goto = if goto { vec!["-g".to_string()] } else { Vec::new() };
+    [vec![program.unwrap_or_else(|| words[0].clone())], words[1..].to_vec(), goto, vec![target.into()]].concat()
 }
 
 /// The command opening `path` at its line: the user's editor, else the first of Zed, Cursor and VS Code installed,
@@ -1442,13 +1456,50 @@ pub fn terminal_command(editor: &str, path: &Path, line: Option<u32>, col: Optio
     if is_nvim(Some(editor)) {
         return nvim_command(editor, path, line, col);
     }
-    let quoted = format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
     let program = editor.split_whitespace().next().unwrap_or_default().rsplit('/').next().unwrap_or_default();
-    let jump = match line {
-        Some(l) if matches!(program, "vim" | "vi" | "nano" | "micro" | "emacs") => format!(" +{l}"),
-        _ => String::new(),
-    };
-    format!("exec {editor}{jump} {quoted}")
+    match line {
+        // Helix takes the line on the file's name
+        Some(l) if matches!(program, "hx" | "helix") => {
+            let at = match col {
+                Some(c) => format!("{}:{l}:{c}", path.display()),
+                None => format!("{}:{l}", path.display()),
+            };
+            format!("exec {editor} {}", quote(&at))
+        }
+        // lvim is nvim's arguments
+        _ if program == "lvim" => nvim_command(editor, path, line, col),
+        Some(l) if matches!(program, "vim" | "vi" | "nano" | "micro" | "emacs" | "emacsclient" | "kak" | "vis") => {
+            format!("exec {editor} +{l} {}", quote(&path.display().to_string()))
+        }
+        // omarchy-launch-editor forwards its arguments to whichever editor Omarchy's defaults name, which may not
+        // take `+line`; fresh's syntax is unknown: the file alone
+        _ => format!("exec {editor} {}", quote(&path.display().to_string())),
+    }
+}
+
+/// Whether the editor command opens a window of its own: VS Code and its forks, Zed, Sublime Text, gvim, or any
+/// command told to `--wait` for its window to close (a terminal editor never needs that).
+pub fn is_gui_editor(editor: &str) -> bool {
+    let mut words = editor.split_whitespace();
+    let gui = matches!(
+        words.next().and_then(|w| w.rsplit('/').next()),
+        Some("code" | "code-insiders" | "codium" | "cursor" | "windsurf" | "zed" | "zeditor" | "subl" | "gvim" | "mvim" | "gedit" | "kate")
+    );
+    gui || words.any(|w| matches!(w, "-w" | "--wait"))
+}
+
+/// Whether the editor command runs in a terminal (vim, nvim, nano, micro, Helix, Kakoune, `emacs -nw`,
+/// `omarchy-launch-editor --inline`...), so it opens in a pane instead of a window of its own.
+pub fn is_terminal_editor(editor: &str) -> bool {
+    let mut words = editor.split_whitespace();
+    match words.next().and_then(|w| w.rsplit('/').next()) {
+        Some("vim" | "vi" | "nvim" | "lvim" | "nano" | "micro" | "hx" | "helix" | "kak" | "vis" | "fresh") => true,
+        Some("emacs") => words.any(|w| matches!(w, "-nw" | "--no-window-system")),
+        Some("emacsclient") => words.any(|w| matches!(w, "-t" | "-nw" | "--tty")),
+        Some("omarchy-launch-editor") => words.any(|w| w == "--inline"),
+        _ => false,
+    }
 }
 
 /// Whether the editor command runs nvim, which opens in a pane instead of its own window.
@@ -1752,14 +1803,17 @@ mod tests {
     }
 
     #[test]
-    fn with_no_editor_set_linux_opens_nvim_beside_the_pane() {
+    fn with_no_editor_set_linux_opens_visual_or_nvim_beside_the_pane() {
         let (path, has) = (Path::new("/tmp/a.rs"), |names: &'static [&'static str]| move |n: &str| names.contains(&n).then(|| format!("/usr/bin/{n}")));
         let pick = |editor: Option<&str>, env: Option<&str>, pane: bool, mac: bool, found: &dyn Fn(&str) -> Option<String>| choose_opener(path, false, Some(3), None, editor, env, pane, mac, found);
         let all = has(&["nvim", "code"]);
-        assert_eq!(pick(None, Some("hx"), true, false, &all), Opener::Split("nvim".into()));
-        // no nvim: $VISUAL/$EDITOR in the split, else VS Code, else nothing (no xdg-open: it runs nvim.desktop
-        // with no terminal)
+        // $VISUAL/$EDITOR first, in the split, even with nvim installed
+        assert_eq!(pick(None, Some("hx"), true, false, &all), Opener::Split("hx".into()));
         assert_eq!(pick(None, Some("omarchy-launch-editor --inline"), true, false, &has(&["code"])), Opener::Split("omarchy-launch-editor --inline".into()));
+        // neither set: nvim in the split, else VS Code, else nothing (no xdg-open: it runs nvim.desktop with no
+        // terminal)
+        assert_eq!(pick(None, Some(" "), true, false, &all), Opener::Split("nvim".into()));
+        assert_eq!(pick(None, None, true, false, &all), Opener::Split("nvim".into()));
         assert_eq!(pick(None, Some(" "), true, false, &has(&["code"])), Opener::Gui(vec!["/usr/bin/code".into(), "-g".into(), "/tmp/a.rs:3".into()]));
         assert_eq!(pick(None, None, false, false, &all), Opener::Gui(vec!["/usr/bin/code".into(), "-g".into(), "/tmp/a.rs:3".into()]));
         assert_eq!(pick(None, Some("vim"), false, false, &has(&[])), Opener::Nothing);
@@ -1768,15 +1822,54 @@ mod tests {
         assert_eq!(pick(None, None, true, true, &has(&["nvim"])), Opener::Gui(vec![crate::platform::OPEN.into(), "/tmp/a.rs".into()]));
         // an editor set is used as before
         assert_eq!(pick(Some("nvim"), None, true, false, &all), Opener::Split("nvim".into()));
-        assert_eq!(pick(Some("nvim"), None, false, false, &has(&["zed"])), Opener::Gui(vec!["/usr/bin/zed".into(), "/tmp/a.rs:3".into()]));
         assert_eq!(pick(Some("subl -n"), None, true, false, &has(&["subl"])), Opener::Gui(vec!["/usr/bin/subl".into(), "-n".into(), "/tmp/a.rs:3".into()]));
         assert_eq!(choose_opener(Path::new("/tmp"), true, None, None, Some("nvim"), None, true, false, &all), Opener::FileManager);
     }
 
     #[test]
+    fn a_terminal_editor_set_opens_in_a_split_or_asks_for_a_pane() {
+        let all = |n: &str| ["nvim", "vim", "zed", "emacs"].contains(&n).then(|| format!("/usr/bin/{n}"));
+        let pick = |editor: &str, pane: bool| choose_opener(Path::new("/tmp/a.rs"), false, Some(3), None, Some(editor), Some("code"), pane, false, &all);
+        for e in ["nvim", "/usr/bin/vim", "vi", "nano", "micro", "hx", "helix", "emacs -nw", "emacs --no-window-system"] {
+            assert_eq!(pick(e, true), Opener::Split(e.into()), "{e}");
+            // not a GUI editor the user didn't pick
+            assert_eq!(pick(e, false), Opener::NeedsPane(e.into()), "{e}");
+        }
+        // emacs with a window of its own, and look-alikes, are GUI editors
+        assert_eq!(pick("emacs", true), Opener::Gui(vec!["/usr/bin/emacs".into(), "/tmp/a.rs:3".into()]));
+        assert_eq!(pick("vimr", true), Opener::Gui(vec!["vimr".into(), "/tmp/a.rs:3".into()]));
+        assert!(is_terminal_editor(" vim -u NONE"));
+        assert!(!is_terminal_editor("gvim"));
+        assert!(!is_terminal_editor(""));
+        for e in ["kak", "vis", "lvim", "fresh", "emacsclient -t", "emacsclient --tty", "omarchy-launch-editor --inline"] {
+            assert!(is_terminal_editor(e), "{e}");
+        }
+        assert!(!is_terminal_editor("emacsclient -c"));
+        assert!(!is_terminal_editor("omarchy-launch-editor"));
+    }
+
+    #[test]
+    fn a_gui_visual_opens_its_own_window() {
+        let found = |n: &str| ["nvim", "code", "zed"].contains(&n).then(|| format!("/usr/bin/{n}"));
+        let pick = |env: &str| choose_opener(Path::new("/tmp/a.rs"), false, Some(3), None, None, Some(env), true, false, &found);
+        assert_eq!(pick("code --wait"), Opener::Gui(vec!["/usr/bin/code".into(), "--wait".into(), "-g".into(), "/tmp/a.rs:3".into()]));
+        assert_eq!(pick("zed"), Opener::Gui(vec!["/usr/bin/zed".into(), "/tmp/a.rs:3".into()]));
+        assert_eq!(pick("myeditor -w"), Opener::Gui(vec!["myeditor".into(), "-w".into(), "/tmp/a.rs:3".into()]));
+        // unknown editors stay in the split: they may be scripts needing a terminal
+        assert_eq!(pick("omarchy-launch-editor --inline"), Opener::Split("omarchy-launch-editor --inline".into()));
+        assert_eq!(pick("myeditor"), Opener::Split("myeditor".into()));
+    }
+
+    #[test]
     fn terminal_editors_get_the_line_when_they_take_it() {
         assert_eq!(terminal_command("vim", Path::new("/tmp/a"), Some(3), Some(1)), "exec vim +3 '/tmp/a'");
-        assert_eq!(terminal_command("hx", Path::new("/tmp/a"), Some(3), None), "exec hx '/tmp/a'");
+        assert_eq!(terminal_command("hx", Path::new("/tmp/a"), Some(3), None), "exec hx '/tmp/a:3'");
+        assert_eq!(terminal_command("hx", Path::new("/tmp/a"), Some(3), Some(2)), "exec hx '/tmp/a:3:2'");
+        assert_eq!(terminal_command("hx", Path::new("/tmp/a"), None, None), "exec hx '/tmp/a'");
+        assert_eq!(terminal_command("kak", Path::new("/tmp/a"), Some(3), None), "exec kak +3 '/tmp/a'");
+        assert_eq!(terminal_command("emacsclient -t", Path::new("/tmp/a"), Some(3), None), "exec emacsclient -t +3 '/tmp/a'");
+        assert_eq!(terminal_command("lvim", Path::new("/tmp/a"), None, None), "exec lvim '/tmp/a'");
+        assert_eq!(terminal_command("omarchy-launch-editor --inline", Path::new("/tmp/a"), Some(3), None), "exec omarchy-launch-editor --inline '/tmp/a'");
         assert_eq!(terminal_command("/usr/bin/nvim", Path::new("/tmp/a"), Some(3), None), "exec /usr/bin/nvim +3 '/tmp/a'");
     }
 

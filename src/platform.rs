@@ -40,7 +40,7 @@ unsafe extern "C" {
 
 /// Starts `argv` on its own, as a launcher would: in a session of its own (no terminal, none of Shepherd's
 /// signals), with no stdin, stdout or stderr of Shepherd's, and not killed when Shepherd or the handle goes. A
-/// program still running after a moment (an app with its window up) is left to run, and tokio reaps it when it
+/// program still running after a moment (an app with its window up) is left to run, and a task reaps it when it
 /// exits; one that has already failed by then (`xdg-open` with no app for the file) or could not start is the error,
 /// in words for a toast. Runs on the tokio runtime.
 pub async fn launch(argv: &[std::ffi::OsString]) -> Result<(), String> {
@@ -68,8 +68,14 @@ pub async fn launch(argv: &[std::ffi::OsString]) -> Result<(), String> {
             None => format!("{name} was stopped by a signal"),
         }),
         Ok(Err(e)) => Err(format!("{name}: {e}")),
-        // still running: dropping the child leaves it be, and tokio reaps it once it exits
-        Err(_) => Ok(()),
+        // still running (an app with its window up): a task waits on it, so it is reaped the moment it exits
+        // rather than whenever tokio's orphan queue next looks
+        Err(_) => {
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+            Ok(())
+        }
     }
 }
 

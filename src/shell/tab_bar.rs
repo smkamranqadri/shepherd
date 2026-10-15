@@ -704,8 +704,8 @@ impl Shell {
             .flex()
             .items_center()
             .gap(px(2.))
-            // the 28 px `+` sits as far from the right edge as from the top and bottom, and clear of the window's
-            // buttons while no right panel sits under them
+            // the bar's last button (the right panel's toggle) ends as far from the right edge as the tabs sit from
+            // the top and bottom, and clear of the window's buttons while no right panel sits under them
             .pr(px(TAB_TOP + if self.panel_open { 0. } else { window_controls_w(cx) }))
             // clear the traffic lights and the sidebar toggle once the sidebar no longer sits under them
             .pl(px((TITLEBAR_CLUSTER - sidebar_w).max(8.)))
@@ -774,6 +774,8 @@ impl Shell {
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.new_tab(ws.clone(), cx))),
                 )
             })
+            // off macOS the tabs and the `+` take only their width: the rest of the bar goes before the toggle
+            .when(!cfg!(target_os = "macos"), |el| el.child(div().flex_1().min_w_0()))
             // The right panel's toggle, at the titlebar's right end (the left one's mirror): the bar ends where the
             // panel begins, so it sits beside the panel's header when open and in the corner when closed.
             .child(
