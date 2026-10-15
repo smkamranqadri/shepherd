@@ -519,6 +519,10 @@ impl Shell {
             window.request_animation_frame();
         }
 
+        // held Ctrl (Cmd on macOS): each tab's Tab1–9 chord over its right end, numbered along the strip as
+        // `go_to_tab` counts (herdr's tabs, then the file tabs)
+        let hint = self.hints_of(hints::HintMode::Tabs).map(|o| (o, TAB_ACTIONS.map(|a| chord_of(cx, a))));
+        let mut strip_at = 0;
         let mut index = 0;
         let mut items = Vec::new();
         let mut flying = Vec::new();
@@ -527,6 +531,16 @@ impl Shell {
             if t.face == Face::Divider {
                 items.push(divider(theme, k));
                 continue;
+            }
+            let chip = match &hint {
+                Some((opacity, chords)) if entry.exit.is_none() => {
+                    let chord = chords.get(strip_at).cloned().flatten();
+                    chord.map(|c| hints::chip(theme, &c, *opacity))
+                }
+                _ => None,
+            };
+            if entry.exit.is_none() {
+                strip_at += 1;
             }
             let file = match t.face {
                 Face::File { tab, .. } => files_key.clone().map(|key| (key, tab)),
@@ -621,7 +635,8 @@ impl Shell {
                 .block_mouse_except_scroll()
                 .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
                 .when(!selected && !closing, |el| el.hover(|s| s.bg(theme.hover)))
-                .child(content);
+                .child(content)
+                .children(chip);
             if closing {
                 items.push(tab.into_any_element());
                 continue;

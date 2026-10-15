@@ -1036,6 +1036,21 @@ impl Render for SettingsView {
                     )
                     .child(
                         card_row(&theme, false)
+                            .child(row_text(
+                                &theme,
+                                "Shortcut hints",
+                                if cfg!(target_os = "macos") {
+                                    "Holding Cmd shows each tab's shortcut, and holding Ctrl each workspace's."
+                                } else {
+                                    "Holding Alt shows each tab's shortcut, and holding Ctrl+Shift each workspace's."
+                                },
+                            ))
+                            .child(toggle(&theme, "show-shortcut-hints", settings.show_shortcut_hints).on_click(cx.listener(
+                                |_, _: &ClickEvent, _, cx| update(cx, |s| s.show_shortcut_hints = !s.show_shortcut_hints),
+                            ))),
+                    )
+                    .child(
+                        card_row(&theme, false)
                             .child(row_text(&theme, "Copy on select", "A finished selection goes to the clipboard, then clears."))
                             .child(toggle(&theme, "copy-on-select", settings.copy_on_select).on_click(cx.listener(
                                 |_, _: &ClickEvent, _, cx| update(cx, |s| s.copy_on_select = !s.copy_on_select),

@@ -18,6 +18,7 @@ It's written in Rust on [GPUI](https://github.com/zeronsh/zui) and styled after 
 - herdr's own `[keys]` work in Shepherd, and its popups float over the panes.
 - `⌥⌘B` opens the review panel: the branch's PR (gh) or MR (glab) with its description, checks or pipeline jobs and their logs. It works for SSH machines too.
 - `⌘K` opens a command panel with every action, workspace and tab. `⇧⌘A` opens the agents panel.
+- Hold `⌘` for a moment and each tab shows its shortcut; hold `⌃` and each workspace does (Alt and Ctrl+Shift on Linux). Settings can turn the hints off.
 - The status bar shows the branch, its PR and CI, the current folder, the focused agent and your Claude and Codex plan limits.
 - Settings cover fonts, themes, key bindings and usage. They also edit herdr's own `config.toml` for notifications and integrations, keeping your comments.
 

@@ -200,7 +200,17 @@ impl Shell {
                     .collect()
             })
             .unwrap_or_default();
+        // held Ctrl+Shift (Ctrl on macOS): each of the first nine workspaces' chord, in `go_to_workspace`'s order
+        let hint = self.hints_of(hints::HintMode::Workspaces).filter(|_| live).map(|opacity| {
+            let order: Vec<String> = snapshot.map(|s| s.workspace_tree().into_iter().map(|(w, _)| w.workspace_id.clone()).collect()).unwrap_or_default();
+            let chords: Vec<(String, String)> = order.into_iter().zip(WORKSPACE_ACTIONS).filter_map(|(id, a)| Some((id, chord_of(cx, a)?))).collect();
+            (opacity, chords)
+        });
         let ws_row = |w: &crate::model::Workspace, nested: bool, chevron: Option<gpui::AnyElement>, folded: Option<usize>, cx: &mut Context<Self>| {
+            let chip = hint.as_ref().and_then(|(opacity, chords)| {
+                let (_, chord) = chords.iter().find(|(id, _)| *id == w.workspace_id)?;
+                Some(hints::chip(theme, chord, *opacity))
+            });
             let show = SettingsGlobal::of(cx).settings.workspace_show;
             let compact = SettingsGlobal::of(cx).settings.compact_workspaces;
             let selected = shown_ws.as_deref() == Some(w.workspace_id.as_str());
@@ -327,6 +337,8 @@ impl Shell {
                     }
                 })
                 .children(chevron)
+                // over the row's right end (its status and chevron), so nothing in it moves
+                .when_some(chip, |el, chip| el.relative().child(chip))
                 .when(live, |el| {
                     el.on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
                         if e.click_count() == 2 {

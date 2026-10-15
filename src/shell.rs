@@ -33,6 +33,7 @@ mod sessions;
 mod sidebar;
 mod sync;
 mod file_tabs;
+mod hints;
 mod tab_bar;
 pub(crate) mod widgets;
 mod workspaces;
@@ -280,6 +281,13 @@ pub struct Shell {
     session_delete: Option<crate::ui::Popup<sessions::Place>>,
     /// The saved machine shown, by its label; `None` for a session on this Mac.
     machine_label: Option<String>,
+    /// The shortcut hints held up by Ctrl (Cmd on macOS) or Ctrl+Shift (Ctrl on macOS).
+    hints: hints::Hints,
+    /// The wake-up when the hint modifier has been held long enough.
+    hints_wait: Option<gpui::Task<()>>,
+    /// Every key down in this window puts the hints away, a key bound to an action too (dispatched before any
+    /// key-down listener hears it).
+    _hint_keys: Subscription,
 }
 
 /// New worktree: the repo's workspace and the branch name being typed.
@@ -349,6 +357,7 @@ impl Shell {
                     if active {
                         s.touched = Instant::now();
                     }
+                    s.hint_activation(active, window, cx);
                     cx.set_global(crate::terminal::pane::Yielded(!active));
                     if active {
                         s.refresh_places(cx); // sessions made or deleted elsewhere
@@ -447,6 +456,12 @@ impl Shell {
                     crate::ui::side_panel::SidePanelEvent::ChangesCounted => cx.notify(),
                 })
                 .detach();
+                let (this, handle) = (cx.entity().downgrade(), window.window_handle());
+                let hint_keys = cx.intercept_keystrokes(move |_, window, cx| {
+                    if window.window_handle() == handle {
+                        let _ = this.update(cx, |s, cx| s.hint_cancel(cx));
+                    }
+                });
                 let mut shell = Shell {
                     snapshot: None,
                     error: None,
@@ -565,6 +580,9 @@ impl Shell {
                     session_dialog: None,
                     session_delete: None,
                     machine_label: None,
+                    hints: Default::default(),
+                    hints_wait: None,
+                    _hint_keys: hint_keys,
                 };
                 shell.resume_machine(cx);
                 shell.connect(cx);
@@ -1304,6 +1322,14 @@ impl Render for Shell {
             self.removing.retain(|id| s.workspaces.iter().any(|w| &w.workspace_id == id));
         }
         reapply_traffic_lights(window);
+        // a menu or dialog opening puts the shortcut hints away; they fade in and out on their own frames
+        let now = Instant::now();
+        if self.popup_open() {
+            self.hints.cancel(now);
+        }
+        if self.hints.fading(now) {
+            window.request_animation_frame();
+        }
         let theme = Theme::of(cx).clone();
         let snapshot = self.snapshot.clone();
         let toasts = crate::ui::toast::stack(&theme, TITLEBAR_HEIGHT + 8., window, cx);
@@ -1603,7 +1629,11 @@ impl Render for Shell {
                     cx.stop_propagation();
                 }
             }))
-            .capture_any_mouse_down(cx.listener(|s, _: &MouseDownEvent, _, cx| s.touch(cx)))
+            .capture_any_mouse_down(cx.listener(|s, _: &MouseDownEvent, _, cx| {
+                s.touch(cx);
+                s.hint_cancel(cx);
+            }))
+            .on_modifiers_changed(cx.listener(|s, e: &gpui::ModifiersChangedEvent, _, cx| s.hint_modifiers(&e.modifiers, cx)))
             .relative()
             .size_full()
             .flex()

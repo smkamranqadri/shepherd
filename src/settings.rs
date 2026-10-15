@@ -92,6 +92,8 @@ pub struct Settings {
     /// the window manager provides its own controls or tiles windows), the tabs take their room; the edges still
     /// resize the window, and a right-click on the titlebar opens the window manager's menu.
     pub window_buttons: bool,
+    /// Holding Alt (Cmd on macOS) shows each tab's shortcut, and Ctrl+Shift (Ctrl on macOS) each workspace's.
+    pub show_shortcut_hints: bool,
     /// The workspaces sidebar is shown; `⌘B` hides it.
     pub sidebar_open: bool,
     /// Worktree groups folded in the sidebar, by workspace id.
@@ -312,6 +314,7 @@ impl Default for Settings {
             secure_input: false,
             translucent_window: cfg!(target_os = "macos"),
             window_buttons: true,
+            show_shortcut_hints: true,
             sidebar_open: true,
             folded: Vec::new(),
             window: None,
