@@ -75,6 +75,8 @@ pub struct Cmd {
 
 /// What of stderr is kept: git's and rg's messages are a line or two.
 const STDERR_CAP: usize = 64 * 1024;
+/// What of a stream's stderr its `Exit` carries: the last 8 KiB, where the reason a search failed is.
+const STREAM_STDERR: usize = 8 * 1024;
 /// A stream's lines go out at least this often while it prints, and in batches of at most `BATCH_LINES`.
 const BATCH_EVERY: Duration = Duration::from_millis(50);
 const BATCH_LINES: usize = 200;
@@ -175,12 +177,22 @@ pub async fn run(host: &Host, cmd: Cmd, limits: Limits) -> Result<Output, RunErr
     tokio::time::timeout(limits.timeout, job).await.map_err(|_| RunError::Timeout)?
 }
 
-/// A stream's batches of lines; its last item may be an error (`NotFound`, `Timeout`, `Truncated`, …).
-pub type Batches = mpsc::UnboundedReceiver<Result<Vec<Vec<u8>>, RunError>>;
+/// What a stream sends: its lines in batches, then how the child ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Item {
+    Lines(Vec<Vec<u8>>),
+    /// The last item of a child that ran to its end: its exit code (`None` when a signal ended it) and the last
+    /// `STREAM_STDERR` bytes of its stderr, lossy. rg's exit 2 with its complaints is not "no results" (exit 1).
+    Exit { code: Option<i32>, stderr: String },
+}
+
+/// A stream's items; its last is `Exit`, or an error (`NotFound`, `Timeout`, `Truncated`, …) when it did not end
+/// on its own.
+pub type Batches = mpsc::UnboundedReceiver<Result<Item, RunError>>;
 
 /// `cmd`'s stdout as lines (split on `\n`, which is dropped), sent in batches every `BATCH_EVERY` or `BATCH_LINES`
-/// until it ends, prints `max_bytes` (then `Truncated` comes last), reaches its deadline (`Timeout`) or the receiver
-/// is dropped. Aborting the handle, the deadline and a dropped receiver all kill the child. The channel is unbounded:
+/// until it ends (then `Exit` comes last), prints `max_bytes` (then `Truncated`), reaches its deadline (`Timeout`)
+/// or the receiver is dropped. Aborting the handle, the deadline and a dropped receiver all kill the child. The channel is unbounded:
 /// `max_bytes` bounds what it can hold, and a receiver that stops reading cannot hold the deadline off.
 pub fn stream(host: &Host, cmd: Cmd, limits: Limits, rt: &Handle) -> (Batches, AbortHandle) {
     let (tx, rx) = mpsc::unbounded();
@@ -193,14 +205,48 @@ pub fn stream(host: &Host, cmd: Cmd, limits: Limits, rt: &Handle) -> (Batches, A
     (rx, task.abort_handle())
 }
 
-type Sender = mpsc::UnboundedSender<Result<Vec<Vec<u8>>, RunError>>;
+type Sender = mpsc::UnboundedSender<Result<Item, RunError>>;
+
+/// Adds `data` to `tail`, which keeps (at least) the last `cap` bytes, in amortised constant time.
+fn keep_tail(tail: &mut Vec<u8>, data: &[u8], cap: usize) {
+    tail.extend_from_slice(&data[data.len().saturating_sub(cap)..]);
+    if tail.len() > cap * 2 {
+        tail.drain(..tail.len() - cap);
+    }
+}
+
+/// Reads all of `r`, keeping its last `cap` bytes; the child never blocks on a full stderr pipe.
+async fn read_tail(r: Option<impl AsyncRead + Unpin>, cap: usize) -> Vec<u8> {
+    let (Some(mut r), mut tail) = (r, Vec::new()) else { return Vec::new() };
+    let mut buf = [0u8; 8192];
+    while let Ok(n) = r.read(&mut buf).await {
+        if n == 0 {
+            break;
+        }
+        keep_tail(&mut tail, &buf[..n], cap);
+    }
+    let cut = tail.len().saturating_sub(cap);
+    tail.drain(..cut);
+    tail
+}
+
+struct AbortOnDrop(AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 async fn pump(host: &Host, cmd: Cmd, limits: Limits, tx: &Sender) -> Result<(), RunError> {
     if let Host::Ssh { .. } = host {
         return Err(RunError::RemoteUnsupported);
     }
-    let mut child = spawn(&cmd, false)?;
+    let mut child = spawn(&cmd, true)?;
     tokio::spawn(feed(child.stdin.take(), cmd.stdin.clone()));
+    // read beside stdout, and stopped with this task however it ends (a grandchild may hold the pipe open)
+    let mut stderr = tokio::spawn(read_tail(child.stderr.take(), STREAM_STDERR));
+    let _stop_stderr = AbortOnDrop(stderr.abort_handle());
     let Some(stdout) = child.stdout.take() else { return Ok(()) };
     let mut reader = BufReader::new(stdout);
     let deadline = tokio::time::sleep(limits.timeout);
@@ -209,7 +255,7 @@ async fn pump(host: &Host, cmd: Cmd, limits: Limits, tx: &Sender) -> Result<(), 
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // `total` counts the lines sent; `line` the one being read, never past one byte over the cap
     let (mut batch, mut line, mut total) = (Vec::new(), Vec::new(), 0usize);
-    let send = |batch: &mut Vec<Vec<u8>>| batch.is_empty() || tx.unbounded_send(Ok(std::mem::take(batch))).is_ok();
+    let send = |batch: &mut Vec<Vec<u8>>| batch.is_empty() || tx.unbounded_send(Ok(Item::Lines(std::mem::take(batch)))).is_ok();
     let end = loop {
         let budget = (limits.max_bytes + 1).saturating_sub(total + line.len()) as u64;
         let mut limited = (&mut reader).take(budget);
@@ -246,10 +292,24 @@ async fn pump(host: &Host, cmd: Cmd, limits: Limits, tx: &Sender) -> Result<(), 
         }
     };
     send(&mut batch);
-    // at the cap or the deadline the child may still be running; at the end this only reaps it
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-    end
+    if let Err(e) = end {
+        // at the cap or the deadline the child may still be running
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(e);
+    }
+    // stdout closed: the child is ending; it, and a grandchild holding stderr open, still have the deadline
+    let ended = async {
+        let status = child.wait().await.map_err(|e| RunError::Io(e.to_string()))?;
+        let stderr = (&mut stderr).await.unwrap_or_default();
+        Ok::<_, RunError>(Item::Exit { code: status.code(), stderr: String::from_utf8_lossy(&stderr).into_owned() })
+    };
+    let exit = tokio::select! {
+        exit = ended => Some(exit),
+        _ = &mut deadline => None,
+    };
+    let _ = tx.unbounded_send(Ok(exit.ok_or(RunError::Timeout)??));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -341,11 +401,24 @@ mod tests {
         assert_eq!(out.stdout, b"unset\n");
     }
 
+    /// The lines of `items`, which must all be `Lines`.
+    fn lines(items: Vec<Result<Item, RunError>>) -> Vec<Vec<u8>> {
+        items
+            .into_iter()
+            .flat_map(|i| match i {
+                Ok(Item::Lines(lines)) => lines,
+                other => panic!("not lines: {other:?}"),
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn a_stream_sends_every_line_then_ends() {
         let (rx, _) = stream(&Host::Local, sh("seq 1 450; printf last"), limits(5000, 1 << 20), &Handle::current());
-        let lines: Vec<Vec<u8>> = rx.map(|b| b.unwrap()).collect::<Vec<_>>().await.concat();
-        assert_eq!(lines.len(), 451, "no Truncated under the cap");
+        let mut got: Vec<_> = rx.collect().await;
+        assert_eq!(got.pop(), Some(Ok(Item::Exit { code: Some(0), stderr: String::new() })), "no Truncated under the cap");
+        let lines = lines(got);
+        assert_eq!(lines.len(), 451);
         assert_eq!((lines[0].as_slice(), lines[449].as_slice(), lines[450].as_slice()), (&b"1"[..], &b"450"[..], &b"last"[..]));
     }
 
@@ -354,11 +427,10 @@ mod tests {
         let (rx, _) = stream(&Host::Local, sh("yes"), limits(5000, 1000), &Handle::current());
         let mut got: Vec<_> = rx.collect().await;
         assert_eq!(got.pop(), Some(Err(RunError::Truncated)));
-        let lines: Vec<Vec<u8>> = got.into_iter().map(Result::unwrap).collect::<Vec<_>>().concat();
-        assert_eq!(lines.len(), 500, "two bytes a line");
+        assert_eq!(lines(got).len(), 500, "two bytes a line");
         let (rx, _) = stream(&Host::Local, sh("echo one; exec sleep 5"), limits(300, 1000), &Handle::current());
         let got: Vec<_> = rx.collect().await;
-        assert_eq!(got, vec![Ok(vec![b"one".to_vec()]), Err(RunError::Timeout)]);
+        assert_eq!(got, vec![Ok(Item::Lines(vec![b"one".to_vec()])), Err(RunError::Timeout)]);
     }
 
     #[tokio::test]
@@ -368,7 +440,33 @@ mod tests {
         let got: Vec<_> = rx.collect().await;
         assert_eq!(got, vec![Err(RunError::Truncated)]);
         let (rx, _) = stream(&Host::Local, sh("printf 'abc'"), limits(5000, 3), &Handle::current());
-        assert_eq!(rx.collect::<Vec<_>>().await, vec![Ok(vec![b"abc".to_vec()])], "exactly the cap is not cut");
+        let got: Vec<_> = rx.collect().await;
+        assert_eq!(got[0], Ok(Item::Lines(vec![b"abc".to_vec()])), "exactly the cap is not cut");
+        assert!(matches!(got[1], Ok(Item::Exit { code: Some(0), .. })));
+    }
+
+    #[tokio::test]
+    async fn a_stream_ends_with_the_exit_code_and_the_tail_of_stderr() {
+        // rg's "problems": exit 2 after some results, its complaints on stderr
+        let (rx, _) = stream(&Host::Local, sh("echo found; echo 'a: Permission denied' >&2; exit 2"), limits(5000, 1000), &Handle::current());
+        let got: Vec<_> = rx.collect().await;
+        assert_eq!(got, vec![Ok(Item::Lines(vec![b"found".to_vec()])), Ok(Item::Exit { code: Some(2), stderr: "a: Permission denied\n".into() })]);
+        // a lot of stderr: only its last 8 KiB, where the end is
+        let (rx, _) = stream(&Host::Local, sh("head -c 100000 /dev/zero | tr '\\0' x >&2; printf END >&2; exit 1"), limits(5000, 1000), &Handle::current());
+        let got: Vec<_> = rx.collect().await;
+        let [Ok(Item::Exit { code: Some(1), stderr })] = &got[..] else { panic!("{got:?}") };
+        assert_eq!(stderr.len(), STREAM_STDERR);
+        assert!(stderr.ends_with("xEND"));
+    }
+
+    #[test]
+    fn a_tail_keeps_the_last_bytes() {
+        let mut tail = Vec::new();
+        for chunk in [&b"abcdef"[..], b"gh", b"ijklmnopqrstuvwxyz"] {
+            keep_tail(&mut tail, chunk, 4);
+            assert!(tail.len() <= 8);
+        }
+        assert!(tail.ends_with(b"wxyz"));
     }
 
     async fn wait_gone(pid_file: &Path) -> bool {
