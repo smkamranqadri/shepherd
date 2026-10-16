@@ -147,6 +147,12 @@ pub struct Shell {
     tab_roots: HashMap<String, String>,
     /// The pinned file tabs kept for the next run.
     kept_tabs: file_tabs::KeptTabs,
+    /// Where the cursor and scroll were in tabs whose views went to save memory, for the views they get next.
+    tab_places: HashMap<crate::files::tabs::TabId, crate::ui::editor::Place>,
+    /// A Save / Don't Save / Cancel prompt is up: no second one over it.
+    asking: bool,
+    /// Don't Save was chosen on quitting or closing: the window goes without asking again.
+    leaving: bool,
     /// Workspaces (`roots::root_key`) whose root was guessed this run, true while the guess runs: one guess per
     /// workspace and run, so one that found nothing (home, `/`) leaves "No folder" up rather than ask git again.
     root_guesses: std::collections::BTreeMap<String, bool>,
@@ -427,17 +433,28 @@ impl Shell {
                 cx.on_app_quit(|s: &mut Shell, cx| {
                     s.save_frame(cx);
                     let kept = s.flush_kept_tabs(cx);
+                    // a quit that did not ask (the Dock's, logging out): unsaved tabs are saved as far as the quit
+                    // waits, writes under way finished
+                    // ponytail: E4's drafts keep what does not make it in time
+                    let edits = s.flush_editors(cx);
+                    // the updater's relaunch, once the quit goes through
+                    file_tabs::AfterQuit::run(cx);
                     async move {
                         if let Some(write) = kept {
                             write.await;
                         }
+                        futures::future::join_all(edits).await;
                     }
                 })
                 .detach();
                 let this = cx.entity().downgrade();
-                window.on_window_should_close(cx, move |_, cx| {
-                    let _ = this.update(cx, |s, cx| s.save_frame(cx));
-                    true
+                // unsaved file tabs ask Save All / Don't Save / Cancel first, and close the window after
+                window.on_window_should_close(cx, move |window, cx| {
+                    this.update(cx, |s, cx| {
+                        s.save_frame(cx);
+                        !s.ask_unsaved(file_tabs::Exit::Close, window, cx)
+                    })
+                    .unwrap_or(true)
                 });
                 let tab = SettingsGlobal::of(cx).settings.panel_tab;
                 let side_panel = cx.new(|cx| crate::ui::side_panel::SidePanel::new(rt.clone(), tab, cx));
@@ -511,6 +528,9 @@ impl Shell {
                     real_paths: HashMap::new(),
                     tab_roots: HashMap::new(),
                     kept_tabs: Default::default(),
+                    tab_places: HashMap::new(),
+                    asking: false,
+                    leaving: false,
                     root_guesses: Default::default(),
                     root_menu: None,
                     review_poll: None,
@@ -1655,6 +1675,8 @@ impl Render for Shell {
                     this.send(Command::CloseTab { tab_id: tab.tab_id }, cx, |_, _, _| {});
                 }
             }))
+            // bound in the editor only (`bindings::context_of`); the editor saves itself on SaveFile
+            .on_action(cx.listener(|this, _: &SaveAllFiles, window, cx| this.save_all_files(window, cx)))
             .on_action(cx.listener(|this, _: &NewWorkspace, _, cx| this.new_workspace(cx)))
             .on_action(cx.listener(|this, _: &SplitRight, w, cx| this.pane_command(w, cx, |pane_id| Command::Split { pane_id, down: false })))
             .on_action(cx.listener(|this, _: &SplitDown, w, cx| this.pane_command(w, cx, |pane_id| Command::Split { pane_id, down: true })))
@@ -1864,7 +1886,18 @@ impl Render for Shell {
             });
         self.popups(root, &theme, &snapshot, sidebar_w, window, cx)
             .children(spring_back)
-            .when(window_buttons(cx), |el| el.children(window_controls(&theme, window)))
+            .when(window_buttons(cx), |el| {
+                el.children(window_controls(
+                    &theme,
+                    window,
+                    cx.listener(|s, _: &ClickEvent, window, cx| {
+                        s.save_frame(cx);
+                        if !s.ask_unsaved(file_tabs::Exit::Close, window, cx) {
+                            window.remove_window();
+                        }
+                    }),
+                ))
+            })
             .children(resize_edges(window))
             .child(toasts)
     }

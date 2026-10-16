@@ -36,7 +36,7 @@ const TAB: usize = 4;
 /// every frame it shows, and stretch the horizontal scroll to megapixels. Copy still takes all of it.
 const MAX_SHOWN: usize = 4000;
 /// Markdown over this size opens on its source: the preview lays every block out on each frame.
-const MAX_PREVIEW: usize = 512 * 1024;
+pub(crate) const MAX_PREVIEW: usize = 512 * 1024;
 /// The lines kept worked out for drawing (`Drawn`); past this many the cache starts over (a long scroll).
 const MAX_DRAWN: usize = 2048;
 
@@ -594,15 +594,8 @@ impl FileViewer {
         cx.notify();
     }
 
-    /// The header's path: under the root when the file is in it, else from home (`~/…`).
     fn shown_path(&self) -> String {
-        match self.root.as_deref().and_then(|r| self.path.strip_prefix(r).ok()) {
-            Some(rel) => rel.to_string_lossy().into_owned(),
-            None => match self.path.strip_prefix(crate::platform::home()) {
-                Ok(rest) => format!("~/{}", rest.to_string_lossy()),
-                Err(_) => self.path.to_string_lossy().into_owned(),
-            },
-        }
+        shown_path(&self.path, self.root.as_deref())
     }
 
     fn header(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -769,23 +762,7 @@ impl FileViewer {
             // no root: a relative link has nowhere it may lead
             None => Links::web(),
         };
-        // with the gap, 20 px above the first block and below the last
-        let space = || div().h(px(8.)).flex_none().into_any_element();
-        let column = |block: AnyElement| div().w_full().max_w(px(820.)).mx_auto().px(px(24.)).child(block).into_any_element();
-        div()
-            .id("viewer-md")
-            .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.preview_scroll)
-            .font_family(theme.font_ui.clone())
-            .text_size(px(13.5))
-            .flex()
-            .flex_col()
-            .gap(px(12.))
-            .child(space())
-            .children(crate::ui::markdown::render(blocks, "viewer-md", &links, theme).into_iter().map(column))
-            .child(space())
-            .into_any_element()
+        markdown_preview("viewer-md", blocks, &links, &self.preview_scroll, theme)
     }
 
     /// The text as a list of rows, a gutter of line numbers and the line, no wrapping: wider lines scroll across.
@@ -903,6 +880,39 @@ impl FileViewer {
 
 /// What a read that timed out says (and offers the editor for: the file is there, its disk is slow).
 const NOT_RESPONDING: &str = "Not responding";
+
+/// A header's path: under `root` when the file is in it, else from home (`~/…`).
+pub(crate) fn shown_path(path: &Path, root: Option<&Path>) -> String {
+    match root.and_then(|r| path.strip_prefix(r).ok()) {
+        Some(rel) => rel.to_string_lossy().into_owned(),
+        None => match path.strip_prefix(crate::platform::home()) {
+            Ok(rest) => format!("~/{}", rest.to_string_lossy()),
+            Err(_) => path.to_string_lossy().into_owned(),
+        },
+    }
+}
+
+/// Markdown's preview: Zeron's blocks, selectable through `ui::markdown`, in a column a page wide. Each block is a
+/// child of the scrolled element after a spacer, so a `#heading` link scrolls to its block (child `ix + 1`).
+pub(crate) fn markdown_preview(id: &'static str, blocks: &[Block], links: &Links, scroll: &ScrollHandle, theme: &Theme) -> AnyElement {
+    // with the gap, 20 px above the first block and below the last
+    let space = || div().h(px(8.)).flex_none().into_any_element();
+    let column = |block: AnyElement| div().w_full().max_w(px(820.)).mx_auto().px(px(24.)).child(block).into_any_element();
+    div()
+        .id(id)
+        .size_full()
+        .overflow_y_scroll()
+        .track_scroll(scroll)
+        .font_family(theme.font_ui.clone())
+        .text_size(px(13.5))
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .child(space())
+        .children(crate::ui::markdown::render(blocks, id, links, theme).into_iter().map(column))
+        .child(space())
+        .into_any_element()
+}
 
 /// The colour `token` draws in: the terminal's palette, so the code matches the panes beside it.
 pub(crate) fn token_color(token: Token, theme: &Theme) -> gpui::Hsla {

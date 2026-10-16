@@ -280,7 +280,8 @@ pub(crate) fn titlebar_button(theme: &Theme, id: &'static str, icon: &'static st
 
 /// Off macOS, the window's own buttons at the titlebar's right end, those the desktop offers: minimize, maximize (or
 /// restore) and close. Windows clicks them itself, as its caption buttons (maximize's hover brings Snap Layouts).
-pub(super) fn window_controls(theme: &Theme, window: &Window) -> Option<Div> {
+/// `close` is close's click: the window asks about unsaved file tabs first, as when the desktop closes it.
+pub(super) fn window_controls(theme: &Theme, window: &Window, close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Option<Div> {
     if cfg!(target_os = "macos") {
         return None;
     }
@@ -298,7 +299,12 @@ pub(super) fn window_controls(theme: &Theme, window: &Window) -> Option<Div> {
             .gap(px(4.))
             .when(offered.minimize, |el| el.child(button("window-minimize", "icons/minus.svg", WindowControlArea::Min, |w| w.minimize_window())))
             .when(offered.maximize, |el| el.child(button("window-maximize", maximize, WindowControlArea::Max, |w| w.zoom_window())))
-            .child(button("window-close", "icons/close.svg", WindowControlArea::Close, |w| w.remove_window())),
+            .child(
+                titlebar_button(theme, "window-close", "icons/close.svg")
+                    .size(px(28.))
+                    .window_control_area(WindowControlArea::Close)
+                    .when(!cfg!(windows), |b| b.on_click(close)),
+            ),
     )
 }
 

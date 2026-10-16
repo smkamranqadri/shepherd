@@ -2,6 +2,8 @@ pub mod command_panel;
 pub mod diff_view;
 pub mod divider;
 pub mod edge_fade;
+pub mod editor;
+pub mod editor_highlight;
 pub mod loader;
 pub mod markdown;
 pub mod project_icon;

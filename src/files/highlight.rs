@@ -1,4 +1,4 @@
-//! Syntax highlighting for the viewer: syntect's parser with bat's syntaxes (`two-face`), no syntect theme. Each
+//! Syntax highlighting for the viewer and the editor: syntect's parser with bat's syntaxes (`two-face`), no syntect theme. Each
 //! scope is sorted into a handful of `Token`s that the viewer colours from the theme's terminal palette, so code
 //! reads in the colours the panes beside it use and every Shepherd theme highlights without a theme of its own.
 //!
@@ -14,7 +14,7 @@ use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet
 pub const BUDGET: usize = 400_000;
 /// A line longer than this ends the highlighting (minified code, a data line): syntect's time on one line is not
 /// cancellable, and its state after a skipped line would be wrong for the rest.
-const MAX_LINE: usize = 10_000;
+pub const MAX_LINE: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Token {
@@ -170,9 +170,7 @@ impl Highlights {
 /// The tokens of `lines` (byte ranges into each line): the first `budget_chars` characters' worth of lines, line ends
 /// counted, fewer when `cancel` is set (another file opened) or a line is longer than `MAX_LINE`.
 pub fn highlight<'a>(syntax: &SyntaxReference, lines: impl Iterator<Item = &'a str>, budget_chars: usize, cancel: &AtomicBool) -> Highlights {
-    let set = syntaxes();
-    let mut state = ParseState::new(syntax);
-    let mut stack = ScopeStack::new();
+    let (mut state, mut stack) = start(syntax);
     let mut out = Highlights { spans: Vec::new(), firsts: vec![0] };
     let mut spent = 0;
     let mut buf = String::new();
@@ -181,37 +179,57 @@ pub fn highlight<'a>(syntax: &SyntaxReference, lines: impl Iterator<Item = &'a s
         if cancel.load(Ordering::Relaxed) || spent > budget_chars || line.len() > MAX_LINE {
             break;
         }
-        // the `_newlines` syntaxes match on the line end
-        buf.clear();
-        buf.push_str(line);
-        buf.push('\n');
-        let Ok(ops) = state.parse_line(&buf, set) else { break };
-        let first = out.spans.len();
-        let mut at = 0;
-        let push = |start: usize, end: usize, token: Token, spans: &mut Vec<Span>| {
-            let (start, end) = (start.min(line.len()) as u32, end.min(line.len()) as u32);
-            if start >= end || token == Token::Plain {
-                return;
-            }
-            let own = spans.len() > first;
-            match spans.last_mut() {
-                Some(last) if own && last.token == token && last.end == start => last.end = end,
-                _ => spans.push(Span { start, end, token }),
-            }
-        };
-        for (pos, op) in ops {
-            if pos > at {
-                push(at, pos, classify(stack.as_slice()), &mut out.spans);
-                at = pos;
-            }
-            if stack.apply(&op).is_err() {
-                break;
-            }
+        if !parse_line(&mut state, &mut stack, line, &mut buf, &mut out.spans) {
+            break;
         }
-        push(at, buf.len(), classify(stack.as_slice()), &mut out.spans);
         out.firsts.push(out.spans.len() as u32);
     }
     out
+}
+
+/// The parser's state before a syntax's first line.
+pub fn start(syntax: &SyntaxReference) -> (ParseState, ScopeStack) {
+    (ParseState::new(syntax), ScopeStack::new())
+}
+
+/// Parses `line` (no line end) on from `state` and `stack`, and appends its spans (byte ranges of the line, in
+/// order, `Plain` left out) to `spans`. `buf` is scratch. False when syntect fails on it: its spans are left out and
+/// the state is as far as it got. A line longer than `MAX_LINE` is not parsed (the editor's own long lines): no
+/// spans, the state as it was.
+pub fn parse_line(state: &mut ParseState, stack: &mut ScopeStack, line: &str, buf: &mut String, spans: &mut Vec<Span>) -> bool {
+    if line.len() > MAX_LINE {
+        return true;
+    }
+    let set = syntaxes();
+    // the `_newlines` syntaxes match on the line end
+    buf.clear();
+    buf.push_str(line);
+    buf.push('\n');
+    let Ok(ops) = state.parse_line(buf, set) else { return false };
+    let first = spans.len();
+    let mut at = 0;
+    let push = |start: usize, end: usize, token: Token, spans: &mut Vec<Span>| {
+        let (start, end) = (start.min(line.len()) as u32, end.min(line.len()) as u32);
+        if start >= end || token == Token::Plain {
+            return;
+        }
+        let own = spans.len() > first;
+        match spans.last_mut() {
+            Some(last) if own && last.token == token && last.end == start => last.end = end,
+            _ => spans.push(Span { start, end, token }),
+        }
+    };
+    for (pos, op) in ops {
+        if pos > at {
+            push(at, pos, classify(stack.as_slice()), spans);
+            at = pos;
+        }
+        if stack.apply(&op).is_err() {
+            break;
+        }
+    }
+    push(at, buf.len(), classify(stack.as_slice()), spans);
+    true
 }
 
 #[cfg(test)]

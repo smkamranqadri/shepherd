@@ -1,0 +1,1205 @@
+//! A file tab's view: the file, editable. Text within the editing limits (`MAX_EDIT` bytes, `MAX_EDIT_LINES` lines,
+//! no line over `MAX_EDIT_LINE` characters) opens in gpui-base's code editor, highlighted as the viewer would
+//! (`editor_highlight`); a markdown file shows its preview first and its source in the editor. Anything else (an
+//! image, a PDF, binary, text past the limits) is the read-only viewer's (`ui::viewer`), drawn inside this view, with
+//! a note when it is text that could not be edited here.
+//!
+//! The text is compared with the last version on disk on every change (its length first, then its chunks), so the
+//! tab's dot goes when an undo comes back to it. A save (`files::save`, off the main thread) makes the version it
+//! wrote the new baseline, not the buffer as it is when the save ends: typing during a save leaves the tab dirty.
+//! A save that fails says why in a banner under the header; one the file changed under offers Overwrite or Reload.
+use crate::bindings::SaveFile;
+use crate::files::content::{self, FileKind};
+use crate::files::highlight;
+use crate::files::save::{self, Baseline, LineEnding, SaveError, SaveMode};
+use crate::shell::widgets::{tip, titlebar_button};
+use crate::theme::Theme;
+use crate::ui::editor_highlight::{SyntectHighlighter, editor_style};
+use crate::ui::markdown::{Link, Links};
+use crate::ui::review::Block;
+use crate::ui::viewer::{FileViewer, ViewerEvent};
+use gpui::{
+    AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    ParentElement, PromptLevel, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, point,
+    prelude::*, px,
+};
+use gpui_base::input::{Editor, EditorState, InputEvent, InputHighlighter, Position, Rope, RopeExt, TabSize};
+use futures::FutureExt;
+use futures::future::{BoxFuture, LocalBoxFuture, Shared};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+use syntect::parsing::SyntaxReference;
+use tokio::runtime::Handle;
+
+/// The largest file that opens editable; up to `content::MAX_TEXT` it opens read-only in the viewer.
+pub const MAX_EDIT: u64 = 4 << 20;
+pub const MAX_EDIT_LINES: usize = 200_000;
+/// A line longer than this (minified code, data) keeps the file in the viewer unless "Edit anyway" is chosen.
+pub const MAX_EDIT_LINE: usize = 20_000;
+/// How long a read may take before the editor gives up on it (a hung mount).
+const LOAD_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub enum EditorEvent {
+    /// "Open in editor", at a line when there is one: the Shell shows the terminals and opens the file there.
+    OpenInEditor { path: PathBuf, line: Option<u32> },
+    /// A markdown link to another file in the root: the Shell opens it in a tab.
+    OpenFile { path: PathBuf, line: Option<u32>, fragment: Option<String> },
+    /// The unsaved-changes dot came or went, or a save started or ended: the tab bar draws again, and a preview is
+    /// pinned on its first edit.
+    Dirty(bool),
+}
+
+/// Where the cursor and the scroll were, kept for the tab while its view is gone (dropped to save memory) and put
+/// back when it is made again.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Place {
+    pub line: u32,
+    pub column: u32,
+    pub scroll_y: f32,
+}
+
+/// Whether the buffer (`len` bytes, as `chunks`) is exactly `saved`: its length first, then chunk by chunk.
+pub fn same_text<'a>(len: usize, chunks: impl IntoIterator<Item = &'a str>, saved: &[u8]) -> bool {
+    if len != saved.len() {
+        return false;
+    }
+
+    let mut at = 0;
+    for chunk in chunks {
+        let end = at + chunk.len();
+        if saved.get(at..end) != Some(chunk.as_bytes()) {
+            return false;
+        }
+        at = end;
+    }
+    at == saved.len()
+}
+
+/// Unsaved changes: the text last written (or as opened) against the buffer, and the save under way.
+#[derive(Debug, Default)]
+pub struct Tracker {
+    /// Its bytes: the baseline's own when they are the text as edited (no BOM, \n line ends), so they are kept once.
+    saved: Arc<Vec<u8>>,
+    dirty: bool,
+    /// The save under way, by its number: only its answer counts.
+    saving: Option<u64>,
+    saves: u64,
+}
+
+impl Tracker {
+    pub fn new(saved: Arc<Vec<u8>>) -> Tracker {
+        Tracker { saved, ..Tracker::default() }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn saving(&self) -> bool {
+        self.saving.is_some()
+    }
+
+    /// The buffer changed: true when that turned the dot on or off.
+    pub fn changed<'a>(&mut self, len: usize, chunks: impl IntoIterator<Item = &'a str>) -> bool {
+        let dirty = !same_text(len, chunks, &self.saved);
+        std::mem::replace(&mut self.dirty, dirty) != dirty
+    }
+
+    /// A save starts; its number, or `None` while another runs.
+    pub fn start_save(&mut self) -> Option<u64> {
+        if self.saving.is_some() {
+            return None;
+        }
+        self.saves += 1;
+        self.saving = Some(self.saves);
+        Some(self.saves)
+    }
+
+    /// Save `ticket` ended, having written `written` (`None`: it failed). What it wrote is the new saved text, and the
+    /// buffer as it is now is compared with that: typing since the save started keeps the dot. False for an answer
+    /// to a save that is not the one under way.
+    pub fn finish_save<'a>(&mut self, ticket: u64, written: Option<Arc<Vec<u8>>>, len: usize, chunks: impl IntoIterator<Item = &'a str>) -> bool {
+        if self.saving != Some(ticket) {
+            return false;
+        }
+        self.saving = None;
+        if let Some(written) = written {
+            self.saved = written;
+            self.dirty = !same_text(len, chunks, &self.saved);
+        }
+        true
+    }
+}
+
+/// What the background read hands back.
+enum Loaded {
+    Edit(Box<Editable>),
+    /// The viewer's: not text, or text past the limits (`note` says which, when it is text).
+    View(Option<Note>),
+}
+
+/// A file that opens in the editor, read and worked out off the main thread.
+struct Editable {
+    /// The text with its line ends made `\n` (a save writes the file's own ending back).
+    text: String,
+    baseline: Baseline,
+    syntax: Option<&'static SyntaxReference>,
+    /// Why it opens read-only, if it does.
+    readonly: Option<&'static str>,
+    blocks: Option<Vec<Block>>,
+    real_root: Option<PathBuf>,
+    hard_tabs: bool,
+}
+
+/// Why text opened in the viewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Note {
+    LongLines,
+    TooLarge,
+}
+
+unsafe extern "C" {
+    fn access(path: *const std::ffi::c_char, mode: std::ffi::c_int) -> std::ffi::c_int;
+}
+
+/// Whether this user may write `path` (the kernel's answer: mode bits, ACLs, a read-only mount).
+fn writable(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
+    // SAFETY: a NUL-terminated path, read by access(2) only
+    unsafe { access(c.as_ptr(), 2) == 0 }
+}
+
+/// Reads `path` for editing (blocking: the runtime's blocking pool runs it). `force` opens text with long lines too.
+fn read_for_edit(path: &Path, root: Option<&Path>, force: bool) -> Loaded {
+    let Ok(meta) = std::fs::metadata(path) else { return Loaded::View(None) };
+    if !meta.is_file() {
+        return Loaded::View(None);
+    }
+    if meta.len() > MAX_EDIT {
+        // text the viewer shows, too large to edit; anything else is the viewer's to say
+        let head = std::fs::File::open(path).ok().and_then(|f| {
+            let mut head = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::Read::take(f, 8192), &mut head).ok().map(|_| head)
+        });
+        let text = head.is_some_and(|h| matches!(content::kind_of(path, &h, meta.len()), FileKind::Text | FileKind::Markdown));
+        return Loaded::View(text.then_some(Note::TooLarge));
+    }
+    let Ok(baseline) = Baseline::read(path) else { return Loaded::View(None) };
+    let head = &baseline.bytes[..baseline.bytes.len().min(8192)];
+    let kind = content::kind_of(path, head, baseline.bytes.len() as u64);
+    if !matches!(kind, FileKind::Text | FileKind::Markdown) {
+        return Loaded::View(None);
+    }
+    let Some(text) = content::decode(&baseline.bytes) else { return Loaded::View(None) };
+    if text.len() > MAX_EDIT_LINES {
+        return Loaded::View(Some(Note::TooLarge));
+    }
+    if !force && text.lines().any(|l| l.len() > MAX_EDIT_LINE && l.chars().count() > MAX_EDIT_LINE) {
+        return Loaded::View(Some(Note::LongLines));
+    }
+    let readonly = if !writable(path) {
+        Some("You can't write to this file")
+    } else {
+        let root = root.or(path.parent()).unwrap_or(Path::new("/"));
+        match save::contained(root, path) {
+            Err(SaveError::OutsideRoot) => Some("Outside the workspace's folder"),
+            _ => None,
+        }
+    };
+    let syntax = highlight::syntax_for(path, text.line(0));
+    if let Some(syntax) = syntax {
+        // its contexts load on first use: here, not on the main thread when the editor makes its highlighter
+        let _ = highlight::start(syntax);
+    }
+    let blocks = (kind == FileKind::Markdown && text.text.len() <= crate::ui::viewer::MAX_PREVIEW).then(|| crate::ui::review::markdown(&text.text));
+    let real_root = blocks.as_ref().and(root).and_then(|r| r.canonicalize().ok());
+    let sample = || text.lines().take(2000);
+    let hard_tabs = sample().filter(|l| l.starts_with('\t')).count() > sample().filter(|l| l.starts_with("  ")).count();
+    let normal = if text.text.contains('\r') { text.text.replace("\r\n", "\n").replace('\r', "\n") } else { text.text };
+    Loaded::Edit(Box::new(Editable { text: normal, baseline, syntax, readonly, blocks, real_root, hard_tabs }))
+}
+
+/// A save that failed, as the banner under the header says it.
+#[derive(Debug, Clone, PartialEq)]
+enum Banner {
+    Failed(String),
+    /// The file changed on disk since it was opened (or saved): Overwrite or Reload.
+    Conflict,
+    /// The file was deleted on disk: Save anyway recreates it.
+    Deleted,
+}
+
+/// The open file in the editor.
+struct Edit {
+    state: Entity<EditorState>,
+    baseline: Baseline,
+    tracker: Tracker,
+    readonly: Option<&'static str>,
+    /// A markdown file's blocks, for its preview.
+    blocks: Option<Vec<Block>>,
+    real_root: Option<PathBuf>,
+    _events: Subscription,
+}
+
+enum Body {
+    Loading,
+    Edit(Box<Edit>),
+    View { viewer: Entity<FileViewer>, note: Option<Note>, _events: Subscription },
+}
+
+/// Where to go once the file is in.
+#[derive(Debug, Clone)]
+enum Goto {
+    Line(u32),
+    Fragment(String),
+}
+
+/// A save under way, as its callers await it: whether the file was written. Dropping it leaves the save running.
+pub type Saving = Shared<LocalBoxFuture<'static, bool>>;
+
+pub struct FileEditor {
+    focus: FocusHandle,
+    rt: Handle,
+    path: PathBuf,
+    root: Option<PathBuf>,
+    /// Bumped by every open: a load, save or diff that started for the file before is dropped.
+    generation: u64,
+    body: Body,
+    /// Markdown shows as its preview, not its source.
+    preview: bool,
+    preview_scroll: ScrollHandle,
+    goto: Option<Goto>,
+    restore: Option<Place>,
+    banner: Option<Banner>,
+    /// The user agreed to save this file in place (a hard-linked file, another owner's): every save does, without
+    /// asking again, while the tab shows the file.
+    in_place: bool,
+    /// The save under way, and the one more asked for meanwhile (Ctrl/Cmd+S again), started when it ends.
+    saving: Option<Saving>,
+    queued: Option<SaveMode>,
+    /// The bytes of the save under way reaching the disk, which quitting waits for (no gpui task to drive it then).
+    writing: Option<Shared<BoxFuture<'static, ()>>>,
+    _theme: Subscription,
+}
+
+impl EventEmitter<EditorEvent> for FileEditor {}
+
+impl Focusable for FileEditor {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match &self.body {
+            Body::Edit(e) if !self.preview_shown() => e.state.read(cx).focus_handle(cx),
+            Body::View { viewer, .. } => viewer.read(cx).focus_handle(cx),
+            _ => self.focus.clone(),
+        }
+    }
+}
+
+impl FileEditor {
+    pub fn new(rt: Handle, cx: &mut Context<Self>) -> FileEditor {
+        let theme = cx.observe_global::<Theme>(|e: &mut FileEditor, cx| {
+            if let Body::Edit(edit) = &e.body {
+                let style = editor_style(Theme::of(cx));
+                edit.state.update(cx, |s, cx| {
+                    s.set_editor_style(style);
+                    cx.notify();
+                });
+            }
+        });
+        FileEditor {
+            focus: cx.focus_handle(),
+            rt,
+            path: PathBuf::new(),
+            root: None,
+            generation: 0,
+            body: Body::Loading,
+            preview: true,
+            preview_scroll: ScrollHandle::new(),
+            goto: None,
+            restore: None,
+            banner: None,
+            in_place: false,
+            saving: None,
+            queued: None,
+            writing: None,
+            _theme: theme,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Markdown's preview is on screen (in the editor, or the viewer's).
+    pub fn shows_markdown(&self, cx: &App) -> bool {
+        match &self.body {
+            Body::Edit(e) => e.blocks.is_some() && self.preview,
+            Body::View { viewer, .. } => viewer.read(cx).shows_markdown(),
+            Body::Loading => false,
+        }
+    }
+
+    fn preview_shown(&self) -> bool {
+        matches!(&self.body, Body::Edit(e) if e.blocks.is_some() && self.preview)
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        matches!(&self.body, Body::Edit(e) if e.tracker.is_dirty())
+    }
+
+    /// A save is under way: quitting waits for it.
+    pub fn is_saving(&self) -> bool {
+        self.saving.is_some()
+    }
+
+    /// The save under way, to wait for.
+    pub fn saving(&self) -> Option<Saving> {
+        self.saving.clone()
+    }
+
+    /// Quitting without asking (the Dock's Quit, logging out): the write under way, and a save of unsaved changes
+    /// started now off the main thread, as one future the app's quit waits on (for as long as it lets it). Nothing
+    /// in the view is updated: it is going.
+    // ponytail: E4's drafts keep what a quit this short cannot write
+    pub fn flush(&self, cx: &App) -> Option<BoxFuture<'static, ()>> {
+        let writing = self.writing.clone();
+        let save = match &self.body {
+            Body::Edit(e) if e.tracker.is_dirty() && e.readonly.is_none() && self.saving.is_none() => {
+                let rope: Rope = e.state.read(cx).text().clone();
+                let (root, path, baseline) = (self.save_root(), self.path.clone(), e.baseline.clone());
+                let mode = if self.in_place { SaveMode::InPlace } else { SaveMode::Safe };
+                let job = self.rt.spawn_blocking(move || {
+                    if let Err(err) = save::save(&root, &path, &rope_text(&rope), &baseline, mode) {
+                        eprintln!("shepherd: quitting, couldn't save {}: {err}", path.display());
+                    }
+                });
+                Some(job)
+            }
+            _ => None,
+        };
+        if writing.is_none() && save.is_none() {
+            return None;
+        }
+        Some(
+            async move {
+                if let Some(writing) = writing {
+                    writing.await;
+                }
+                if let Some(save) = save {
+                    let _ = save.await;
+                }
+            }
+            .boxed(),
+        )
+    }
+
+    /// The cursor and the scroll, to put back if the view is made again.
+    pub fn place(&self, cx: &App) -> Option<Place> {
+        let Body::Edit(e) = &self.body else { return None };
+        let state = e.state.read(cx);
+        let at = state.cursor_position();
+        Some(Place { line: at.line, column: at.character, scroll_y: f32::from(state.scroll_offset().y) })
+    }
+
+    /// Shows `path` (at `line`, 1-based) in place of what was shown, or, when it is the file shown (with its edits),
+    /// only goes to `line`. `restore` puts the cursor and scroll back as they were (a view made again).
+    pub fn open(&mut self, path: PathBuf, line: Option<u32>, root: Option<PathBuf>, restore: Option<Place>, window: &mut Window, cx: &mut Context<Self>) {
+        if path == self.path && !matches!(self.body, Body::Loading) {
+            if let Some(line) = line {
+                self.go_to_line(line, window, cx);
+            }
+            return;
+        }
+        self.load(path, line.map(Goto::Line), root, restore, false, window, cx);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load(&mut self, path: PathBuf, goto: Option<Goto>, root: Option<PathBuf>, restore: Option<Place>, force: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // the view had the keyboard (a reload, Edit anyway): it keeps it while the file loads, and the new state takes
+        // it once in (`loaded`)
+        if self.focus_handle(cx).contains_focused(window, cx) {
+            window.focus(&self.focus, cx);
+        }
+        self.release(Some(window), cx);
+        self.generation += 1;
+        // the choice to save in place is the file's: another file asks again
+        self.in_place &= path == self.path;
+        (self.path, self.root, self.body) = (path.clone(), root.clone(), Body::Loading);
+        (self.goto, self.restore, self.banner) = (goto, restore, None);
+        (self.saving, self.queued) = (None, None);
+        (self.preview, self.preview_scroll) = (true, ScrollHandle::new());
+        let generation = self.generation;
+        let job = self.rt.spawn(async move {
+            let read = tokio::task::spawn_blocking(move || read_for_edit(&path, root.as_deref(), force));
+            // ponytail: a read that never ends keeps its blocking thread; the viewer then says so
+            tokio::time::timeout(LOAD_TIMEOUT, read).await.ok().and_then(Result::ok).unwrap_or(Loaded::View(None))
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(loaded) = job.await {
+                let _ = this.update_in(cx, |e, window, cx| e.loaded(generation, loaded, window, cx));
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn loaded(&mut self, generation: u64, loaded: Loaded, window: &mut Window, cx: &mut Context<Self>) {
+        if generation != self.generation {
+            return;
+        }
+        // the view had the keyboard while it loaded: what it shows now takes it
+        let focused = self.focus.is_focused(window);
+        match loaded {
+            Loaded::Edit(file) => self.edit(*file, window, cx),
+            Loaded::View(note) => self.view(note, window, cx),
+        }
+        if focused {
+            let handle = self.focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+        cx.notify();
+    }
+
+    /// The file in the editor.
+    fn edit(&mut self, file: Editable, window: &mut Window, cx: &mut Context<Self>) {
+        let Editable { text, baseline, syntax, readonly, blocks, real_root, hard_tabs } = file;
+        // the bytes on disk are the text as edited (no BOM, `\n` ends): one copy for both
+        let saved = if baseline.bytes.as_slice() == text.as_bytes() { baseline.bytes.clone() } else { Arc::new(text.clone().into_bytes()) };
+        let style = editor_style(Theme::of(cx));
+        let state = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx)
+                .line_number(true)
+                .folding(false)
+                .soft_wrap(false)
+                .tab_size(TabSize { tab_size: 4, hard_tabs });
+            // ponytail: its find bar is gpui-component's; Shepherd's own comes with E3
+            state.set_searchable(false, cx);
+            state.set_editor_style(style);
+            state.set_editor_paddings(gpui::Edges { top: px(4.), ..Default::default() });
+            state.set_value(text, window, cx);
+            if let Some(syntax) = syntax {
+                let factory: gpui_base::input::InputHighlighterFactory =
+                    Rc::new(move |_: &str| Some(Box::new(SyntectHighlighter::new(syntax)) as Box<dyn InputHighlighter>));
+                state.set_highlighter_factory(factory, cx);
+            }
+            state.set_readonly(readonly.is_some(), cx);
+            state
+        });
+        let events = cx.subscribe_in(&state, window, |e: &mut FileEditor, _, event: &InputEvent, _, cx| {
+            if let InputEvent::Change = event {
+                e.changed(cx);
+            }
+        });
+        let markdown = blocks.is_some();
+        self.body = Body::Edit(Box::new(Edit { state, baseline, tracker: Tracker::new(saved), readonly, blocks, real_root, _events: events }));
+        match self.goto.take() {
+            Some(Goto::Line(line)) => self.go_to_line(line, window, cx),
+            Some(Goto::Fragment(fragment)) => self.go_to_fragment(&fragment, window, cx),
+            None => {
+                if let Some(place) = self.restore.take() {
+                    self.put_back(place, cx);
+                    // a markdown file's source was where the cursor was
+                    self.preview = !markdown || place.line == 0;
+                }
+            }
+        }
+    }
+
+    /// The file in the viewer, read again by it.
+    fn view(&mut self, note: Option<Note>, window: &mut Window, cx: &mut Context<Self>) {
+        let viewer = cx.new(|cx| FileViewer::new(self.rt.clone(), cx));
+        let events = cx.subscribe(&viewer, |_: &mut FileEditor, _, event: &ViewerEvent, cx| match event {
+            ViewerEvent::OpenInEditor { path, line } => cx.emit(EditorEvent::OpenInEditor { path: path.clone(), line: *line }),
+            ViewerEvent::OpenFile { path, line, fragment } => cx.emit(EditorEvent::OpenFile { path: path.clone(), line: *line, fragment: fragment.clone() }),
+        });
+        let line = match &self.goto {
+            Some(Goto::Line(line)) => Some(*line),
+            _ => None,
+        };
+        let (path, root) = (self.path.clone(), self.root.clone());
+        viewer.update(cx, |v, cx| v.open(path, line, root, window, cx));
+        if let Some(Goto::Fragment(fragment)) = self.goto.take() {
+            viewer.update(cx, |v, cx| v.go_to(fragment, cx));
+        }
+        self.body = Body::View { viewer, note, _events: events };
+    }
+
+    /// Lets go of what it holds outside itself: the viewer's image and highlight.
+    pub fn release(&mut self, window: Option<&mut Window>, cx: &mut App) {
+        if let Body::View { viewer, .. } = &self.body {
+            viewer.update(cx, |v, cx| v.release(window, cx));
+        }
+    }
+
+    /// Out of sight: the viewer's image leaves gpui's cache.
+    pub fn hide(&mut self, window: Option<&mut Window>, cx: &mut App) {
+        if let Body::View { viewer, .. } = &self.body {
+            viewer.update(cx, |v, cx| v.evict_image(window, cx));
+        }
+    }
+
+    /// The buffer changed: the dot, and the pin of a preview.
+    fn changed(&mut self, cx: &mut Context<Self>) {
+        let Body::Edit(e) = &mut self.body else { return };
+        let text = e.state.read(cx).text();
+        if e.tracker.changed(text.len(), text.chunks()) {
+            cx.emit(EditorEvent::Dirty(e.tracker.is_dirty()));
+            cx.notify();
+        }
+    }
+
+    fn go_to_line(&mut self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.body {
+            Body::Loading => self.goto = Some(Goto::Line(line)),
+            Body::View { viewer, .. } => {
+                let (viewer, path, root) = (viewer.clone(), self.path.clone(), self.root.clone());
+                viewer.update(cx, |v, cx| v.open(path, Some(line), root, window, cx));
+            }
+            Body::Edit(e) => {
+                let state = e.state.clone();
+                if self.preview_shown() {
+                    self.preview = false;
+                    if self.focus.is_focused(window) {
+                        state.update(cx, |s, cx| s.focus(window, cx));
+                    }
+                }
+                state.update(cx, |s, cx| {
+                    let offset = s.text().line_start_offset((line.saturating_sub(1) as usize).min(s.text().lines_len().saturating_sub(1)));
+                    s.set_selected_range(offset..offset, cx);
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    /// A markdown link's `#heading` or `#L12`, once the text is in.
+    pub fn go_to(&mut self, fragment: String, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.body {
+            Body::Loading => self.goto = Some(Goto::Fragment(fragment)),
+            Body::View { viewer, .. } => viewer.update(cx, |v, cx| v.go_to(fragment, cx)),
+            Body::Edit(_) => self.go_to_fragment(&fragment, window, cx),
+        }
+    }
+
+    fn go_to_fragment(&mut self, fragment: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Body::Edit(e) = &self.body else { return };
+        if let Some(line) = crate::ui::markdown::fragment_line(fragment) {
+            self.go_to_line(line, window, cx);
+        } else if let Some(ix) = e.blocks.as_deref().and_then(|b| crate::ui::markdown::anchor_block(b, fragment)) {
+            self.preview = true;
+            self.preview_scroll.scroll_to_top_of_item(ix + 1);
+            cx.notify();
+        }
+    }
+
+    fn put_back(&mut self, place: Place, cx: &mut Context<Self>) {
+        let Body::Edit(e) = &self.body else { return };
+        e.state.update(cx, |s, cx| {
+            let offset = s.text().position_to_offset(&Position::new(place.line, place.column));
+            s.set_selected_range(offset..offset, cx);
+            s.set_scroll_offset(point(px(0.), px(place.scroll_y)), cx);
+        });
+    }
+
+    /// A link in the preview: a heading or a line here is gone to, another file in the root is the Shell's to open.
+    fn follow(&mut self, link: Link, window: &mut Window, cx: &mut Context<Self>) {
+        match link {
+            Link::Anchor(anchor) => self.go_to_fragment(&anchor, window, cx),
+            Link::File { path, fragment } if path == self.path => {
+                if let Some(fragment) = fragment {
+                    self.go_to_fragment(&fragment, window, cx);
+                }
+            }
+            Link::File { path, fragment } => {
+                let line = fragment.as_deref().and_then(crate::ui::markdown::fragment_line);
+                cx.emit(EditorEvent::OpenFile { path, line, fragment: fragment.filter(|_| line.is_none()) });
+            }
+            Link::External(_) | Link::Disabled(_) => {}
+        }
+    }
+
+    fn set_preview(&mut self, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview == preview {
+            return;
+        }
+        let had = self.focus_handle(cx).contains_focused(window, cx) || self.focus.is_focused(window);
+        self.preview = preview;
+        if had {
+            let handle = self.focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+        cx.notify();
+    }
+
+    /// The folder a save checks the file is inside: the workspace's, else the file's own.
+    fn save_root(&self) -> PathBuf {
+        self.root.clone().or_else(|| self.path.parent().map(PathBuf::from)).unwrap_or_else(|| PathBuf::from("/"))
+    }
+
+    /// Saves the buffer off the main thread; the task answers whether it was written (callers may share it). While
+    /// one runs, one more is queued (typing since is saved too) and the task answers for that one. `None` when there
+    /// is nothing to save it from (read-only, not text).
+    pub fn save(&mut self, mode: SaveMode, window: &mut Window, cx: &mut Context<Self>) -> Option<Saving> {
+        let Body::Edit(e) = &self.body else { return None };
+        if e.readonly.is_some() {
+            return None;
+        }
+        if let Some(current) = self.saving.clone() {
+            self.queued = Some(mode);
+            let follow = cx.spawn_in(window, async move |this, cx| {
+                let first = current.await;
+                // the queued one started as that one ended (`saved`), unless that one failed or left nothing to save
+                match this.update(cx, |e, _| e.saving.clone()).ok().flatten() {
+                    Some(next) => next.await,
+                    None => first && this.update(cx, |e, _| !e.is_dirty()).unwrap_or(false),
+                }
+            });
+            return Some(follow.boxed_local().shared());
+        }
+        self.start_save(mode, window, cx)
+    }
+
+    fn start_save(&mut self, mode: SaveMode, window: &mut Window, cx: &mut Context<Self>) -> Option<Saving> {
+        // a file agreed to be saved in place always is
+        let mode = match (mode, self.in_place) {
+            (SaveMode::Safe, true) => SaveMode::InPlace,
+            (SaveMode::Overwrite, true) => SaveMode::OverwriteInPlace,
+            (mode, _) => mode,
+        };
+        let root = self.save_root();
+        let Body::Edit(e) = &mut self.body else { return None };
+        let ticket = e.tracker.start_save()?;
+        let rope: Rope = e.state.read(cx).text().clone();
+        let (baseline, path, generation) = (e.baseline.clone(), self.path.clone(), self.generation);
+        let job = self.rt.spawn_blocking(move || {
+            let text = rope_text(&rope);
+            let saved = save::save(&root, &path, &text, &baseline, mode);
+            (Arc::new(text), saved)
+        });
+        let job = job.map(|done| done.ok()).boxed().shared();
+        self.writing = Some(job.clone().map(|_| ()).boxed().shared());
+        cx.emit(EditorEvent::Dirty(e.tracker.is_dirty()));
+        cx.notify();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        cx.spawn_in(window, async move |this, cx| {
+            let done = job.await.ok_or_else(|| SaveError::Io("The save did not finish".into()));
+            let ok = this.update_in(cx, |e, window, cx| e.saved(generation, ticket, mode, done, window, cx)).unwrap_or(false);
+            let _ = tx.send(ok);
+        })
+        .detach();
+        let saving = rx.map(|ok| ok.unwrap_or(false)).boxed_local().shared();
+        self.saving = Some(saving.clone());
+        Some(saving)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn saved(&mut self, generation: u64, ticket: u64, mode: SaveMode, done: Result<(Arc<String>, Result<Baseline, SaveError>), SaveError>, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        (self.saving, self.writing) = (None, None);
+        let queued = self.queued.take();
+        let Body::Edit(e) = &mut self.body else { return false };
+        let (written, result) = match done {
+            Ok((text, Ok(baseline))) => {
+                // what was written is the new saved text, kept once when it is the bytes on disk
+                let written = if baseline.bytes.as_slice() == text.as_bytes() { baseline.bytes.clone() } else { Arc::new(text.as_bytes().to_vec()) };
+                (Some(written), Ok(baseline))
+            }
+            Ok((_, Err(err))) | Err(err) => (None, Err(err)),
+        };
+        let text = e.state.read(cx).text();
+        if !e.tracker.finish_save(ticket, written, text.len(), text.chunks()) {
+            return false;
+        }
+        let dirty = e.tracker.is_dirty();
+        cx.emit(EditorEvent::Dirty(dirty));
+        cx.notify();
+        let in_place = matches!(mode, SaveMode::InPlace | SaveMode::OverwriteInPlace);
+        let result = match result {
+            Ok(baseline) => {
+                e.baseline = baseline;
+                Ok(())
+            }
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(()) => {
+                self.banner = None;
+                // typed during it and asked again: one more
+                if let Some(mode) = queued.filter(|_| dirty) {
+                    let _ = self.start_save(mode, window, cx);
+                }
+                true
+            }
+            Err(SaveError::Conflict) => {
+                self.banner = Some(Banner::Conflict);
+                false
+            }
+            Err(SaveError::Deleted) => {
+                self.banner = Some(Banner::Deleted);
+                false
+            }
+            Err(err @ (SaveError::HardLinked(_) | SaveError::FolderNotWritable | SaveError::OwnerDiffers)) if !in_place => {
+                self.banner = None;
+                self.ask_in_place(err, mode, window, cx);
+                false
+            }
+            Err(err) => {
+                self.banner = Some(Banner::Failed(err.to_string()));
+                false
+            }
+        }
+    }
+
+    /// A safe save can't be made here (a hard-linked file, another owner's, a folder Shepherd can't write to): asks
+    /// to write the file where it is instead.
+    fn ask_in_place(&mut self, err: SaveError, mode: SaveMode, window: &mut Window, cx: &mut Context<Self>) {
+        let detail = format!("{err}. Saving in place rewrites the file where it is: its links and owner stay, but a crash midway can leave it half written.");
+        let answer = window.prompt(PromptLevel::Warning, "Save in place?", Some(&detail), &["Save in Place", "Cancel"], cx);
+        let next = if mode == SaveMode::Overwrite { SaveMode::Overwrite } else { SaveMode::Safe };
+        let generation = self.generation;
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Ok(0) {
+                let _ = this.update_in(cx, |e, window, cx| {
+                    if e.generation == generation {
+                        // asked once per file: its next saves are in place too
+                        e.in_place = true;
+                        let _ = e.save(next, window, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// The conflict banner's Overwrite and the deleted one's Save anyway: the buffer is written over what changed
+    /// on disk, or where the file was.
+    fn overwrite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.save(SaveMode::Overwrite, window, cx);
+    }
+
+    /// The conflict banner's Reload: the file as it is on disk, the cursor and scroll kept; unsaved changes are
+    /// dropped only once that is confirmed.
+    fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_dirty() {
+            return self.reload_now(window, cx);
+        }
+        let detail = "The file is read again from disk; your changes here are lost.";
+        let answer = window.prompt(PromptLevel::Warning, "Discard your changes?", Some(detail), &["Discard", "Cancel"], cx);
+        let generation = self.generation;
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Ok(0) {
+                let _ = this.update_in(cx, |e, window, cx| {
+                    if e.generation == generation {
+                        e.reload_now(window, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn reload_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let place = self.place(cx);
+        let (path, root) = (self.path.clone(), self.root.clone());
+        self.load(path, None, root, place, false, window, cx);
+        cx.emit(EditorEvent::Dirty(false));
+    }
+
+    fn open_in_editor(&mut self, cx: &mut Context<Self>) {
+        let line = self.place(cx).map(|p| p.line + 1);
+        cx.emit(EditorEvent::OpenInEditor { path: self.path.clone(), line });
+    }
+
+    /// Keys while the preview has the keyboard (the editor handles its own): copy and scrolling.
+    fn key(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus.is_focused(window) || !self.preview_shown() {
+            return;
+        }
+        let (key, m) = (e.keystroke.key.as_str(), &e.keystroke.modifiers);
+        let primary = if cfg!(target_os = "macos") { m.platform && !m.control } else { m.control && !m.platform };
+        if crate::platform::terminal_chord(key, m) == Some("c") || (primary && !m.alt && key == "c") {
+            if let Some(text) = crate::ui::markdown::selected_text() {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+            }
+        } else if m.modified() {
+            return;
+        } else {
+            let handle = &self.preview_scroll;
+            let line = px(Theme::of(cx).terminal_font_size * 1.5);
+            let page = handle.bounds().size.height - line * 2.;
+            let (offset, max) = (handle.offset(), handle.max_offset());
+            let y = match key {
+                "up" => offset.y + line * 3.,
+                "down" => offset.y - line * 3.,
+                "pageup" => offset.y + page,
+                "pagedown" => offset.y - page,
+                "home" => px(0.),
+                "end" => -max.y,
+                _ => return,
+            };
+            handle.set_offset(point(offset.x, y.clamp(-max.y, px(0.))));
+            cx.notify();
+        }
+        cx.stop_propagation();
+    }
+
+    fn header(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let name = self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let icon = crate::files::icons::material_icon(&name, false, false);
+        let tag = |label: SharedString| {
+            div().flex_none().px(px(5.)).rounded(px(4.)).border_1().border_color(theme.border).text_size(px(10.5)).text_color(theme.text_faint).child(label)
+        };
+        let Body::Edit(e) = &self.body else { return div().into_any_element() };
+        let ending = match e.baseline.ending {
+            LineEnding::Lf => "LF",
+            LineEnding::Crlf => "CRLF",
+            LineEnding::Cr => "CR",
+        };
+        let toggle = e.blocks.is_some().then(|| {
+            let choice = |id: &'static str, label: &'static str, on: bool, preview: bool| {
+                let hover = theme.hover;
+                div()
+                    .id(id)
+                    .px(px(8.))
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(5.))
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .text_color(if on { theme.text } else { theme.text_muted })
+                    .when(on, |el| el.bg(theme.selected))
+                    .when(!on, |el| el.hover(move |s| s.bg(hover)))
+                    .on_click(cx.listener(move |e: &mut FileEditor, _: &ClickEvent, window, cx| e.set_preview(preview, window, cx)))
+                    .child(label)
+            };
+            div()
+                .flex()
+                .flex_none()
+                .gap(px(2.))
+                .p(px(2.))
+                .rounded(px(7.))
+                .border_1()
+                .border_color(theme.border)
+                .child(choice("editor-preview", "Preview", self.preview, true))
+                .child(choice("editor-source", "Source", !self.preview, false))
+        });
+        let path = self.path.to_string_lossy().into_owned();
+        let readonly = e.readonly;
+        div()
+            .h(px(36.))
+            .flex_none()
+            .pl(px(12.))
+            .pr(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.wash(0.04))
+            .font_family(theme.font_ui.clone())
+            .text_size(px(12.5))
+            .child(gpui::img(icon).size(px(16.)).flex_none().object_fit(gpui::ObjectFit::Contain))
+            .child(div().min_w_0().truncate().text_color(theme.text).child(crate::ui::viewer::shown_path(&self.path, self.root.as_deref())))
+            .child(tag(ending.into()))
+            .when(e.baseline.mixed, |el| el.child(tag("Mixed line ends".into())))
+            .when_some(readonly, |el, why| el.child(div().id("editor-readonly").child(tag("Read-only".into())).tooltip(tip(why, None))))
+            .when(e.tracker.saving(), |el| el.child(div().text_size(px(11.5)).text_color(theme.text_faint).child("Saving…")))
+            .child(div().flex_1())
+            .children(toggle)
+            .child(
+                titlebar_button(theme, "editor-open-in-editor", "icons/solar/pen-new-square.svg")
+                    .tooltip(tip("Open in editor", None))
+                    .on_click(cx.listener(|e, _: &ClickEvent, _, cx| e.open_in_editor(cx))),
+            )
+            .child(
+                titlebar_button(theme, "editor-copy-path", "icons/solar/copy.svg")
+                    .tooltip(tip("Copy path", None))
+                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(path.clone())))),
+            )
+            .into_any_element()
+    }
+
+    /// A button in a banner or note.
+    fn button(theme: &Theme, id: &'static str) -> gpui::Stateful<gpui::Div> {
+        let hover = theme.hover;
+        div()
+            .id(id)
+            .flex_none()
+            .px(px(10.))
+            .h(px(22.))
+            .flex()
+            .items_center()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.border)
+            .text_size(px(12.))
+            .text_color(theme.text)
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover))
+    }
+
+    /// The strip under the header for a save's trouble (E2 puts the disk's changes here too).
+    fn banner(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let banner = self.banner.as_ref()?;
+        let strip = div()
+            .flex_none()
+            .min_h(px(32.))
+            .px(px(12.))
+            .py(px(4.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.warning.opacity(0.12))
+            .font_family(theme.font_ui.clone())
+            .text_size(px(12.5));
+        Some(match banner {
+            Banner::Conflict => strip
+                .child(div().flex_1().min_w_0().text_color(theme.text).child("The file changed on disk since it was opened."))
+                .child(Self::button(theme, "editor-overwrite").child("Overwrite").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.overwrite(window, cx))))
+                .child(Self::button(theme, "editor-reload").child("Reload").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.reload(window, cx))))
+                .into_any_element(),
+            Banner::Deleted => strip
+                .child(div().flex_1().min_w_0().text_color(theme.text).child("Deleted on disk."))
+                .child(Self::button(theme, "editor-save-anyway").child("Save anyway").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.overwrite(window, cx))))
+                .into_any_element(),
+            Banner::Failed(why) => strip
+                .child(div().flex_1().min_w_0().text_color(theme.text).child(format!("Couldn't save: {why}")))
+                .child(Self::button(theme, "editor-dismiss").child("Dismiss").on_click(cx.listener(|e, _: &ClickEvent, _, cx| {
+                    e.banner = None;
+                    cx.notify();
+                })))
+                .into_any_element(),
+        })
+    }
+
+    /// The note over the viewer when text did not open editable.
+    fn note(&self, note: Note, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let strip = div()
+            .flex_none()
+            .h(px(32.))
+            .px(px(12.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .border_b_1()
+            .border_color(theme.border)
+            .font_family(theme.font_ui.clone())
+            .text_size(px(12.5))
+            .text_color(theme.text_muted);
+        match note {
+            Note::LongLines => strip
+                .child(div().flex_1().min_w_0().truncate().child(format!("A line is longer than {} characters: shown read-only.", group(MAX_EDIT_LINE))))
+                .child(Self::button(theme, "editor-edit-anyway").child("Edit anyway").on_click(cx.listener(|e, _: &ClickEvent, window, cx| {
+                    let (path, root) = (e.path.clone(), e.root.clone());
+                    e.load(path, None, root, None, true, window, cx);
+                })))
+                .into_any_element(),
+            Note::TooLarge => strip
+                .child(div().flex_1().min_w_0().truncate().child(format!(
+                    "Files over {} or {} lines open read-only.",
+                    content::human_size(MAX_EDIT),
+                    group(MAX_EDIT_LINES)
+                )))
+                .into_any_element(),
+        }
+    }
+
+    /// The editor, in the terminal's font and size.
+    fn code(&self, e: &Edit, theme: &Theme) -> AnyElement {
+        let font = gpui::font(theme.font_terminal.clone());
+        let line_h = px((theme.terminal_font_size * theme.terminal_line_height).round());
+        div()
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .font(font)
+            .text_size(px(theme.terminal_font_size))
+            .line_height(line_h)
+            .text_color(theme.terminal.foreground)
+            .child(Editor::new(&e.state))
+            .into_any_element()
+    }
+
+    fn preview_body(&self, e: &Edit, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let blocks = e.blocks.as_deref().unwrap_or_default();
+        let links = match &e.real_root {
+            Some(root) => {
+                let this = cx.entity().downgrade();
+                Links::local(self.path.clone(), root.clone(), move |link, window, cx| {
+                    let _ = this.update(cx, |e, cx| e.follow(link, window, cx));
+                })
+            }
+            None => Links::web(),
+        };
+        crate::ui::viewer::markdown_preview("editor-md", blocks, &links, &self.preview_scroll, theme)
+    }
+}
+
+/// The rope as one string (off the main thread: a 4 MB copy).
+fn rope_text(rope: &Rope) -> String {
+    let mut text = String::with_capacity(rope.len());
+    for chunk in rope.chunks() {
+        text.push_str(chunk);
+    }
+    text
+}
+
+/// `n` with thousands apart: 200,000.
+fn group(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+impl Render for FileEditor {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = &Theme::of(cx).clone();
+        let root = div()
+            .id("file-editor")
+            .track_focus(&self.focus)
+            .key_context("FileEditor")
+            .on_key_down(cx.listener(|e, ev: &KeyDownEvent, window, cx| e.key(ev, window, cx)))
+            // the editor's text and a markdown preview's alike
+            .on_action(cx.listener(|e, _: &SaveFile, window, cx| {
+                let _ = e.save(SaveMode::Safe, window, cx);
+            }))
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme.terminal.background);
+        match &self.body {
+            Body::Loading => root.into_any_element(),
+            Body::View { viewer, note, .. } => {
+                let note = note.map(|n| self.note(n, theme, cx));
+                root.children(note).child(div().flex_1().min_h_0().child(viewer.clone())).into_any_element()
+            }
+            Body::Edit(e) => {
+                let body = if self.preview_shown() {
+                    // a press in the preview gives it the keyboard (its selection is ui::markdown's)
+                    let preview = self.preview_body(e, theme, cx);
+                    div()
+                        .size_full()
+                        .on_mouse_down(MouseButton::Left, cx.listener(|e, _, window, cx| window.focus(&e.focus, cx)))
+                        .child(preview)
+                        .into_any_element()
+                } else {
+                    self.code(e, theme)
+                };
+                let header = self.header(theme, cx);
+                let banner = self.banner(theme, cx);
+                root.child(header).children(banner).child(div().flex_1().min_h_0().overflow_hidden().child(body)).into_any_element()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_buffer_is_compared_by_length_then_chunks() {
+        assert!(same_text(5, ["ab", "c", "de"], b"abcde"));
+        assert!(!same_text(5, ["ab", "c", "dx"], b"abcde"));
+        assert!(!same_text(4, ["ab", "cd"], b"abcde"), "lengths differ");
+        assert!(same_text(0, std::iter::empty(), b""));
+        // chunks that claim the length but run short or long
+        assert!(!same_text(5, ["ab"], b"abcde"));
+        assert!(!same_text(5, ["abcdef"], b"abcde"));
+    }
+
+    #[test]
+    fn undo_back_to_the_saved_text_clears_the_dot() {
+        let mut t = Tracker::new(Arc::new("fn main() {}\n".into()));
+        assert!(!t.is_dirty());
+        assert!(t.changed(14, ["fn main() {x}\n"]), "the first edit turns it on");
+        assert!(t.is_dirty());
+        assert!(!t.changed(15, ["fn main() {xy}\n"]), "still dirty: no flip");
+        assert!(t.changed(13, ["fn main() {", "}\n"]), "undone to the saved text, in other chunks");
+        assert!(!t.is_dirty());
+    }
+
+    #[test]
+    fn typing_during_a_save_stays_dirty() {
+        let mut t = Tracker::new(Arc::new("a".into()));
+        t.changed(2, ["ab"]);
+        let ticket = t.start_save().expect("a save");
+        assert!(t.saving());
+        assert_eq!(t.start_save(), None, "one at a time");
+        // typed while the save of "ab" ran
+        t.changed(3, ["abc"]);
+        assert!(t.finish_save(ticket, Some(Arc::new(b"ab".to_vec())), 3, ["abc"]));
+        assert!(t.is_dirty(), "only what was written is the baseline");
+        assert!(!t.saving());
+        // undo to what the save wrote: clean
+        assert!(t.changed(2, ["ab"]));
+        assert!(!t.is_dirty());
+        // a save of the buffer as it is ends clean
+        t.changed(3, ["abc"]);
+        let ticket = t.start_save().unwrap();
+        assert!(t.finish_save(ticket, Some(Arc::new(b"abc".to_vec())), 3, ["abc"]));
+        assert!(!t.is_dirty());
+        // a failed save leaves the dot and the old baseline
+        t.changed(4, ["abcd"]);
+        let ticket = t.start_save().unwrap();
+        assert!(t.finish_save(ticket, None, 4, ["abcd"]));
+        assert!(t.is_dirty());
+        assert!(t.changed(3, ["abc"]), "the baseline is still the last written");
+        // a late answer to an older save counts for nothing
+        assert!(!t.finish_save(ticket, Some(Arc::new(b"zzz".to_vec())), 3, ["abc"]));
+        assert!(!t.is_dirty());
+    }
+
+    #[test]
+    fn text_within_the_limits_opens_editable() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, body: &[u8]| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let ok = file("a.rs", b"fn a() {}\r\nfn b() {}\r\n");
+        match read_for_edit(&ok, Some(dir.path()), false) {
+            Loaded::Edit(e) => {
+                assert_eq!(e.text, "fn a() {}\nfn b() {}\n", "line ends as \\n; the baseline keeps CRLF");
+                assert_eq!(e.baseline.ending, LineEnding::Crlf);
+                assert!(e.syntax.is_some());
+                assert_eq!(e.readonly, None);
+            }
+            Loaded::View(_) => panic!("editable"),
+        }
+        let long = file("min.js", format!("{}\n", "x".repeat(MAX_EDIT_LINE + 1)).as_bytes());
+        assert!(matches!(read_for_edit(&long, Some(dir.path()), false), Loaded::View(Some(Note::LongLines))));
+        assert!(matches!(read_for_edit(&long, Some(dir.path()), true), Loaded::Edit(_)), "Edit anyway");
+        let binary = file("b.bin", b"\0\x01\x02");
+        assert!(matches!(read_for_edit(&binary, Some(dir.path()), false), Loaded::View(None)));
+        // outside the workspace's folder: read-only
+        let other = tempfile::tempdir().unwrap();
+        match read_for_edit(&ok, Some(other.path()), false) {
+            Loaded::Edit(e) => assert!(e.readonly.is_some()),
+            Loaded::View(_) => panic!("editable"),
+        }
+    }
+
+    #[test]
+    fn numbers_group_by_thousands() {
+        assert_eq!(group(200_000), "200,000");
+        assert_eq!(group(20_000), "20,000");
+        assert_eq!(group(999), "999");
+        assert_eq!(group(1_000_000), "1,000,000");
+    }
+}

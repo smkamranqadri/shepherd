@@ -35,6 +35,8 @@ pub enum Updates {
     Available(Release),
     Downloading { version: String, percent: u64 },
     Installing,
+    /// Installed; Shepherd relaunches as it quits (the quit waited on unsaved files and was cancelled).
+    Installed,
     /// Why the check or the update failed; with the release when it was the update, to try again.
     Failed(String, Option<Release>),
 }
@@ -55,12 +57,13 @@ impl Updates {
             Updates::Available(r) => format!("Shepherd {} is available", r.version),
             Updates::Downloading { percent, .. } => format!("Downloading · {percent}%"),
             Updates::Installing => "Installing, Shepherd restarts in a moment…".into(),
+            Updates::Installed => "Installed, Shepherd restarts when it quits".into(),
             Updates::Failed(why, _) => format!("Update failed: {why}"),
         }
     }
 
     pub fn busy(&self) -> bool {
-        matches!(self, Updates::Checking | Updates::Downloading { .. } | Updates::Installing)
+        matches!(self, Updates::Checking | Updates::Downloading { .. } | Updates::Installing | Updates::Installed)
     }
 
     /// The sidebar strip: its label and the release a click installs. `None` while there is nothing to offer.
@@ -70,6 +73,7 @@ impl Updates {
             Updates::Available(r) => Some((format!("Shepherd v{} is out", r.version), Some(r.clone()))),
             Updates::Downloading { version, percent } => Some((format!("Downloading v{version}… {percent}%"), None)),
             Updates::Installing => Some(("Installing, Shepherd restarts…".into(), None)),
+            Updates::Installed => Some(("Installed, restarts on quit".into(), None)),
             Updates::Failed(why, Some(r)) => Some((format!("Update failed: {why}"), Some(r.clone()))),
             _ => None,
         }
@@ -180,12 +184,20 @@ pub fn install(release: Release, cx: &mut App) {
             Ok(zip) => {
                 cx.update(|cx| set(cx, Updates::Installing));
                 let target = app.clone();
-                cx.background_spawn(async move { replace(&zip, &target) }).await.and_then(|()| relaunch(&app))
+                cx.background_spawn(async move { replace(&zip, &target) }).await
             }
             Err(e) => Err(e),
         };
         cx.update(|cx| match done {
-            Ok(()) => cx.quit(),
+            // unsaved file tabs ask first; it relaunches once the quit goes through (now, or after a cancel, later)
+            Ok(()) => {
+                set(cx, Updates::Installed);
+                crate::shell::Shell::quit_and(cx, move || {
+                    if let Err(e) = relaunch(&app) {
+                        eprintln!("shepherd: couldn't relaunch after the update: {e:#}");
+                    }
+                });
+            }
             Err(e) => set(cx, Updates::Failed(format!("{e:#}"), Some(release))),
         });
     })

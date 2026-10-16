@@ -16,7 +16,9 @@ fn main() {
         cx.set_global(settings.theme(cx.window_appearance()));
         shepherd::bindings::rebind(cx, &settings.keys);
         cx.set_global(shepherd::settings::SettingsGlobal { settings, error, path });
-        cx.on_action(|_: &shepherd::bindings::Quit, cx| cx.quit());
+        shepherd::bindings::bind_editor_keys(cx);
+        // unsaved file tabs ask first
+        cx.on_action(|_: &shepherd::bindings::Quit, cx| shepherd::shell::Shell::quit(cx));
         // off macOS an app with no windows left has nothing to show: closing the last one quits, as GNOME expects
         if !cfg!(target_os = "macos") {
             cx.on_window_closed(|cx, _| {

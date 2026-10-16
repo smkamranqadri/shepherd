@@ -7,6 +7,11 @@
 //! shown `MAX_VIEWS` are kept; the pinned tabs are kept for the next run in `open-files.json`
 //! (`files::open_files`), written a second after the last change and only when it changed.
 //!
+//! A file's view is its editor (`ui::editor`), which shows what it cannot edit in the read-only viewer. A tab with
+//! unsaved changes has a dot, is pinned on its first edit, is never closed to make room nor replaced as a preview,
+//! and asks Save / Don't Save / Cancel before it closes; quitting or closing the window with any asks Save All /
+//! Don't Save / Cancel. The cursor and scroll of a view dropped to save memory are put back when it is made again.
+//!
 //! A change in the Changes tab opens its diff (`ui::diff_view`) as a file tab of its own kind (`TabKind::Diff`),
 //! by the same preview rules, never kept for the next run; the shown one reads its diff again on every Changes
 //! poll and whenever it comes into view.
@@ -17,7 +22,9 @@ use crate::files::status::{Change, Group};
 use crate::files::tabs::{self, FileTab, StripEntry, TabId, TabKind, WorkspaceTabs};
 use crate::files::diff::Entries;
 use crate::ui::diff_view::{DiffEvent, DiffSpec, DiffView};
-use crate::ui::viewer::{FileViewer, ViewerEvent};
+use crate::files::save::SaveMode;
+use crate::ui::editor::{EditorEvent, FileEditor, Saving};
+use gpui::PromptLevel;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
@@ -45,10 +52,10 @@ fn real_path(rt: &tokio::runtime::Handle, path: PathBuf) -> impl std::future::Fu
     async move { job.await.unwrap_or(fallback) }
 }
 
-/// A file tab's view: a file's viewer, or a change's diff.
+/// A file tab's view: a file's editor, or a change's diff.
 #[derive(Clone)]
 pub(super) enum TabView {
-    File(Entity<FileViewer>),
+    File(Entity<FileEditor>),
     Diff(Entity<DiffView>),
 }
 
@@ -62,8 +69,14 @@ impl TabView {
 
     /// Markdown's preview is on screen: its selection is `ui::markdown`'s, which must not be forgotten.
     pub(super) fn shows_markdown(&self, cx: &App) -> bool {
-        matches!(self, TabView::File(v) if v.read(cx).shows_markdown())
+        matches!(self, TabView::File(v) if v.read(cx).shows_markdown(cx))
     }
+
+    /// It has unsaved changes.
+    pub(super) fn is_dirty(&self, cx: &App) -> bool {
+        matches!(self, TabView::File(v) if v.read(cx).is_dirty())
+    }
+
 
     pub(super) fn element(&self) -> gpui::AnyElement {
         match self {
@@ -75,7 +88,7 @@ impl TabView {
     /// Out of sight: an image leaves gpui's cache, a large diff goes (read again when shown), a menu closes.
     fn hide(&self, window: Option<&mut Window>, cx: &mut App) {
         match self {
-            TabView::File(v) => v.update(cx, |v, cx| v.evict_image(window, cx)),
+            TabView::File(v) => v.update(cx, |v, cx| v.hide(window, cx)),
             TabView::Diff(v) => v.update(cx, |v, _| v.hide()),
         }
     }
@@ -250,17 +263,19 @@ impl Shell {
     #[allow(clippy::too_many_arguments)]
     fn open_real(&mut self, key: String, path: PathBuf, line: Option<u32>, fragment: Option<String>, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.restore_tabs(&key, cx);
+        let dirty = self.dirty_tabs(cx);
         let tabs = self.file_tabs.entry(key.clone()).or_default();
-        // ponytail: nothing is dirty until tabs edit (E1)
-        let id = tabs.open(path.clone(), TabKind::File, preview, |_| false, &mut self.next_tab_id);
-        tabs.trim(id, |_| false);
+        // a preview with unsaved changes is not replaced, nor a dirty tab closed to make room
+        let id = tabs.open(path.clone(), TabKind::File, preview, |t| dirty.contains(&t), &mut self.next_tab_id);
+        tabs.trim(id, |t| dirty.contains(&t));
         self.drop_dead_views(cx);
+        self.adopt_orphan(id, &path, window, cx);
         let view = match self.view_of(id) {
             Some(TabView::File(view)) => {
-                // a replaced preview's view shows the new file; the same file again reads it afresh only to go to `line`
+                // a replaced preview's view shows the new file; the same file (its edits kept) only goes to `line`
                 if view.read(cx).path() != path || line.is_some() {
                     let root = self.panel_context(window, cx).root.map(PathBuf::from);
-                    view.update(cx, |v, cx| v.open(path, line, root, window, cx));
+                    view.update(cx, |v, cx| v.open(path, line, root, None, window, cx));
                 }
                 view
             }
@@ -272,10 +287,11 @@ impl Shell {
             None => self.make_view(id, path, line, window, cx),
         };
         if let Some(fragment) = fragment {
-            view.update(cx, |v, cx| v.go_to(fragment, cx));
+            view.update(cx, |v, cx| v.go_to(fragment, window, cx));
         }
         if !preview {
-            window.focus(&view.read(cx).focus_handle(cx), cx);
+            let handle = view.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
         }
         self.remember_tabs(&key, cx);
         cx.notify();
@@ -298,10 +314,10 @@ impl Shell {
         let root = self.panel_context(window, cx).root.map(PathBuf::from).or_else(|| path.parent().map(PathBuf::from)).unwrap_or_default();
         let entries = self.side_panel.read(cx).entries(&change.path);
         let spec = DiffSpec { root, path: path.clone(), change };
+        let dirty = self.dirty_tabs(cx);
         let tabs = self.file_tabs.entry(key.clone()).or_default();
-        // ponytail: nothing is dirty until tabs edit (E1)
-        let id = tabs.open(path, TabKind::Diff(spec.change.group), preview, |_| false, &mut self.next_tab_id);
-        tabs.trim(id, |_| false);
+        let id = tabs.open(path, TabKind::Diff(spec.change.group), preview, |t| dirty.contains(&t), &mut self.next_tab_id);
+        tabs.trim(id, |t| dirty.contains(&t));
         self.diff_specs.insert(id, spec.clone());
         self.drop_dead_views(cx);
         let view = match self.view_of(id) {
@@ -363,23 +379,33 @@ impl Shell {
         view.update(cx, |v, cx| v.reload(now, entries, poll, cx));
     }
 
-    /// A view for the tab `id`, reading `path`, kept first among the views.
-    fn make_view(&mut self, id: TabId, path: PathBuf, line: Option<u32>, window: &mut Window, cx: &mut Context<Self>) -> Entity<FileViewer> {
+    /// A view for the tab `id`, reading `path`, kept first among the views; the cursor and scroll it had when its
+    /// last view went to save memory come back.
+    fn make_view(&mut self, id: TabId, path: PathBuf, line: Option<u32>, window: &mut Window, cx: &mut Context<Self>) -> Entity<FileEditor> {
         let root = self.panel_context(window, cx).root.map(PathBuf::from);
         let rt = self.rt.clone();
-        let view = cx.new(|cx| FileViewer::new(rt, cx));
-        cx.subscribe_in(&view, window, move |s: &mut Shell, _, event: &ViewerEvent, window, cx| match event {
+        let view = cx.new(|cx| FileEditor::new(rt, cx));
+        cx.subscribe_in(&view, window, move |s: &mut Shell, _, event: &EditorEvent, window, cx| match event {
             // the editor's pane opens beside the focused one: the terminals show, the file tab stays
-            ViewerEvent::OpenInEditor { path, line } => {
+            EditorEvent::OpenInEditor { path, line } => {
                 let pane = s.active_pane(window, cx);
                 s.show_terminals(cx);
                 crate::terminal::pane::open_in_editor(path.clone(), *line, None, pane, cx);
             }
             // a markdown link to another file of the root: a tab of its own, which takes the keyboard
-            ViewerEvent::OpenFile { path, line, fragment } => s.open_file_at(path.clone(), *line, fragment.clone(), false, window, cx),
+            EditorEvent::OpenFile { path, line, fragment } => s.open_file_at(path.clone(), *line, fragment.clone(), false, window, cx),
+            // the dot: a preview edited is kept
+            EditorEvent::Dirty(dirty) => {
+                let preview = s.file_tabs.iter().find(|(_, t)| t.get(id).is_some_and(|t| t.preview)).map(|(k, _)| k.clone());
+                if let Some(key) = preview.filter(|_| *dirty) {
+                    s.pin_file_tab(&key, id, cx);
+                }
+                cx.notify();
+            }
         })
         .detach();
-        view.update(cx, |v, cx| v.open(path, line, root, window, cx));
+        let place = self.tab_places.remove(&id);
+        view.update(cx, |v, cx| v.open(path, line, root, place, window, cx));
         self.keep_view(id, TabView::File(view.clone()), cx);
         view
     }
@@ -389,16 +415,22 @@ impl Shell {
     fn keep_view(&mut self, id: TabId, view: TabView, cx: &App) {
         self.tab_views.insert(0, (id, view));
         while self.tab_views.len() > MAX_VIEWS {
-            let Some(at) = self.tab_views.iter().rposition(|(t, v)| *t != id && !Self::view_dirty(v, cx)) else { break };
-            let (_, gone) = self.tab_views.remove(at);
+            // one with unsaved changes is never dropped to save memory
+            let Some(at) = self.tab_views.iter().rposition(|(t, v)| *t != id && !v.is_dirty(cx)) else { break };
+            let (gone_id, gone) = self.tab_views.remove(at);
+            // where it was, for the view its tab gets when shown again
+            if let TabView::File(v) = &gone
+                && let Some(place) = v.read(cx).place(cx)
+            {
+                self.tab_places.insert(gone_id, place);
+            }
             self.views_gone.push(gone);
         }
     }
 
-    /// The view has unsaved changes: it is never dropped to save memory.
-    // ponytail: always false until tabs edit (E1)
-    fn view_dirty(_view: &TabView, _cx: &App) -> bool {
-        false
+    /// The tabs whose views have unsaved changes.
+    pub(super) fn dirty_tabs(&self, cx: &App) -> HashSet<TabId> {
+        self.tab_views.iter().filter(|(_, v)| v.is_dirty(cx)).map(|(id, _)| *id).collect()
     }
 
     /// The tree's "Open in editor" (its menu, Cmd/Ctrl+Enter): the editor's pane (nvim's split) opens beside the
@@ -417,8 +449,47 @@ impl Shell {
         true
     }
 
+    /// Closes the tab `id` of the workspace `key`; one with unsaved changes is shown and asks Save / Don't Save /
+    /// Cancel first, and closes once saved (a save that fails leaves it open, saying why).
     pub(super) fn close_file_tab(&mut self, key: &str, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
-        // ponytail: a dirty tab asks Save / Don't Save / Cancel first once tabs edit (E1)
+        let editor = match self.view_of(id) {
+            Some(TabView::File(v)) if v.read(cx).is_dirty() => v,
+            _ => return self.discard_file_tab(key, id, window, cx),
+        };
+        if self.asking {
+            return;
+        }
+        self.asking = true;
+        // the question is about the tab in view
+        self.show_file_tab(key, id, cx);
+        let name = editor.read(cx).path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let message = format!("Save changes to {name}?");
+        let answer = window.prompt(PromptLevel::Warning, &message, Some(LOST), &CLOSE_ANSWERS, cx);
+        let key = key.to_string();
+        cx.spawn_in(window, async move |this, cx| {
+            let close = match closing(answer.await.ok()) {
+                Closing::Keep => false,
+                Closing::Discard => true,
+                Closing::Save => {
+                    let save = this.update_in(cx, |_, window, cx| editor.update(cx, |e, cx| e.save(SaveMode::Safe, window, cx)));
+                    match save {
+                        Ok(Some(save)) => save.await,
+                        _ => false,
+                    }
+                }
+            };
+            let _ = this.update_in(cx, |s, window, cx| {
+                s.asking = false;
+                if close {
+                    s.discard_file_tab(&key, id, window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Closes the tab, unsaved changes or not.
+    fn discard_file_tab(&mut self, key: &str, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tabs) = self.file_tabs.get_mut(key) else { return };
         if tabs.close(id).is_none() {
             // back to the terminals: herdr's focused pane takes the keyboard on the next render
@@ -434,14 +505,15 @@ impl Shell {
     }
 
     /// Views of tabs no workspace has any more (replaced, trimmed, pruned) go, retired on the next render; one with
-    /// unsaved changes stays (E1 asks before its tab goes).
+    /// unsaved changes stays (its workspace closed: Save All on quit still saves it).
     fn drop_dead_views(&mut self, cx: &App) {
         let live: HashSet<TabId> = self.file_tabs.values().flat_map(|t| t.files.iter().map(|f| f.id)).collect();
+        self.tab_places.retain(|id, _| live.contains(id));
         // a diff tab's change goes with it (or with its slot, now a file's)
         let diffs: HashSet<TabId> = self.file_tabs.values().flat_map(|t| t.files.iter().filter(|f| matches!(f.kind, TabKind::Diff(_))).map(|f| f.id)).collect();
         self.diff_specs.retain(|id, _| diffs.contains(id));
         let (keep, gone): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut self.tab_views).into_iter().partition(|(id, v)| live.contains(id) || Self::view_dirty(v, cx));
+            std::mem::take(&mut self.tab_views).into_iter().partition(|(id, v)| live.contains(id) || v.is_dirty(cx));
         self.tab_views = keep;
         self.views_gone.extend(gone.into_iter().map(|(_, v)| v));
     }
@@ -493,6 +565,12 @@ impl Shell {
             self.follow_root(&key, cx);
         }
         let shown = self.shown_file_tab().map(|(_, t)| (t.id, t.path.clone(), t.kind));
+        // a tab restored or reopened for a file whose unsaved buffer outlived its workspace takes that buffer
+        if let Some((id, path, TabKind::File)) = &shown
+            && self.view_of(*id).is_none()
+        {
+            self.adopt_orphan(*id, &path.clone(), window, cx);
+        }
         let drawn = shown.as_ref().map(|(id, ..)| *id);
         let view = shown.map(|(id, path, kind)| match self.tab_views.iter().position(|(t, _)| *t == id) {
             Some(0) => self.tab_views[0].1.clone(),
@@ -552,10 +630,10 @@ impl Shell {
                 if s.tab_roots.get(&key) != Some(&root) {
                     return;
                 }
+                let dirty = s.dirty_tabs(cx);
                 let Some(tabs) = s.file_tabs.get_mut(&key) else { return };
                 let was = tabs.active;
-                // ponytail: nothing is dirty until tabs edit (E1)
-                if tabs.close_outside(&[PathBuf::from(&root), real], |_| false).is_empty() {
+                if tabs.close_outside(&[PathBuf::from(&root), real], |t| dirty.contains(&t)).is_empty() {
                     return;
                 }
                 if was.is_some() && tabs.active.is_none() {
@@ -680,5 +758,264 @@ impl Shell {
         // the timer is dropped (cancelled): the write happens here instead
         drop(self.kept_tabs.save.take());
         self.write_kept_tabs(cx)
+    }
+}
+
+/// A close prompt's answers, in order (`closing` reads the index).
+const CLOSE_ANSWERS: [&str; 3] = ["Save", "Don't Save", "Cancel"];
+/// Quitting's or closing the window's.
+const EXIT_ANSWERS: [&str; 3] = ["Save All", "Don't Save", "Cancel"];
+const LOST: &str = "Your changes are lost if you don't save them.";
+
+/// What an answer to Save / Don't Save / Cancel does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Closing {
+    Save,
+    Discard,
+    /// Cancel, or the prompt went without an answer.
+    Keep,
+}
+
+/// A file's name as a prompt or a toast says it.
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+fn closing(answer: Option<usize>) -> Closing {
+    match answer {
+        Some(0) => Closing::Save,
+        Some(1) => Closing::Discard,
+        _ => Closing::Keep,
+    }
+}
+
+/// The question before quitting with unsaved files (their names), and its detail.
+fn unsaved_message(names: &[String]) -> (String, String) {
+    const LISTED: usize = 4;
+    let message = match names.len() {
+        1 => format!("Save changes to {}?", names[0]),
+        n => format!("Save changes to {n} files?"),
+    };
+    let detail = match names.len() {
+        0 | 1 => LOST.to_string(),
+        n if n <= LISTED => format!("{}. {LOST}", names.join(", ")),
+        n => format!("{} and {} more. {LOST}", names[..LISTED].join(", "), n - LISTED),
+    };
+    (message, detail)
+}
+
+/// What a window with unsaved tabs does once they are dealt with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Exit {
+    Quit,
+    Close,
+}
+
+/// What runs once Shepherd quits, however it quits (the updater's relaunch): kept until a quit goes through.
+#[derive(Default)]
+pub struct AfterQuit(Vec<Box<dyn FnOnce()>>);
+
+impl gpui::Global for AfterQuit {}
+
+impl AfterQuit {
+    /// Runs what was left to run (on the app's quit).
+    pub(super) fn run(cx: &mut App) {
+        if let Some(after) = cx.try_global::<AfterQuit>().is_some().then(|| std::mem::take(&mut cx.global_mut::<AfterQuit>().0)) {
+            for f in after {
+                f();
+            }
+        }
+    }
+}
+
+impl Shell {
+    /// Quit (its chord, the menu): the first window with unsaved file tabs asks first; with none, Shepherd quits.
+    pub fn quit(cx: &mut App) {
+        for window in cx.windows() {
+            let Some(window) = window.downcast::<Shell>() else { continue };
+            if window.update(cx, |s, window, cx| s.ask_unsaved(Exit::Quit, window, cx)).unwrap_or(false) {
+                return;
+            }
+        }
+        cx.quit();
+    }
+
+    /// `quit`, and `after` once it does (the updater relaunches only if the quit goes through; cancelled, it waits
+    /// for the next one).
+    pub fn quit_and(cx: &mut App, after: impl FnOnce() + 'static) {
+        cx.default_global::<AfterQuit>().0.push(Box::new(after));
+        Self::quit(cx);
+    }
+
+    /// The views with unsaved changes (`saving`: or a save under way), those of tabs that closed with their workspace
+    /// too.
+    fn editors(&self, saving: bool, cx: &App) -> Vec<Entity<FileEditor>> {
+        let mut out: Vec<Entity<FileEditor>> = Vec::new();
+        for view in self.tab_views.iter().map(|(_, v)| v).chain(&self.views_gone) {
+            if let TabView::File(v) = view
+                && (v.read(cx).is_dirty() || saving && v.read(cx).is_saving())
+                && !out.contains(v)
+            {
+                out.push(v.clone());
+            }
+        }
+        out
+    }
+
+    /// Unsaved file tabs before quitting or closing the window: asks Save All / Don't Save / Cancel, and quits or
+    /// closes once they are saved (all of them) or let go. A save under way is waited for either way, and alone it
+    /// is waited for without asking. True when it asked or waits, so the caller does not go yet.
+    pub(super) fn ask_unsaved(&mut self, exit: Exit, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.leaving {
+            return false;
+        }
+        let dirty = self.editors(false, cx);
+        let saving = self.editors(true, cx);
+        if saving.is_empty() {
+            return false;
+        }
+        if self.asking {
+            return true;
+        }
+        self.asking = true;
+        let answer = (!dirty.is_empty()).then(|| {
+            let names: Vec<String> = dirty.iter().map(|e| file_name(e.read(cx).path())).collect();
+            let (message, detail) = unsaved_message(&names);
+            window.prompt(PromptLevel::Warning, &message, Some(&detail), &EXIT_ANSWERS, cx)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = match answer {
+                Some(answer) => closing(answer.await.ok()),
+                // nothing unsaved, a save under way: only waited for
+                None => Closing::Discard,
+            };
+            let go = match answer {
+                Closing::Keep => false,
+                Closing::Discard => {
+                    // what is being written finishes first, whatever was answered
+                    let writes = this.update(cx, |s, cx| s.editors(true, cx).iter().filter_map(|e| e.read(cx).saving()).collect::<Vec<_>>()).unwrap_or_default();
+                    for write in writes {
+                        write.await;
+                    }
+                    true
+                }
+                Closing::Save => {
+                    let saves = this.update_in(cx, |s, window, cx| s.save_all(window, cx)).unwrap_or_default();
+                    Self::all_saved(&this, saves, cx).await
+                }
+            };
+            let _ = this.update_in(cx, |s, window, cx| {
+                s.asking = false;
+                if go {
+                    s.leaving = true;
+                    match exit {
+                        Exit::Quit => cx.quit(),
+                        Exit::Close => window.remove_window(),
+                    }
+                }
+            });
+        })
+        .detach();
+        true
+    }
+
+    /// Ctrl/Cmd+Alt+S, and Save All before quitting: saves every view with unsaved changes, and hands back those
+    /// under way too (a clean tab still writing), each with whether its file was written.
+    pub(super) fn save_all(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<(Entity<FileEditor>, Saving)> {
+        let mut out = Vec::new();
+        for e in self.editors(true, cx) {
+            let save = if e.read(cx).is_dirty() { e.update(cx, |e, cx| e.save(SaveMode::Safe, window, cx)) } else { e.read(cx).saving() };
+            out.push((e, save.unwrap_or_else(|| futures::FutureExt::shared(futures::FutureExt::boxed_local(async { false })))));
+        }
+        out
+    }
+
+    /// Waits for `saves`; true when every one wrote its file, else the first that did not is shown (its banner says
+    /// why), or named when its tab is not in this window's shown workspace.
+    async fn all_saved(this: &gpui::WeakEntity<Shell>, saves: Vec<(Entity<FileEditor>, Saving)>, cx: &mut gpui::AsyncWindowContext) -> bool {
+        let mut failed = None;
+        for (editor, save) in saves {
+            if !save.await && failed.is_none() {
+                failed = Some(editor);
+            }
+        }
+        let Some(editor) = failed else { return true };
+        let _ = this.update(cx, |s, cx| s.show_failed(&editor, cx));
+        false
+    }
+
+    /// A save of Save All failed: its tab shows, if it is one of the shown workspace's; else a toast names the file.
+    fn show_failed(&mut self, editor: &Entity<FileEditor>, cx: &mut Context<Self>) {
+        let id = self.tab_views.iter().find(|(_, v)| matches!(v, TabView::File(v) if v == editor)).map(|(id, _)| *id);
+        let key = self.shown_tabs_key().filter(|k| id.is_some_and(|id| self.file_tabs.get(k).is_some_and(|t| t.get(id).is_some())));
+        match (key, id) {
+            (Some(key), Some(id)) => self.show_file_tab(&key, id, cx),
+            _ => {
+                let name = file_name(editor.read(cx).path());
+                crate::ui::toast::error(cx, format!("Couldn't save {name}"))
+            }
+        }
+    }
+
+    /// Ctrl/Cmd+Alt+S: Save All, the first tab that failed shown.
+    pub(super) fn save_all_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let saves = self.save_all(window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            Self::all_saved(&this, saves, cx).await;
+        })
+        .detach();
+    }
+
+    /// Quitting without asking (the Dock's Quit, logging out, `leaving` not set): every unsaved view is saved and every
+    /// write under way waited for, as long as the app's quit lets them run.
+    pub(super) fn flush_editors(&self, cx: &App) -> Vec<futures::future::BoxFuture<'static, ()>> {
+        if self.leaving {
+            // Don't Save was the answer; what was being written was waited for then
+            return Vec::new();
+        }
+        self.editors(true, cx).iter().filter_map(|e| e.read(cx).flush(cx)).collect()
+    }
+
+    /// The view of a tab that went with its workspace, unsaved, for the file a tab now opens: that tab takes it over
+    /// (so one file never has two buffers), in place of a view of another file its slot had. True when it did.
+    fn adopt_orphan(&mut self, id: TabId, path: &std::path::Path, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let live: HashSet<TabId> = self.file_tabs.values().flat_map(|t| t.files.iter().map(|f| f.id)).collect();
+        let orphan = self.tab_views.iter().position(|(t, v)| !live.contains(t) && matches!(v, TabView::File(v) if v.read(cx).path() == path));
+        let Some(at) = orphan else { return false };
+        if let Some(own) = self.view_of(id) {
+            if matches!(&own, TabView::File(v) if v.read(cx).path() == path) {
+                return false;
+            }
+            self.drop_view(id, own, window, cx);
+        }
+        let at = self.tab_views.iter().position(|(t, v)| !live.contains(t) && matches!(v, TabView::File(v) if v.read(cx).path() == path)).unwrap_or(at);
+        self.tab_views[at].0 = id;
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_close_prompt_routes_its_answer() {
+        assert_eq!(CLOSE_ANSWERS[0], "Save");
+        assert_eq!(closing(Some(0)), Closing::Save);
+        assert_eq!(closing(Some(1)), Closing::Discard);
+        assert_eq!(closing(Some(2)), Closing::Keep, "Cancel");
+        assert_eq!(closing(None), Closing::Keep, "dismissed without an answer");
+        assert_eq!(EXIT_ANSWERS.len(), CLOSE_ANSWERS.len(), "the same routing for both");
+    }
+
+    #[test]
+    fn the_quit_prompt_names_the_files() {
+        let names = |n: usize| (0..n).map(|i| format!("f{i}.rs")).collect::<Vec<_>>();
+        assert_eq!(unsaved_message(&names(1)).0, "Save changes to f0.rs?");
+        let (message, detail) = unsaved_message(&names(3));
+        assert_eq!(message, "Save changes to 3 files?");
+        assert!(detail.starts_with("f0.rs, f1.rs, f2.rs. "), "{detail}");
+        let (_, detail) = unsaved_message(&names(7));
+        assert!(detail.starts_with("f0.rs, f1.rs, f2.rs, f3.rs and 3 more. "), "{detail}");
     }
 }

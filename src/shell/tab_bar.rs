@@ -473,12 +473,12 @@ impl Shell {
             let blank = (theme.text_muted, theme.text_muted);
             tabs.push(Shown { face: Face::Divider, id: "file-divider".into(), label: String::new(), status: AgentStatus::Idle, icon: "", tint: blank, zoomed: false, width: DIVIDER_W });
         }
+        let dirty = self.dirty_tabs(cx);
         for f in &file_tabs {
             // a diff's label has its group after the name
             let label = f.label();
             let width = tab_width(label_w(&label, window), false, false);
-            // ponytail: nothing is dirty until tabs edit (E1)
-            let face = Face::File { tab: f.id, preview: f.preview, dirty: false };
+            let face = Face::File { tab: f.id, preview: f.preview, dirty: dirty.contains(&f.id) };
             let name = f.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let icon = crate::files::icons::material_icon(&name, false, false);
             tabs.push(Shown { face, id: file_entry_id(f.id), label, status: AgentStatus::Idle, icon, tint: (theme.text_muted, theme.text_muted), zoomed: false, width });

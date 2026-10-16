@@ -73,8 +73,68 @@ app_actions! {
     CommandPanel: "Command panel",
     AgentsPanel: "Agents",
     WorkspacesPanel: "Workspaces",
+    SaveFile: "Save file",
+    SaveAllFiles: "Save all files",
     ShowShortcuts: "Keyboard shortcuts",
     Quit: "Quit",
+}
+
+/// Where the editor's own chords are bound: its text, inside a file tab's view. A pane's keys are in "Terminal", so
+/// Ctrl+Shift+Z and the rest stay the shell's there.
+pub const EDITOR: &str = "FileEditor > Input";
+/// Where the save chords are bound: anywhere in a file tab's view (its text and a markdown preview alike). A pane's
+/// keys are in "Terminal", so Ctrl+S (XOFF) stays the shell's there.
+pub const FILE_VIEW: &str = "FileEditor";
+/// Where an app chord that is also one of gpui-base's text chords is bound: everywhere but in text. GPUI ranks a
+/// binding without a context as deep as the deepest, and Shepherd's are bound after gpui-base's, so bound everywhere
+/// it would win in the editor (Cmd+Shift+Up would switch workspace, not select to the start).
+pub const NOT_IN_TEXT: &str = "!Input";
+
+/// The key context `action`'s chords are bound in, if it has one of its own: the save actions in a file's view.
+pub fn context_of(action: &str) -> Option<&'static str> {
+    matches!(action, "SaveFile" | "SaveAllFiles").then_some(FILE_VIEW)
+}
+
+/// App actions whose chords are bound in the editor's text as well, over a gpui-base "Input" binding of the same
+/// chord (Cmd+Shift+F is its Replace on macOS), so they act the same there as anywhere.
+const OVER_THE_EDITOR: &[&str] = &["ShowSearch"];
+
+/// App actions that stay app-wide in the editor's text even over one of its own chords: closing, the sidebar, the
+/// command panel, new tab, and moving between tabs (whose hints show while the modifier is held).
+const GLOBAL_IN_TEXT: &[&str] = &[
+    "ClosePane", "CloseTab", "ToggleSidebar", "CommandPanel", "NewTab", "NextTab", "PreviousTab", "Tab1", "Tab2", "Tab3", "Tab4", "Tab5", "Tab6", "Tab7",
+    "Tab8", "Tab9",
+];
+
+/// The contexts `action`'s `chord` is bound in, given the chords gpui-base binds in text (`text_chords`).
+fn contexts(action: &str, chord: &str, text_chords: &[String]) -> Vec<Option<&'static str>> {
+    match context_of(action) {
+        Some(context) => vec![Some(context)],
+        None if OVER_THE_EDITOR.contains(&action) => vec![None, Some(EDITOR)],
+        None if text_chords.iter().any(|k| k == chord) && !GLOBAL_IN_TEXT.contains(&action) => vec![Some(NOT_IN_TEXT)],
+        None => vec![None],
+    }
+}
+
+/// The single-keystroke chords gpui-base binds in its "Input" context (the editor's text, and every other input), in
+/// GPUI's spelling.
+fn text_chords(cx: &App) -> Vec<String> {
+    let input = gpui::KeyBindingContextPredicate::parse("Input").ok();
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    keymap
+        .bindings()
+        .filter(|b| b.predicate().as_deref() == input.as_ref() && b.keystrokes().len() == 1)
+        .map(|b| b.keystrokes()[0].inner().unparse())
+        .collect()
+}
+
+/// The editor's chords that are not app actions, bound once after gpui-base's: Ctrl+Shift+Z redoes on Linux too.
+pub fn bind_editor_keys(cx: &mut App) {
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([KeyBinding::new("ctrl-shift-z", gpui_base::input::Redo, Some(EDITOR))]);
+    #[cfg(target_os = "macos")]
+    let _ = cx;
 }
 
 #[cfg(target_os = "macos")]
@@ -134,6 +194,8 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("CommandPanel", "cmd-k"),
     ("CommandPanel", "cmd-shift-p"),
     ("AgentsPanel", "cmd-shift-a"),
+    ("SaveFile", "cmd-s"),
+    ("SaveAllFiles", "cmd-alt-s"),
     ("Quit", "cmd-q"),
     ("ShowShortcuts", "cmd-/"),
 ];
@@ -199,6 +261,9 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("OpenSettings", "ctrl-,"),
     ("CommandPanel", "ctrl-shift-p"),
     ("AgentsPanel", "ctrl-shift-a"),
+    // in the editor only (`context_of`): a pane's Ctrl+S is the terminal's
+    ("SaveFile", "ctrl-s"),
+    ("SaveAllFiles", "ctrl-alt-s"),
     ("Quit", "ctrl-shift-q"),
     // Ctrl+Shift+/ as a US layout reports it: the shifted key, without shift. Ctrl+/ stays the terminal's.
     ("ShowShortcuts", "ctrl-?"),
@@ -377,15 +442,22 @@ pub fn init_menu_actions(cx: &mut App) {
     cx.on_action(|_: &ToggleFullScreen, cx| window(cx, |w| w.toggle_fullscreen()));
 }
 
-/// Binds `next`; chords of `previous` that `next` no longer uses are bound to `NoAction` (a later binding
-/// wins in GPUI), so other bindings, such as gpui-base's input keys, are left alone.
+/// Each binding of `bound` as (chord, context, action), in every context its action binds in.
+fn placed<'a>(bound: &'a [(String, String)], text_chords: &[String]) -> Vec<(&'a str, Option<&'static str>, &'a str)> {
+    bound.iter().flat_map(|(action, chord)| contexts(action, chord, text_chords).into_iter().map(move |c| (chord.as_str(), c, action.as_str()))).collect()
+}
+
+/// Binds `next`; chords of `previous` that `next` no longer binds in the same context are bound to `NoAction` there
+/// (a later binding wins in GPUI), so other bindings, such as gpui-base's input keys, are left alone.
 pub fn apply(cx: &mut App, previous: &[(String, String)], next: &[(String, String)]) {
-    let mut bindings: Vec<KeyBinding> = previous
+    let text = text_chords(cx);
+    let (before, after) = (placed(previous, &text), placed(next, &text));
+    let mut bindings: Vec<KeyBinding> = before
         .iter()
-        .filter(|(_, chord)| !next.iter().any(|(_, k)| k == chord))
-        .map(|(_, chord)| KeyBinding::new(chord, NoAction, None))
+        .filter(|(chord, context, _)| !after.iter().any(|(k, c, _)| k == chord && c == context))
+        .map(|(chord, context, _)| KeyBinding::new(chord, NoAction, *context))
         .collect();
-    bindings.extend(next.iter().filter_map(|(action, chord)| binding(action, chord, None)));
+    bindings.extend(after.iter().filter_map(|(chord, context, action)| binding(action, chord, *context)));
     cx.bind_keys(bindings);
 }
 
@@ -457,11 +529,112 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     fn linux_defaults_leave_readline_its_ctrl_letters() {
         let eff = effective(&user(&[]));
+        // an editor-only chord never reaches a pane (`editor_chords_never_fire_in_a_pane`)
         for key in ["p", "n", "r", "e", "a", "f", "u", "y", "l"] {
             let taken = normalize(&format!("ctrl-{key}")).unwrap();
-            assert!(!eff.iter().any(|(_, k)| *k == taken), "ctrl-{key} is readline's");
+            assert!(!eff.iter().any(|(a, k)| *k == taken && context_of(a).is_none()), "ctrl-{key} is readline's");
         }
         assert_eq!(chord(&eff, "QuickOpen"), normalize("ctrl-alt-p").as_deref());
+    }
+
+    fn stack(names: &[&str]) -> Vec<gpui::KeyContext> {
+        names.iter().map(|n| gpui::KeyContext::parse(n).unwrap()).collect()
+    }
+
+    #[test]
+    fn editor_actions_bind_in_the_editor_only() {
+        for (action, _) in ACTIONS {
+            let editor = matches!(*action, "SaveFile" | "SaveAllFiles");
+            assert_eq!(context_of(action), editor.then_some(FILE_VIEW), "{action}");
+        }
+        let view = gpui::KeyBindingContextPredicate::parse(FILE_VIEW).unwrap();
+        assert!(view.depth_of(&stack(&["FileEditor", "Input"])).is_some(), "the editor's text");
+        assert!(view.depth_of(&stack(&["FileEditor"])).is_some(), "a markdown preview");
+        assert!(view.depth_of(&stack(&["Terminal"])).is_none(), "a pane");
+        assert!(view.depth_of(&stack(&["Input"])).is_none(), "another input (a rename, the command panel)");
+        let editor = gpui::KeyBindingContextPredicate::parse(EDITOR).unwrap();
+        assert!(editor.eval(&stack(&["FileEditor", "Input"])));
+        assert!(!editor.eval(&stack(&["FileEditor"])));
+        // the default chords exist and parse
+        let eff = effective(&user(&[]));
+        assert!(chord(&eff, "SaveFile").is_some() && chord(&eff, "SaveAllFiles").is_some());
+        // ShowSearch is bound over the editor's own chord as well as everywhere
+        let text = text_chords_here();
+        assert_eq!(contexts("ShowSearch", "x", &text), [None, Some(EDITOR)]);
+        assert_eq!(contexts("SaveFile", "x", &text), [Some(FILE_VIEW)]);
+        assert_eq!(contexts("NewTab", "x", &text), [None]);
+    }
+
+    /// gpui-base's text chords (its `input::init`) that Shepherd's defaults could meet, as GPUI spells them.
+    fn text_chords_here() -> Vec<String> {
+        #[cfg(target_os = "macos")]
+        let chords = ["cmd-a", "cmd-c", "cmd-x", "cmd-v", "cmd-z", "cmd-shift-z", "cmd-f", "cmd-shift-f", "cmd-left", "cmd-right", "cmd-up", "cmd-down", "cmd-shift-up", "cmd-shift-down", "cmd-[", "cmd-]", "alt-left", "alt-right", "cmd-."];
+        #[cfg(not(target_os = "macos"))]
+        let chords = ["ctrl-a", "ctrl-c", "ctrl-x", "ctrl-v", "ctrl-z", "ctrl-y", "ctrl-f", "ctrl-h", "ctrl-left", "ctrl-right", "ctrl-shift-left", "ctrl-shift-right", "ctrl-[", "ctrl-]", "ctrl-.", "ctrl-backspace", "ctrl-delete"];
+        chords.iter().map(|c| normalize(c).unwrap()).collect()
+    }
+
+    /// In the editor's text its own chords win over the app's, but for the deliberate app-wide ones; outside text the
+    /// app's fire. A keymap as GPUI keeps it: gpui-base's text bindings first, then Shepherd's (`apply`'s order).
+    #[test]
+    fn the_editor_s_chords_win_in_its_text_but_for_the_app_wide_ones() {
+        let mut text = text_chords_here();
+        // pretend gpui-base took the deliberate app-wide chords too: they must stay the app's
+        let closes = if cfg!(target_os = "macos") { "cmd-w" } else { "ctrl-w" };
+        text.extend([normalize(closes).unwrap(), normalize("ctrl-tab").unwrap()]);
+        let eff = effective(&user(&[]));
+        let mut keymap = gpui::Keymap::new(text.iter().map(|c| KeyBinding::new(c, gpui_base::input::SelectToStart, Some("Input"))).collect());
+        keymap.add_bindings(placed(&eff, &text).into_iter().filter_map(|(chord, context, action)| binding(action, chord, context)));
+        let editor = stack(&["Workspace", "FileEditor", "Input"]);
+        let pane = stack(&["Workspace", "Terminal"]);
+        let fired = |chord: &str, at: &[gpui::KeyContext]| {
+            let typed = gpui::Keystroke::parse(chord).unwrap();
+            keymap.bindings_for_input(&[typed], at).0.first().map(|b| b.action().name().to_string())
+        };
+        let mut met = 0;
+        for chord in &text {
+            let Some((action, _)) = eff.iter().find(|(_, k)| k == chord) else { continue };
+            met += 1;
+            let wanted = if GLOBAL_IN_TEXT.contains(&action.as_str()) || OVER_THE_EDITOR.contains(&action.as_str()) { format!("shepherd::{action}") } else { "input::SelectToStart".into() };
+            assert_eq!(fired(chord, &editor).as_deref(), Some(wanted.as_str()), "{chord} ({action}) in the editor");
+            assert_eq!(fired(chord, &pane).as_deref(), Some(format!("shepherd::{action}").as_str()), "{chord} ({action}) in a pane");
+        }
+        assert!(met >= 2, "the defaults meet the editor's chords: {met}");
+        #[cfg(target_os = "macos")]
+        assert_eq!(fired("cmd-shift-up", &editor).as_deref(), Some("input::SelectToStart"), "not the previous workspace");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn editor_chords_never_fire_in_a_pane() {
+        let eff = effective(&user(&[]));
+        let pane = stack(&["Terminal"]);
+        for key in ["s", "z", "y", "a", "c", "v", "x"] {
+            let typed = normalize(&format!("ctrl-{key}")).unwrap();
+            for (chord, context, action) in placed(&eff, &text_chords_here()) {
+                if chord != typed {
+                    continue;
+                }
+                let context = context.unwrap_or_else(|| panic!("ctrl-{key} ({action}) is bound everywhere"));
+                assert!(gpui::KeyBindingContextPredicate::parse(context).unwrap().depth_of(&pane).is_none(), "ctrl-{key} reaches a pane");
+            }
+        }
+        assert_eq!(chord(&eff, "SaveFile"), normalize("ctrl-s").as_deref());
+        // the panes' own chords stay theirs: none of the editor's takes Ctrl+Shift+C, V, F or G
+        for key in ["c", "v", "f", "g"] {
+            let taken = normalize(&format!("ctrl-shift-{key}")).unwrap();
+            assert!(!eff.iter().any(|(_, k)| *k == taken));
+        }
+    }
+
+    #[test]
+    fn the_global_chords_still_work_in_the_editor() {
+        // bound everywhere, so an editor without a binding of its own for them hears them too
+        let text = text_chords_here();
+        for action in ["ClosePane", "CloseTab", "ToggleSidebar", "CommandPanel", "NewTab", "NextTab", "PreviousTab"] {
+            let keys = chord(&effective(&user(&[])), action).unwrap().to_string();
+            assert_eq!(contexts(action, &keys, &text), [None], "{action}");
+        }
     }
 
     /// Whether a keystroke typed as GPUI's Linux backend reports it (`keystroke_from_xkb`) fires `chord`.
