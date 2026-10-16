@@ -36,8 +36,9 @@ tar -xzf Shepherd-<version>-linux-<arch>.tar.gz -C ~/.local   # anywhere else: b
 ```
 
 It draws with Vulkan, so it needs a Vulkan driver (`mesa-vulkan-drivers`, which the packages recommend). There's no
-Dock badge, Secure Keyboard Entry or self-update on Linux; settings live in `~/.config/shepherd`. A click on a
-notification requests activation for the window; compositors may grant it or mark the window for attention. The
+Dock badge, Secure Keyboard Entry or self-update on Linux; settings live in `~/.config/shepherd`. A release build made
+with `SHEPHERD_UPDATE_CHECK` set says when a new version is out and opens its page; other builds never check. A click
+on a notification requests activation for the window; compositors may grant it or mark the window for attention. The
 notification sound is the freedesktop sound theme's, played by `canberra-gtk-play`, or `paplay` where that is missing.
 Settings → Appearance can make the window translucent (whether it is blurred depends on your compositor), or hide its
 own buttons when the window manager provides its own controls or tiles windows. A right-click on the titlebar opens

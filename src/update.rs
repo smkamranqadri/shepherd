@@ -1,7 +1,9 @@
 //! Updating Shepherd.app from its GitHub releases (Collie's updater): the latest release from GitHub's API, its
 //! `Shepherd-<V>-universal.zip` downloaded and unpacked next to the running app, checked to be signed by the
 //! running app's team, swapped in, then a relaunch. Checked at launch and every few hours; the sidebar offers
-//! what it finds (Zeron's update strip), Settings → About checks by hand.
+//! what it finds (Zeron's update strip), Settings → About checks by hand. Off macOS, where there is no signature to
+//! check a download against, a release build made with `SHEPHERD_UPDATE_CHECK` set only tells: the offer opens the
+//! release's page, and installing is up to the user; other builds never check.
 use anyhow::{Context as _, bail};
 use futures::StreamExt;
 use gpui::{App, AppContext as _, Global};
@@ -47,7 +49,7 @@ impl Updates {
     /// The line under "Shepherd <version>" in Settings → About.
     pub fn line(&self) -> String {
         match self {
-            Updates::Unknown => "A herdr client for macOS".into(),
+            Updates::Unknown => if cfg!(target_os = "macos") { "A herdr client for macOS" } else { "A herdr client" }.into(),
             Updates::Checking => "Checking for updates…".into(),
             Updates::UpToDate => "Up to date".into(),
             Updates::Available(r) => format!("Shepherd {} is available", r.version),
@@ -64,7 +66,8 @@ impl Updates {
     /// The sidebar strip: its label and the release a click installs. `None` while there is nothing to offer.
     pub fn strip(&self) -> Option<(String, Option<Release>)> {
         match self {
-            Updates::Available(r) => Some((format!("Update to v{}", r.version), Some(r.clone()))),
+            Updates::Available(r) if INSTALLS => Some((format!("Update to v{}", r.version), Some(r.clone()))),
+            Updates::Available(r) => Some((format!("Shepherd v{} is out", r.version), Some(r.clone()))),
             Updates::Downloading { version, percent } => Some((format!("Downloading v{version}… {percent}%"), None)),
             Updates::Installing => Some(("Installing, Shepherd restarts…".into(), None)),
             Updates::Failed(why, Some(r)) => Some((format!("Update failed: {why}"), Some(r.clone()))),
@@ -89,10 +92,26 @@ fn bundle_of(exe: &Path) -> Option<PathBuf> {
     (app.extension()? == "app").then(|| app.to_path_buf())
 }
 
-/// Sets up the state and, in an app bundle, checks now and every few hours.
+/// Whether this build installs updates itself: a macOS app bundle. Elsewhere an offer opens the release's page.
+pub const INSTALLS: bool = cfg!(target_os = "macos");
+
+/// Off macOS, whether this build tells of new releases: only a release build made with `SHEPHERD_UPDATE_CHECK` set
+/// (as release CI would), so a build from source or a distribution's package never asks GitHub.
+const NOTICE: bool = option_env!("SHEPHERD_UPDATE_CHECK").is_some() && !cfg!(debug_assertions);
+
+/// Whether this build looks for updates: a release build in an app bundle on macOS; elsewhere one built to
+/// ([`NOTICE`]).
+pub fn checks() -> bool {
+    if INSTALLS { app_bundle().is_some() } else { NOTICE }
+}
+
+/// Where a release's page must be, to be opened: this repository's releases on GitHub.
+const RELEASES: &str = "https://github.com/freethinkel/shepherd/releases/";
+
+/// Sets up the state and, where [`checks`], checks now and every few hours.
 pub fn start(cx: &mut App) {
     cx.set_global(Updates::default());
-    if app_bundle().is_none() {
+    if !checks() {
         return;
     }
     cx.spawn(async move |cx| {
@@ -129,8 +148,15 @@ pub fn check(cx: &mut App, quiet: bool) {
     .detach();
 }
 
-/// Downloads `release`, swaps the app for it and relaunches.
+/// Downloads `release`, swaps the app for it and relaunches; where Shepherd does not install, opens its page.
 pub fn install(release: Release, cx: &mut App) {
+    if !INSTALLS {
+        // `release_page` only offers this repository's pages
+        if release.url.starts_with(RELEASES) {
+            cx.open_url(&release.url);
+        }
+        return;
+    }
     let Some(app) = app_bundle() else { return };
     if Updates::of(cx).busy() {
         return;
@@ -189,7 +215,18 @@ fn latest() -> anyhow::Result<Release> {
         .body_mut()
         .read_to_string()?;
     let json: serde_json::Value = serde_json::from_str(&body)?;
+    if !INSTALLS {
+        return release_page(&json).context("the latest release has no version tag or no page in this repository");
+    }
     release_of(&json).with_context(|| format!("the latest release has no universal or {ARCH} Shepherd zip"))
+}
+
+/// A release from GitHub's JSON as an offer to read about: `v0.2.0` and its page.
+/// None when the page is not under [`RELEASES`].
+fn release_page(json: &serde_json::Value) -> Option<Release> {
+    let version = json["tag_name"].as_str()?.strip_prefix('v')?.to_string();
+    let url = json["html_url"].as_str().filter(|u| u.starts_with(RELEASES))?;
+    Some(Release { url: url.into(), size: 0, version })
 }
 
 /// A release from GitHub's JSON: `v0.2.0` with `Shepherd-0.2.0-universal.zip` (or, from before universal builds,
@@ -318,6 +355,13 @@ mod tests {
             ],
         });
         assert_eq!(release_of(&json), Some(Release { version: "0.2.0".into(), url: "https://x/zip".into(), size: 7 }));
+        let url = "https://github.com/freethinkel/shepherd/releases/tag/v1.3.0";
+        let page = serde_json::json!({ "tag_name": "v1.3.0", "html_url": url, "assets": [] });
+        assert_eq!(release_page(&page), Some(Release { version: "1.3.0".into(), url: url.into(), size: 0 }));
+        assert_eq!(release_page(&serde_json::json!({ "tag_name": "nightly", "html_url": url })), None);
+        for elsewhere in ["https://github.com/o/r/releases/tag/v1.3.0", "http://github.com/freethinkel/shepherd/releases/", "https://evil.example/https://github.com/freethinkel/shepherd/releases/"] {
+            assert_eq!(release_page(&serde_json::json!({ "tag_name": "v1.3.0", "html_url": elsewhere })), None, "{elsewhere}");
+        }
         assert_eq!(release_of(&serde_json::json!({ "tag_name": "v0.2.0", "assets": [] })), None);
         // A universal zip runs on every Mac and wins over an arch's.
         let json = serde_json::json!({
