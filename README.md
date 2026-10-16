@@ -65,6 +65,7 @@ Shepherd needs macOS 14 or later (or Linux) and herdr. It talks to the herdr ser
 | `⌘K`, `⇧⌘A` | Command panel, agents panel |
 | `⌘=`, `⌘-`, `⌘0` | Text size up, down, default |
 | `⌘,` | Settings |
+| `⌘/` | Keyboard shortcuts: every action and its keys, searchable by either (`Ctrl+Shift+/` on Linux) |
 
 Every binding can be changed in Settings.
 

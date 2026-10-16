@@ -57,6 +57,7 @@ app_actions! {
     CommandPanel: "Command panel",
     AgentsPanel: "Agents",
     WorkspacesPanel: "Workspaces",
+    ShowShortcuts: "Keyboard shortcuts",
     Quit: "Quit",
 }
 
@@ -100,6 +101,7 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("CommandPanel", "cmd-shift-p"),
     ("AgentsPanel", "cmd-shift-a"),
     ("Quit", "cmd-q"),
+    ("ShowShortcuts", "cmd-/"),
 ];
 
 /// Off macOS: Ghostty's Linux defaults where it has one. A terminal's Ctrl+letter belongs to the shell, so the app's
@@ -143,6 +145,8 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("CommandPanel", "ctrl-shift-p"),
     ("AgentsPanel", "ctrl-shift-a"),
     ("Quit", "ctrl-shift-q"),
+    // Ctrl+Shift+/ as a US layout reports it: the shifted key, without shift. Ctrl+/ stays the terminal's.
+    ("ShowShortcuts", "ctrl-?"),
 ];
 
 fn known(action: &str) -> bool {
@@ -244,6 +248,7 @@ fn menus(secure_input: bool) -> Vec<gpui::Menu> {
             I::action("Command Panel", CommandPanel),
             I::action("Agents", AgentsPanel),
             I::action("Workspaces", WorkspacesPanel),
+            I::action("Keyboard Shortcuts", ShowShortcuts),
             I::separator(),
             I::action("Enter Full Screen", ToggleFullScreen),
         ]),
@@ -557,6 +562,42 @@ mod tests {
         assert_eq!(chord(&eff, "NextSession"), normalize("ctrl-shift-alt-pagedown").as_deref());
         assert_eq!(chord(&eff, "PreviousSession"), normalize("ctrl-shift-alt-pageup").as_deref());
         assert_eq!(chord(&eff, "NextWorkspace"), normalize("ctrl-shift-pagedown").as_deref());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_shortcuts_panel_is_on_cmd_slash() {
+        assert_eq!(chord(&effective(&user(&[])), "ShowShortcuts"), Some("cmd-/"));
+    }
+
+    /// What gpui_linux's `keystroke_from_xkb` makes of a key on a US layout: the keysym's name (`question` for
+    /// Shift+/), shift dropped for a symbol, and the char typed unless it is a control code (Ctrl+/ types 0x1f).
+    #[cfg(not(target_os = "macos"))]
+    fn from_xkb(key: &str, shift: bool, key_char: Option<&str>) -> Keystroke {
+        let modifiers = gpui::Modifiers { control: true, shift, ..Default::default() };
+        let symbol = key.chars().count() == 1 && key.to_lowercase() == key.to_uppercase();
+        Keystroke { modifiers: gpui::Modifiers { shift: shift && !symbol, ..modifiers }, key: key.into(), key_char: key_char.map(str::to_string) }
+    }
+
+    /// The actions a typed keystroke fires with no user chords, as GPUI matches it against the bindings.
+    #[cfg(not(target_os = "macos"))]
+    fn fired(typed: &Keystroke) -> Vec<String> {
+        effective(&user(&[]))
+            .into_iter()
+            .filter(|(_, chord)| typed.should_match(&gpui::KeybindingKeystroke::from_keystroke(Keystroke::parse(chord).unwrap())))
+            .map(|(action, _)| action)
+            .collect()
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn ctrl_shift_slash_opens_the_shortcuts_and_ctrl_slash_stays_the_terminal_s() {
+        let ctrl_shift_slash = from_xkb("?", true, Some("?"));
+        assert_eq!(ctrl_shift_slash.unparse(), "ctrl-?", "as Settings records it too");
+        assert_eq!(fired(&ctrl_shift_slash), ["ShowShortcuts"]);
+        assert!(fired(&from_xkb("/", false, None)).is_empty(), "Ctrl+/ goes to the pane");
+        // Ctrl+Shift+1 arrives the same way, as ctrl-!
+        assert_eq!(from_xkb("!", true, Some("!")).unparse(), "ctrl-!");
     }
 
     #[test]

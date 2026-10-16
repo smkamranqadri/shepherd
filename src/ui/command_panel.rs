@@ -1,6 +1,6 @@
 //! The command panel (cmd-k, Zeron's command palette): every app action with its chord, then every workspace
 //! and tab of the snapshot, filtered as you type. The agents panel is the same list over the agents.
-use crate::bindings::{ACTIONS, ActiveBindings};
+use crate::bindings::{ACTIONS, ActiveBindings, normalize};
 use crate::model::{AgentSort, AgentStatus, Since, Snapshot, ago, waiting_since};
 use crate::theme::Theme;
 use crate::ui::Popup;
@@ -18,6 +18,8 @@ pub enum Run {
     Action(&'static str),
     /// Show this tab.
     Tab(String),
+    /// Settings' Shortcuts page, recording a new chord for this action.
+    EditKeys(&'static str),
     /// Check out this branch in the shown pane's repo.
     Branch(String),
     /// A herdr plugin's action.
@@ -43,6 +45,7 @@ pub enum Section {
     Themes,
     Worktrees,
     Places,
+    Shortcuts,
 }
 
 impl Section {
@@ -57,6 +60,7 @@ impl Section {
             Section::Themes => "Themes",
             Section::Worktrees => "Worktrees",
             Section::Places => "Sessions",
+            Section::Shortcuts => "Shortcuts",
         }
     }
 }
@@ -72,8 +76,8 @@ pub struct Item {
     pub label: String,
     /// Faint text on the right: the workspace of a tab or agent.
     pub hint: Option<String>,
-    /// An action's chord in GPUI's spelling, drawn as key caps.
-    pub chord: Option<String>,
+    /// An action's chords in GPUI's spelling, each drawn as key caps.
+    pub chords: Vec<String>,
     /// The sidebar's status dot, for agents and for tabs and workspaces with an agent at work.
     pub status: Option<AgentStatus>,
     pub run: Run,
@@ -83,13 +87,91 @@ impl Item {
     /// What the query matches: an action's label, else the label, its workspace and its section. The label
     /// comes first so match positions below its length are in the label.
     fn haystack(&self) -> String {
+        if self.section == Section::Shortcuts {
+            // the label, then each chord's words: "ctrl shift t"
+            return std::iter::once(self.label.clone()).chain(self.chords.iter().map(|c| c.replace('-', " "))).collect::<Vec<_>>().join(" ");
+        }
         match self.run {
-            Run::Action(_) | Run::Branch(_) | Run::Herdr(_) | Run::Theme(_) => self.label.clone(),
+            Run::Action(_) | Run::EditKeys(_) | Run::Branch(_) | Run::Herdr(_) | Run::Theme(_) => self.label.clone(),
             // the branch, then its folder; the place, then where it is
             Run::Worktree { .. } | Run::Place(_) => [Some(self.label.as_str()), self.hint.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" "),
             Run::Tab(_) => [Some(self.label.as_str()), self.hint.as_deref(), Some(self.section.title())].into_iter().flatten().collect::<Vec<_>>().join(" "),
         }
     }
+
+    /// How well `query` matches the item; a shortcut also by its chords, in any order of their modifiers.
+    fn score(&self, query: &str) -> Option<i32> {
+        let text = score(query, &self.haystack());
+        match self.section {
+            Section::Shortcuts => text.max(self.chords.iter().filter_map(|c| chord_score(query, c)).max()),
+            _ => text,
+        }
+    }
+}
+
+/// The words of a chord in GPUI's spelling, each keystroke's modifiers by one name (ctrl, alt, shift, cmd, fn) then
+/// its key.
+fn chord_words(chord: &str) -> Vec<String> {
+    chord
+        .split_whitespace()
+        .filter_map(|k| Keystroke::parse(k).ok())
+        .flat_map(|k| {
+            let m = k.modifiers;
+            [(m.control, "ctrl"), (m.alt, "alt"), (m.shift, "shift"), (m.platform, "cmd"), (m.function, "fn")]
+                .into_iter()
+                .filter(|(on, _)| *on)
+                .map(|(_, name)| name.to_string())
+                .chain([k.key])
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A word typed for a modifier or key as `chord_words` names it: "control" is ctrl, "option" alt, "super" cmd.
+fn key_word(word: &str) -> String {
+    let word = word.to_lowercase();
+    match word.as_str() {
+        "control" | "⌃" => "ctrl",
+        "option" | "opt" | "⌥" => "alt",
+        "⇧" => "shift",
+        "command" | "super" | "win" | "meta" | "⌘" => "cmd",
+        "return" | "↵" => "enter",
+        "esc" => "escape",
+        "pgup" => "pageup",
+        "pgdn" => "pagedown",
+        _ => return word,
+    }
+    .to_string()
+}
+
+/// The symbol Shift makes of `key` on a US layout, which is the key a chord with Shift and it is bound and shown as
+/// (Ctrl+Shift+/ is `ctrl-?`).
+fn shifted(key: &str) -> Option<&'static str> {
+    let at = "`1234567890-=[]\\;',./".find(key).filter(|_| key.len() == 1)?;
+    "~!@#$%^&*()_+{}|:\"<>?".get(at..at + 1)
+}
+
+/// How well `query` names `chord`: every word of it one of the chord's (modifiers in any order, Shift with a key
+/// taken as the symbol it makes), better still all of them. Only a query with a modifier in it names a chord.
+fn chord_score(query: &str, chord: &str) -> Option<i32> {
+    const MODIFIERS: [&str; 5] = ["ctrl", "alt", "shift", "cmd", "fn"];
+    let mut words: Vec<String> = query.split(|c: char| c.is_whitespace() || c == '+').filter(|w| !w.is_empty()).map(key_word).collect();
+    // "ctrl-shift-t" typed as GPUI spells it
+    if words.len() == 1 && words[0].len() > 1 && let Some(spelled) = normalize(&words[0]).filter(|n| n.contains('-')) {
+        words = chord_words(&spelled);
+    }
+    if !words.iter().any(|w| MODIFIERS.contains(&w.as_str())) {
+        return None;
+    }
+    let have = chord_words(chord);
+    let named = |words: &[String]| words.iter().all(|w| have.contains(w)).then_some(if words.len() == have.len() { 3500 } else { 2500 });
+    named(&words).or_else(|| {
+        let key = words.iter().position(|w| shifted(w).is_some())?;
+        let mut words = words.clone();
+        words[key] = shifted(&words[key])?.to_string();
+        words.retain(|w| w != "shift");
+        named(&words)
+    })
 }
 
 /// Which list a panel shows.
@@ -102,6 +184,7 @@ pub enum Kind {
     Themes,
     Worktrees,
     Places,
+    Shortcuts,
 }
 
 impl Kind {
@@ -114,6 +197,7 @@ impl Kind {
             Kind::Worktrees => "", // opened from a workspace's menu, no chord
             Kind::Themes => "ChangeTheme",
             Kind::Places => "SwitchSession",
+            Kind::Shortcuts => "ShowShortcuts",
         }
     }
 }
@@ -151,6 +235,8 @@ fn action_icon(name: &str) -> &'static str {
         "OpenSettings" => "icons/settings.svg",
         "ChangeTheme" => "icons/sun.svg",
         "ToggleSecureInput" => "icons/keyboard.svg",
+        "ShowShortcuts" => "icons/solar/keyboard.svg",
+        "CommandPanel" => "icons/palette-search.svg",
         "AgentsPanel" => "icons/bot.svg",
         "WorkspacesPanel" => "icons/folder.svg",
         "Quit" => "icons/logout-2.svg",
@@ -205,7 +291,7 @@ pub fn workspace_items(snapshot: Option<&Snapshot>) -> Vec<Item> {
                 label: w.label.clone(),
                 mark: None,
                 hint: None,
-                chord: None,
+                chords: Vec::new(),
                 status: busy(w.agent_status),
                 run: Run::Tab(tab),
             })
@@ -225,7 +311,7 @@ pub fn items(snapshot: Option<&Snapshot>, bindings: &[(String, String)], plugin_
             mark: None,
             label: label.to_string(),
             hint: None,
-            chord: bindings.iter().find(|(action, _)| action == name).map(|(_, keys)| keys.clone()),
+            chords: bindings.iter().find(|(action, _)| action == name).map(|(_, keys)| keys.clone()).into_iter().collect(),
             status: None,
             run: Run::Action(name),
         })
@@ -237,7 +323,7 @@ pub fn items(snapshot: Option<&Snapshot>, bindings: &[(String, String)], plugin_
         mark: None,
         label: title.clone(),
         hint: None,
-        chord: None,
+        chords: Vec::new(),
         status: None,
         run: Run::Herdr(crate::herdr::keys::HerdrCommand { kind: crate::herdr::keys::CommandKind::PluginAction, command: id.clone(), keys: Vec::new() }),
     }));
@@ -252,13 +338,33 @@ pub fn items(snapshot: Option<&Snapshot>, bindings: &[(String, String)], plugin_
                 mark: None,
                 label: short_tab_label(&t.label).to_string(),
                 hint: Some(w.label.clone()),
-                chord: None,
+                chords: Vec::new(),
                 status: busy(t.agent_status),
                 run: Run::Tab(t.tab_id.clone()),
             });
         }
     }
     out
+}
+
+/// Every action but the panel's own with all its chords as `bindings` has them (the user's applied; none for an
+/// unbound one), in Settings' order.
+pub fn shortcut_items(bindings: &[(String, String)]) -> Vec<Item> {
+    ACTIONS
+        .iter()
+        .filter(|(name, _)| *name != "ShowShortcuts")
+        .map(|(name, label)| Item {
+            key: name.to_string(),
+            section: Section::Shortcuts,
+            icon: action_icon(name),
+            mark: None,
+            label: label.to_string(),
+            hint: None,
+            chords: bindings.iter().filter(|(action, _)| action == name).map(|(_, keys)| keys.clone()).collect(),
+            status: None,
+            run: Run::Action(name),
+        })
+        .collect()
 }
 
 /// How many recent items the empty command panel shows on top.
@@ -308,7 +414,7 @@ pub fn agent_items(snapshot: Option<&Snapshot>, sort: AgentSort, since: &Since) 
                     Some(at) => format!("{} · {}", ago(at.elapsed()), w.label),
                     None => w.label.clone(),
                 }),
-                chord: None,
+                chords: Vec::new(),
                 status: Some(p.agent_status),
                 run: Run::Tab(p.tab_id.clone()),
             }
@@ -329,7 +435,7 @@ pub fn branch_items(refs: &str, current: Option<&str>) -> Vec<Item> {
             mark: None,
             label: name.to_string(),
             hint: (Some(name) == current).then(|| "current".into()),
-            chord: None,
+            chords: Vec::new(),
             status: None,
             run: Run::Branch(name.to_string()),
         })
@@ -349,7 +455,7 @@ pub fn theme_items(variants: Vec<(String, String)>, dark: bool, current: &str) -
             mark: None,
             label: name,
             hint: (id == current).then(|| "current".into()),
-            chord: None,
+            chords: Vec::new(),
             status: None,
             run: Run::Theme(id),
         })
@@ -381,7 +487,7 @@ pub fn worktree_items(list: &serde_json::Value, repo: &str, home: &str) -> Vec<I
                     Some(state) => format!("{state} · {shown}"),
                     None => shown,
                 }),
-                chord: None,
+                chords: Vec::new(),
                 status: None,
                 run: Run::Worktree { repo: repo.to_string(), path, workspace_id },
             })
@@ -419,7 +525,7 @@ pub fn place_items(rows: Vec<PlaceRow>) -> Vec<Item> {
                 mark: row.icon,
                 label: row.name,
                 hint: Some(if row.shown { format!("current · {at}") } else { at }),
-                chord: None,
+                chords: Vec::new(),
                 status: None,
                 run: Run::Place(row.key),
             }
@@ -499,7 +605,7 @@ pub fn rank(query: &str, items: &[Item]) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter(|(_, item)| !(typing && item.section == Section::Recent))
-        .filter_map(|(i, item)| Some((i, score(query, &item.haystack())?)))
+        .filter_map(|(i, item)| Some((i, item.score(query)?)))
         .collect();
     hits.sort_by_key(|&(_, s)| std::cmp::Reverse(s));
     let mut sections: Vec<Section> = Vec::new();
@@ -578,7 +684,7 @@ impl Panel {
     pub fn new(kind: Kind, items: Vec<Item>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let items = match kind {
             Kind::Commands => with_recent(items, &crate::settings::SettingsGlobal::of(cx).settings.recent_commands),
-            Kind::Agents | Kind::Workspaces | Kind::Branches | Kind::Themes | Kind::Worktrees | Kind::Places => items,
+            Kind::Agents | Kind::Workspaces | Kind::Branches | Kind::Themes | Kind::Worktrees | Kind::Places | Kind::Shortcuts => items,
         };
         let theme = Theme::of(cx).clone();
         let placeholder = match kind {
@@ -589,6 +695,7 @@ impl Panel {
             Kind::Themes => "Change theme",
             Kind::Worktrees => "Open worktree",
             Kind::Places => "Switch session or machine",
+            Kind::Shortcuts => "Search actions or keys",
         };
         let input = cx.new(|cx| {
             let mut input = InputState::new(window, cx).placeholder(placeholder);
@@ -598,6 +705,7 @@ impl Panel {
         input.update(cx, |input, cx| input.focus(window, cx));
         let events = cx.subscribe_in(&input, window, |panel, _, event: &InputEvent, _, cx| match event {
             InputEvent::Change => panel.refilter(cx),
+            InputEvent::PressEnter { secondary: true, .. } if panel.kind == Kind::Shortcuts => panel.edit_keys(panel.selected, cx),
             InputEvent::PressEnter { .. } => panel.run(panel.selected, cx),
             _ => {}
         });
@@ -658,6 +766,13 @@ impl Panel {
         }
         cx.emit(PanelEvent::Run(item.run));
     }
+
+    /// The shortcuts panel's other way out: Settings, recording `row`'s action a new chord.
+    fn edit_keys(&mut self, row: usize, cx: &mut Context<Self>) {
+        if let Some(Run::Action(name)) = self.matches.get(row).map(|&i| self.items[i].run.clone()) {
+            cx.emit(PanelEvent::Run(Run::EditKeys(name)));
+        }
+    }
 }
 
 impl Render for Panel {
@@ -714,7 +829,10 @@ impl Render for Panel {
                     .child(div().flex_1().min_w_0().truncate().child(highlighted(&item.label, &self.query, &theme)))
                     .children(item.hint.clone().map(|hint| div().flex_none().max_w(px(160.)).truncate().text_size(px(12.)).text_color(theme.text_faint).child(hint)))
                     .children(item.status.map(|status| crate::shell::status_dot(status, &theme)))
-                    .children(item.chord.as_ref().map(|chord| div().flex().flex_none().gap(px(4.)).children(chord.split_whitespace().map(|k| kbd(&theme, glyphs(k))))))
+                    .children(item.chords.iter().map(|chord| div().flex().flex_none().gap(px(4.)).children(chord.split_whitespace().map(|k| kbd(&theme, glyphs(k))))))
+                    .when(item.section == Section::Shortcuts && item.chords.is_empty(), |el| {
+                        el.child(div().flex_none().px(px(5.)).text_size(px(11.)).text_color(theme.text_faint).child("—"))
+                    })
                     .into_any_element(),
             );
         }
@@ -742,6 +860,7 @@ impl Render for Panel {
                 Kind::Worktrees => ("No results", "Try a branch or a folder."),
                 Kind::Places if self.items.is_empty() => ("No sessions", "herdr's sessions and saved machines show up here."),
                 Kind::Places => ("No results", "Try a session's name, a machine's, or remote."),
+                Kind::Shortcuts => ("No results", "Try an action, or keys such as ctrl shift t."),
             };
             div().py(px(24.)).flex().flex_col().items_center().gap(px(6.)).child(title).child(div().text_color(theme.text_muted).child(hint))
         });
@@ -817,7 +936,16 @@ impl Render for Panel {
                     .border_t_1()
                     .border_color(theme.border)
                     .child(key_hint(&theme, &["↑", "↓"], "Navigate"))
-                    .child(key_hint(&theme, &["↵"], "Open"))
+                    .child(key_hint(&theme, &["↵"], if self.kind == Kind::Shortcuts { "Run" } else { "Open" }))
+                    .when(self.kind == Kind::Shortcuts, |el| {
+                        let edit = if cfg!(target_os = "macos") { "⌘↵" } else { "Ctrl+↵" };
+                        el.child(
+                            key_hint(&theme, &[edit], "Change keys")
+                                .id("edit-keys")
+                                .cursor_pointer()
+                                .on_click(cx.listener(|panel, _, _, cx| panel.edit_keys(panel.selected, cx))),
+                        )
+                    })
                     .child(key_hint(&theme, &["esc"], "Close")),
             )
     }
@@ -873,7 +1001,7 @@ mod tests {
 
     fn item(section: Section, label: &str) -> Item {
         let run = if section == Section::Commands { Run::Action("NewTab") } else { Run::Tab("t".into()) };
-        Item { key: label.into(), section, icon: "", mark: None, label: label.into(), hint: None, chord: None, status: None, run }
+        Item { key: label.into(), section, icon: "", mark: None, label: label.into(), hint: None, chords: Vec::new(), status: None, run }
     }
 
     #[test]
@@ -965,7 +1093,7 @@ mod tests {
         let tab = Item { hint: Some("shepherd".into()), ..item(Section::Tabs, "claude") };
         assert!(score("shep", &tab.haystack()).is_some());
         assert!(score("tabs", &tab.haystack()).is_some());
-        let action = Item { chord: Some("cmd-t".into()), ..item(Section::Commands, "New tab") };
+        let action = Item { chords: vec!["cmd-t".into()], ..item(Section::Commands, "New tab") };
         assert_eq!(score("cmd", &action.haystack()), None, "a chord is not searched");
     }
 
@@ -996,7 +1124,7 @@ mod tests {
         let bindings = vec![("NewTab".to_string(), "cmd-t".to_string()), ("CommandPanel".to_string(), "cmd-k".to_string())];
         let items = items(Some(&snapshot), &bindings, &[]);
         let new_tab = items.iter().find(|i| i.label == "New tab").unwrap();
-        assert_eq!((new_tab.chord.as_deref(), &new_tab.run), (Some("cmd-t"), &Run::Action("NewTab")));
+        assert_eq!((new_tab.chords.as_slice(), &new_tab.run), (["cmd-t".to_string()].as_slice(), &Run::Action("NewTab")));
         assert!(items.iter().all(|i| i.run != Run::Action("CommandPanel")), "the panel does not list itself");
         let rest: Vec<_> = items.iter().filter(|i| i.section != Section::Commands).map(|i| (i.label.as_str(), i.run.clone(), i.status)).collect();
         assert_eq!(
@@ -1032,6 +1160,59 @@ mod tests {
         assert_eq!(items[2].run, Run::Place("m".into()));
         assert_eq!(ranked("remote", &items), ["M"], "a machine is found by where it is");
         assert_eq!(ranked("box", &items), ["M"]);
+    }
+
+    fn shortcut(label: &str, chords: &[&str]) -> Item {
+        Item { section: Section::Shortcuts, chords: chords.iter().map(|c| c.to_string()).collect(), ..item(Section::Commands, label) }
+    }
+
+    #[test]
+    fn shortcuts_list_every_action_with_the_chords_in_force() {
+        let mut keys = std::collections::BTreeMap::new();
+        keys.insert("SplitRight".to_string(), "ctrl-alt-r".to_string());
+        keys.insert("ClosePane".to_string(), String::new());
+        let items = shortcut_items(&crate::bindings::effective(&keys));
+        assert_eq!(items.len(), ACTIONS.len() - 1, "every action but the panel's own");
+        assert!(items.iter().all(|i| i.run != Run::Action("ShowShortcuts")));
+        let of = |name: &'static str| items.iter().find(|i| i.run == Run::Action(name)).unwrap();
+        assert_eq!(of("SplitRight").chords, ["ctrl-alt-r"], "the user's chord, not the default");
+        assert!(of("ClosePane").chords.is_empty(), "unbound, drawn as —");
+        assert!(of("WorkspacesPanel").chords.is_empty(), "no default");
+        assert_eq!(of("FontSizeUp").chords.len(), 2, "both of its chords");
+        assert_eq!(of("NewTab").label, "New tab");
+        assert_eq!(of("NewTab").section, Section::Shortcuts);
+    }
+
+    #[test]
+    fn shortcuts_are_found_by_their_keys_in_any_order() {
+        let items = vec![
+            shortcut("Close tab", &["ctrl-alt-w"]),
+            shortcut("New tab", &["ctrl-shift-t"]),
+            shortcut("Next tab", &["ctrl-pagedown"]),
+            shortcut("Next session", &["ctrl-alt-shift-pagedown"]),
+            shortcut("Keyboard shortcuts", &["ctrl-?"]),
+            shortcut("Workspaces", &[]),
+        ];
+        assert_eq!(ranked("ctrl shift t", &items)[0], "New tab");
+        assert_eq!(ranked("shift+ctrl+t", &items)[0], "New tab");
+        assert_eq!(ranked("Control Shift T", &items)[0], "New tab");
+        assert_eq!(ranked("ctrl-shift-t", &items)[0], "New tab");
+        assert_eq!(ranked("ctrl shift alt pagedown", &items)[0], "Next session");
+        assert_eq!(ranked("ctrl pagedown", &items)[..2], ["Next tab", "Next session"], "the whole chord first");
+        assert_eq!(ranked("ctrl shift /", &items)[0], "Keyboard shortcuts", "Shift+/ is ?");
+        assert_eq!(ranked("new", &items)[0], "New tab", "and by name");
+        assert_eq!(chord_score("t", "ctrl-shift-t"), None, "a bare key names no chord");
+        assert_eq!(chord_score("cmd t", "ctrl-shift-t"), None);
+    }
+
+    #[test]
+    fn shifted_symbols_on_a_us_layout() {
+        assert_eq!(shifted("/"), Some("?"));
+        assert_eq!(shifted("1"), Some("!"));
+        assert_eq!(shifted("\\"), Some("|"));
+        assert_eq!(shifted("'"), Some("\""));
+        assert_eq!(shifted("t"), None);
+        assert_eq!(shifted("tab"), None);
     }
 
     #[test]

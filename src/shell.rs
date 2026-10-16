@@ -573,6 +573,17 @@ impl Shell {
         }
     }
 
+    /// Settings on its Shortcuts page, recording `action` a new chord: the shortcuts panel's way there.
+    fn open_shortcut_settings(&mut self, action: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_none() {
+            self.toggle_settings_here(window, cx);
+        }
+        if let Some((view, _)) = &self.settings {
+            window.focus(&view.focus_handle(cx), cx);
+            view.update(cx, |v, cx| v.show_shortcut(action, cx));
+        }
+    }
+
     /// cmd-k (commands) or the agents key: opens that panel over the window, or closes it when it is open.
     pub fn toggle_command_panel(&mut self, kind: crate::ui::command_panel::Kind, window: &mut Window, cx: &mut Context<Self>) {
         use crate::ui::command_panel::{Kind, PanelEvent, Run};
@@ -589,6 +600,7 @@ impl Shell {
                 self.refresh_plugin_actions(cx);
                 crate::ui::command_panel::items(self.snapshot.as_ref(), &bindings, &self.plugin_actions)
             }
+            Kind::Shortcuts => crate::ui::command_panel::shortcut_items(&cx.try_global::<ActiveBindings>().map(|b| b.0.clone()).unwrap_or_default()),
             Kind::Agents => crate::ui::command_panel::agent_items(self.snapshot.as_ref(), self.agent_sort, &self.since),
             Kind::Workspaces => crate::ui::command_panel::workspace_items(self.snapshot.as_ref()),
             Kind::Branches => match dir.as_deref() {
@@ -635,6 +647,7 @@ impl Shell {
                         window.dispatch_action(action, cx);
                     }
                 }
+                PanelEvent::Run(Run::EditKeys(action)) => this.open_shortcut_settings(action, window, cx),
                 PanelEvent::Run(Run::Herdr(command)) => {
                     window.focus(&this.focus, cx);
                     this.run_herdr_command(command, window, cx);
@@ -1525,6 +1538,7 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ChangeTheme, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Themes, w, cx)))
             .on_action(cx.listener(|this, _: &AgentsPanel, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Agents, w, cx)))
             .on_action(cx.listener(|this, _: &WorkspacesPanel, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Workspaces, w, cx)))
+            .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Shortcuts, w, cx)))
             .on_action(cx.listener(|this, c: &crate::herdr::keys::HerdrCommand, w, cx| this.run_herdr_command(c, w, cx)))
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, w, cx| {
                 this.drag_divider(e.position, cx);

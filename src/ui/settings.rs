@@ -137,6 +137,8 @@ pub struct SettingsView {
     integration_busy: Option<String>,
     /// The action whose chord the next keystroke becomes.
     recording: Option<&'static str>,
+    /// The page's scroll, so the shortcuts panel can bring an action's row into view.
+    body_scroll: gpui::ScrollHandle,
     ping: Option<String>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -176,6 +178,18 @@ pub fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) {
 }
 
 impl SettingsView {
+    /// Turns to the Shortcuts page with `action`'s chord recording, scrolled near its row.
+    pub fn show_shortcut(&mut self, action: &'static str, cx: &mut Context<Self>) {
+        self.section = Section::Shortcuts;
+        self.recording = ACTIONS.iter().find(|(name, _)| *name == action).map(|(name, _)| *name);
+        if let Some(row) = ACTIONS.iter().position(|(name, _)| *name == action) {
+            // ponytail: rows are a fixed 48 px (and a hairline) under the page's header; a few rows of context above
+            let y = (row as f32 * 49. - 3. * 49.).max(0.);
+            self.body_scroll.set_offset(gpui::point(px(0.), px(-y)));
+        }
+        cx.notify();
+    }
+
     /// Turns to the Usage page.
     pub fn show_usage(&mut self, cx: &mut Context<Self>) {
         self.section = Section::Usage;
@@ -314,6 +328,7 @@ impl SettingsView {
             integrations: None,
             integration_busy: None,
             recording: None,
+            body_scroll: gpui::ScrollHandle::new(),
             ping: None,
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -1465,7 +1480,7 @@ impl Render for SettingsView {
             }))
             .child(nav)
             .child(
-                div().id("settings-body").flex_1().min_w_0().h_full().overflow_y_scroll().child(
+                div().id("settings-body").flex_1().min_w_0().h_full().overflow_y_scroll().track_scroll(&self.body_scroll).child(
                     div()
                         .w_full()
                         .max_w(px(PAGE_MAX_WIDTH))
