@@ -1363,7 +1363,7 @@ pub fn choose_opener(
         None => match (has_pane, env_editor.map(str::trim).filter(|e| !e.is_empty()), installed("nvim")) {
             // a GUI editor in $VISUAL (`code --wait`) gets its own window, not a pane running it
             (_, Some(e), _) if is_gui_editor(e) => Opener::Gui(editor_argv_with(&e.split_whitespace().map(String::from).collect::<Vec<_>>(), &target, installed)),
-            // anything else is taken to want a terminal (omarchy-launch-editor --inline is a script)
+            // anything else is taken to want a terminal (a wrapper script that runs one, say)
             (true, Some(e), _) => Opener::Split(e.to_string()),
             (true, None, Some(_)) => Opener::Split("nvim".into()),
             _ => fallback(),
@@ -1481,8 +1481,8 @@ pub fn terminal_command(editor: &str, path: &Path, line: Option<u32>, col: Optio
         Some(l) if matches!(program, "vim" | "vi" | "nano" | "micro" | "emacs" | "emacsclient" | "kak" | "vis") => {
             format!("exec {editor} +{l} {}", quote(&path.display().to_string()))
         }
-        // omarchy-launch-editor forwards its arguments to whichever editor Omarchy's defaults name, which may not
-        // take `+line`; fresh's syntax is unknown: the file alone
+        // a wrapper script forwards its arguments to an editor that may not take `+line`; fresh's syntax is
+        // unknown: the file alone
         _ => format!("exec {editor} {}", quote(&path.display().to_string())),
     }
 }
@@ -1498,15 +1498,14 @@ pub fn is_gui_editor(editor: &str) -> bool {
     gui || words.any(|w| matches!(w, "-w" | "--wait"))
 }
 
-/// Whether the editor command runs in a terminal (vim, nvim, nano, micro, Helix, Kakoune, `emacs -nw`,
-/// `omarchy-launch-editor --inline`...), so it opens in a pane instead of a window of its own.
+/// Whether the editor command runs in a terminal (vim, nvim, nano, micro, Helix, Kakoune, `emacs -nw`...), so it
+/// opens in a pane instead of a window of its own.
 pub fn is_terminal_editor(editor: &str) -> bool {
     let mut words = editor.split_whitespace();
     match words.next().and_then(|w| w.rsplit('/').next()) {
         Some("vim" | "vi" | "nvim" | "lvim" | "nano" | "micro" | "hx" | "helix" | "kak" | "vis" | "fresh") => true,
         Some("emacs") => words.any(|w| matches!(w, "-nw" | "--no-window-system")),
         Some("emacsclient") => words.any(|w| matches!(w, "-t" | "-nw" | "--tty")),
-        Some("omarchy-launch-editor") => words.any(|w| w == "--inline"),
         _ => false,
     }
 }
@@ -1818,7 +1817,7 @@ mod tests {
         let all = has(&["nvim", "code"]);
         // $VISUAL/$EDITOR first, in the split, even with nvim installed
         assert_eq!(pick(None, Some("hx"), true, false, &all), Opener::Split("hx".into()));
-        assert_eq!(pick(None, Some("omarchy-launch-editor --inline"), true, false, &has(&["code"])), Opener::Split("omarchy-launch-editor --inline".into()));
+        assert_eq!(pick(None, Some("edit-wrapper --inline"), true, false, &has(&["code"])), Opener::Split("edit-wrapper --inline".into()));
         // neither set: nvim in the split, else VS Code, else nothing (no xdg-open: it runs nvim.desktop with no
         // terminal)
         assert_eq!(pick(None, Some(" "), true, false, &all), Opener::Split("nvim".into()));
@@ -1850,11 +1849,11 @@ mod tests {
         assert!(is_terminal_editor(" vim -u NONE"));
         assert!(!is_terminal_editor("gvim"));
         assert!(!is_terminal_editor(""));
-        for e in ["kak", "vis", "lvim", "fresh", "emacsclient -t", "emacsclient --tty", "omarchy-launch-editor --inline"] {
+        for e in ["kak", "vis", "lvim", "fresh", "emacsclient -t", "emacsclient --tty"] {
             assert!(is_terminal_editor(e), "{e}");
         }
         assert!(!is_terminal_editor("emacsclient -c"));
-        assert!(!is_terminal_editor("omarchy-launch-editor"));
+        assert!(!is_terminal_editor("edit-wrapper"), "unknown: not taken for a terminal editor");
     }
 
     #[test]
@@ -1865,7 +1864,7 @@ mod tests {
         assert_eq!(pick("zed"), Opener::Gui(vec!["/usr/bin/zed".into(), "/tmp/a.rs:3".into()]));
         assert_eq!(pick("myeditor -w"), Opener::Gui(vec!["myeditor".into(), "-w".into(), "/tmp/a.rs:3".into()]));
         // unknown editors stay in the split: they may be scripts needing a terminal
-        assert_eq!(pick("omarchy-launch-editor --inline"), Opener::Split("omarchy-launch-editor --inline".into()));
+        assert_eq!(pick("edit-wrapper --inline"), Opener::Split("edit-wrapper --inline".into()));
         assert_eq!(pick("myeditor"), Opener::Split("myeditor".into()));
     }
 
@@ -1878,7 +1877,7 @@ mod tests {
         assert_eq!(terminal_command("kak", Path::new("/tmp/a"), Some(3), None), "exec kak +3 '/tmp/a'");
         assert_eq!(terminal_command("emacsclient -t", Path::new("/tmp/a"), Some(3), None), "exec emacsclient -t +3 '/tmp/a'");
         assert_eq!(terminal_command("lvim", Path::new("/tmp/a"), None, None), "exec lvim '/tmp/a'");
-        assert_eq!(terminal_command("omarchy-launch-editor --inline", Path::new("/tmp/a"), Some(3), None), "exec omarchy-launch-editor --inline '/tmp/a'");
+        assert_eq!(terminal_command("edit-wrapper --inline", Path::new("/tmp/a"), Some(3), None), "exec edit-wrapper --inline '/tmp/a'");
         assert_eq!(terminal_command("/usr/bin/nvim", Path::new("/tmp/a"), Some(3), None), "exec /usr/bin/nvim +3 '/tmp/a'");
     }
 
