@@ -77,6 +77,9 @@ impl Shell {
         match tab {
             PanelTab::Pr if !self.panel_has_pr => {}
             PanelTab::Pr if shown => self.close_panel(window, cx),
+            // Search again while its query has the keyboard closes the panel; from its results, or anywhere else,
+            // it goes to the query
+            PanelTab::Search if shown && !self.side_panel.read(cx).query_focused(window, cx) => self.open_panel_tab(tab, window, cx),
             _ if shown && self.side_panel_focused(window, cx) => self.close_panel(window, cx),
             _ => self.open_panel_tab(tab, window, cx),
         }
@@ -89,7 +92,13 @@ impl Shell {
             save_from_sidebar(cx, |s| s.panel_open = true);
         }
         self.pick_panel_tab(tab, cx);
-        if tab != PanelTab::Pr && !self.side_panel_focused(window, cx) {
+        if tab == PanelTab::Search {
+            if !self.side_panel_focused(window, cx) {
+                self.focused = self.active_pane(window, cx);
+            }
+            // its query, its text selected to type over
+            self.side_panel.update(cx, |p, cx| p.focus_search(window, cx));
+        } else if tab != PanelTab::Pr && !self.side_panel_focused(window, cx) {
             // herdr's focused pane counts as focused already, so the next render does not take the keyboard back
             // for it (as after the command panel, which ran this, closes)
             self.focused = self.active_pane(window, cx);

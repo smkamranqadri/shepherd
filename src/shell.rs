@@ -145,6 +145,9 @@ pub struct Shell {
     next_tab_id: u64,
     /// Files' real paths, as file tabs are kept by (`file_tabs::real_path`), for the run.
     real_paths: HashMap<std::path::PathBuf, std::path::PathBuf>,
+    /// Numbers each file open: a preview whose real path came back after a later open began is dropped, so
+    /// previews land in the order they were asked for.
+    open_seq: u64,
     /// Each workspace's root as last seen by its file tabs: when it moves, clean tabs outside it close.
     tab_roots: HashMap<String, String>,
     /// The pinned file tabs kept for the next run.
@@ -451,6 +454,11 @@ impl Shell {
                 });
                 let tab = SettingsGlobal::of(cx).settings.panel_tab;
                 let side_panel = cx.new(|cx| crate::ui::side_panel::SidePanel::new(rt.clone(), tab, cx));
+                // a search looks in the file tabs' unsaved buffers; asked from the panel's own timer, never while the
+                // Shell is being updated
+                let shell = cx.entity().downgrade();
+                let unsaved: crate::ui::side_panel::UnsavedBuffers = Box::new(move |cx: &App| shell.upgrade().map(|s| s.read(cx).unsaved_buffers(cx)).unwrap_or_default());
+                side_panel.update(cx, |p, _| p.set_unsaved_buffers(unsaved));
                 cx.subscribe_in(&side_panel, window, |s: &mut Shell, _, event: &crate::ui::side_panel::SidePanelEvent, window, cx| match event {
                     crate::ui::side_panel::SidePanelEvent::Dismiss => s.focus_pane(window, cx),
                     crate::ui::side_panel::SidePanelEvent::ChooseRoot => s.choose_root(window, cx),
@@ -459,6 +467,8 @@ impl Shell {
                     crate::ui::side_panel::SidePanelEvent::OpenInEditor(path) => s.open_in_editor_from_panel(path.clone(), window, cx),
                     // its diff in a tab; a conflict's file, with its markers
                     crate::ui::side_panel::SidePanelEvent::OpenChange { path, change, preview } => s.open_change(path.clone(), change.clone(), *preview, window, cx),
+                    // a search match: its file at the match, selected
+                    crate::ui::side_panel::SidePanelEvent::OpenMatch { path, line, cols, preview } => s.open_match(path.clone(), *line, cols.clone(), *preview, window, cx),
                     // the badge is in the Shell's tab strip
                     crate::ui::side_panel::SidePanelEvent::ChangesCounted => cx.notify(),
                     crate::ui::side_panel::SidePanelEvent::ChangesPolled => {
@@ -523,6 +533,7 @@ impl Shell {
                     view_drawn: None,
                     next_tab_id: 0,
                     real_paths: HashMap::new(),
+                    open_seq: 0,
                     tab_roots: HashMap::new(),
                     kept_tabs: Default::default(),
                     tab_places: HashMap::new(),

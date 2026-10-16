@@ -52,6 +52,14 @@ fn real_path(rt: &tokio::runtime::Handle, path: PathBuf) -> impl std::future::Fu
     async move { job.await.unwrap_or(fallback) }
 }
 
+/// Where an opened file goes past its line, once it is in.
+enum Jump {
+    /// A markdown link's `#heading`.
+    Fragment(String),
+    /// A search match: its line and its bytes in the line, selected.
+    Select(u32, std::ops::Range<usize>),
+}
+
 /// A file tab's view: a file's editor, or a change's diff.
 #[derive(Clone)]
 pub(super) enum TabView {
@@ -242,11 +250,19 @@ impl Shell {
         self.open_file_at(path, line, None, preview, window, cx);
     }
 
-    /// `open_file`, going to `fragment` (a markdown link's `#heading`) once the file is in.
-    fn open_file_at(&mut self, path: PathBuf, line: Option<u32>, fragment: Option<String>, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// A search match: `open_file` at its line, its bytes `cols` of the line selected once the file is in. A
+    /// preview leaves the keyboard in the results.
+    pub(super) fn open_match(&mut self, path: PathBuf, line: u32, cols: std::ops::Range<usize>, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_file_at(path, Some(line), Some(Jump::Select(line, cols)), preview, window, cx);
+    }
+
+    /// `open_file`, going on to `jump` (a markdown link's `#heading`, a search match) once the file is in.
+    fn open_file_at(&mut self, path: PathBuf, line: Option<u32>, jump: Option<Jump>, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(key) = self.shown_tabs_key() else { return };
+        self.open_seq += 1;
+        let seq = self.open_seq;
         if let Some(real) = self.real_paths.get(&path).cloned() {
-            return self.open_real(key, real, line, fragment, preview, window, cx);
+            return self.open_real(key, real, line, jump, preview, window, cx);
         }
         let real = real_path(&self.rt, path.clone());
         cx.spawn_in(window, async move |this, cx| {
@@ -256,9 +272,11 @@ impl Shell {
                     s.real_paths.clear();
                 }
                 s.real_paths.insert(path, real.clone());
-                // another workspace or place shown meanwhile: the file is not opened into that one
-                if s.shown_tabs_key().as_deref() == Some(key.as_str()) {
-                    s.open_real(key, real, line, fragment, preview, window, cx);
+                // another workspace or place shown meanwhile: the file is not opened into that one; nor a preview
+                // another open has come after (it would replace that one's)
+                let superseded = preview && s.open_seq != seq;
+                if s.shown_tabs_key().as_deref() == Some(key.as_str()) && !superseded {
+                    s.open_real(key, real, line, jump, preview, window, cx);
                 }
             });
         })
@@ -267,7 +285,7 @@ impl Shell {
 
     /// `open_file` with the file's real path in hand.
     #[allow(clippy::too_many_arguments)]
-    fn open_real(&mut self, key: String, path: PathBuf, line: Option<u32>, fragment: Option<String>, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_real(&mut self, key: String, path: PathBuf, line: Option<u32>, jump: Option<Jump>, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.restore_tabs(&key, cx);
         let dirty = self.dirty_tabs(cx);
         let tabs = self.file_tabs.entry(key.clone()).or_default();
@@ -292,8 +310,10 @@ impl Shell {
             }
             None => self.make_view(id, path, line, window, cx),
         };
-        if let Some(fragment) = fragment {
-            view.update(cx, |v, cx| v.go_to(fragment, window, cx));
+        match jump {
+            Some(Jump::Fragment(fragment)) => view.update(cx, |v, cx| v.go_to(fragment, window, cx)),
+            Some(Jump::Select(line, cols)) => view.update(cx, |v, cx| v.select_in_line(line, cols, window, cx)),
+            None => {}
         }
         if !preview {
             let handle = view.read(cx).focus_handle(cx);
@@ -399,7 +419,7 @@ impl Shell {
                 crate::terminal::pane::open_in_editor(path.clone(), *line, None, pane, cx);
             }
             // a markdown link to another file of the root: a tab of its own, which takes the keyboard
-            EditorEvent::OpenFile { path, line, fragment } => s.open_file_at(path.clone(), *line, fragment.clone(), false, window, cx),
+            EditorEvent::OpenFile { path, line, fragment } => s.open_file_at(path.clone(), *line, fragment.clone().map(Jump::Fragment), false, window, cx),
             // the dot: a preview edited is kept
             EditorEvent::Dirty(dirty) => {
                 let preview = s.file_tabs.iter().find(|(_, t)| t.get(id).is_some_and(|t| t.preview)).map(|(k, _)| k.clone());
@@ -432,6 +452,16 @@ impl Shell {
             }
             self.views_gone.push(gone);
         }
+    }
+
+    /// The unsaved buffers of every workspace's file tabs, by their files' real paths: a search looks in these
+    /// rather than at what is on disk.
+    pub(super) fn unsaved_buffers(&self, cx: &App) -> Vec<(PathBuf, gpui_base::input::Rope)> {
+        let editors = self.tab_views.iter().filter_map(|(_, v)| match v {
+            TabView::File(e) => Some(e.read(cx)),
+            TabView::Diff(_) => None,
+        });
+        editors.filter_map(|e| Some((e.path().to_path_buf(), e.unsaved_text(cx)?))).collect()
     }
 
     /// The tabs whose views have unsaved changes.

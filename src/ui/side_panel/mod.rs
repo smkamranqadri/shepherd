@@ -3,6 +3,9 @@
 //! keystroke in Search re-renders the panel, not the window.
 mod changes;
 mod files;
+mod search;
+
+pub use search::UnsavedBuffers;
 
 use crate::files::watch::{self, Batch, Message};
 use crate::settings::PanelTab;
@@ -50,6 +53,9 @@ pub enum SidePanelEvent {
     /// opens its diff in a tab (a conflict's file with its markers; nothing for a folder). `preview` as
     /// `OpenFile`'s: a single click's tab is replaced by the next.
     OpenChange { path: std::path::PathBuf, change: crate::files::status::Change, preview: bool },
+    /// A match clicked in the Search tab, or Enter on it: its file in a tab at `line` (1-based), the bytes `cols` of
+    /// the line selected. `preview` as `OpenFile`'s: a single click's leaves the keyboard in the results.
+    OpenMatch { path: std::path::PathBuf, line: u32, cols: std::ops::Range<usize>, preview: bool },
     /// The Changes tab's count (its badge, which the Shell draws in the tab strip) changed: the Shell redraws.
     ChangesCounted,
     /// git status answered (changed or not): the shown diff tab reads its diff again.
@@ -99,6 +105,10 @@ pub struct SidePanel {
     watch: Option<Watching>,
     watch_state: WatchState,
     next_watch: u64,
+    /// The Search tab's query, results and the search out.
+    search: search::SearchState,
+    /// Where the buffers with unsaved changes are (the Shell's file tabs): a search looks in them, not on disk.
+    unsaved: Option<UnsavedBuffers>,
 }
 
 impl SidePanel {
@@ -132,6 +142,8 @@ impl SidePanel {
             watch: None,
             watch_state: WatchState::Off,
             next_watch: 0,
+            search: Default::default(),
+            unsaved: None,
         }
     }
 
@@ -311,11 +323,13 @@ impl Render for SidePanel {
             self.render_files(theme, window, cx)
         } else if self.tab == PanelTab::Changes {
             self.render_changes(theme, window, cx)
+        } else if self.tab == PanelTab::Search {
+            self.render_search(theme, window, cx)
         } else {
             let (title, hint) = match self.tab {
                 PanelTab::Files => ("Files", ""),
                 PanelTab::Changes => ("Changes", ""),
-                PanelTab::Search => ("Search", "Search across the workspace's folder will be here."),
+                PanelTab::Search => ("Search", ""),
                 // the Shell draws the PR tab itself
                 PanelTab::Pr => ("Pull request", ""),
             };
@@ -325,7 +339,7 @@ impl Render for SidePanel {
             .id("side-panel")
             .track_focus(&self.focus)
             .key_context("SidePanel")
-            .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, window, cx| {
                 let m = &e.keystroke.modifiers;
                 if e.keystroke.key == "enter" && crate::platform::link_modifier(m) && !m.alt && !m.shift && this.tab == PanelTab::Files && !this.context.remote {
                     if this.open_selected_in_editor(cx) {
@@ -340,6 +354,9 @@ impl Render for SidePanel {
                     cx.emit(SidePanelEvent::Dismiss);
                     cx.stop_propagation();
                 } else if this.tab == PanelTab::Files && !this.context.remote && this.files_key(&e.keystroke.key, cx) {
+                    cx.stop_propagation();
+                } else if this.tab == PanelTab::Search && !this.context.remote && this.focus.is_focused(window) && this.search_key(&e.keystroke.key, cx) {
+                    // the results' own keys; the inputs keep theirs
                     cx.stop_propagation();
                 }
             }))

@@ -32,6 +32,7 @@ use gpui::{
 use gpui_base::input::{Editor, EditorState, InputEvent, InputHighlighter, Position, Rope, RopeExt, TabSize};
 use futures::FutureExt;
 use futures::future::{BoxFuture, LocalBoxFuture, Shared};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -275,6 +276,8 @@ enum Body {
 enum Goto {
     Line(u32),
     Fragment(String),
+    /// A search match: its line (1-based) and its bytes in the line.
+    Select(u32, Range<usize>),
 }
 
 /// git's view of the file, for the gutter: the index's blob, and what is staged (HEAD to index, worked out once when
@@ -452,7 +455,9 @@ impl FileEditor {
     /// Shows `path` (at `line`, 1-based) in place of what was shown, or, when it is the file shown (with its edits),
     /// only goes to `line`. `restore` puts the cursor and scroll back as they were (a view made again).
     pub fn open(&mut self, path: PathBuf, line: Option<u32>, root: Option<PathBuf>, restore: Option<Place>, window: &mut Window, cx: &mut Context<Self>) {
-        if path == self.path && !matches!(self.body, Body::Loading) {
+        // the file shown, or still being read (another match in it, say): the read goes on, and `go_to_line` keeps
+        // the line for when it is in
+        if path == self.path {
             if let Some(line) = line {
                 self.go_to_line(line, window, cx);
             }
@@ -544,6 +549,7 @@ impl FileEditor {
         match self.goto.take() {
             Some(Goto::Line(line)) => self.go_to_line(line, window, cx),
             Some(Goto::Fragment(fragment)) => self.go_to_fragment(&fragment, window, cx),
+            Some(Goto::Select(line, cols)) => self.select_in_line(line, cols, window, cx),
             None => {
                 if let Some(place) = self.restore.take() {
                     self.put_back(place, cx);
@@ -563,7 +569,7 @@ impl FileEditor {
             ViewerEvent::OpenFile { path, line, fragment } => cx.emit(EditorEvent::OpenFile { path: path.clone(), line: *line, fragment: fragment.clone() }),
         });
         let line = match &self.goto {
-            Some(Goto::Line(line)) => Some(*line),
+            Some(Goto::Line(line) | Goto::Select(line, _)) => Some(*line),
             _ => None,
         };
         let (path, root) = (self.path.clone(), self.root.clone());
@@ -641,6 +647,35 @@ impl FileEditor {
                 });
                 cx.notify();
             }
+        }
+    }
+
+    /// Selects `cols` (byte offsets in the line) of `line` (1-based), a search match, scrolled into view; once the
+    /// text is in when it is not yet. The viewer, which has no selection, only goes to the line.
+    pub fn select_in_line(&mut self, line: u32, cols: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.body {
+            Body::Loading => self.goto = Some(Goto::Select(line, cols)),
+            Body::View { .. } => self.go_to_line(line, window, cx),
+            Body::Edit(_) => {
+                self.go_to_line(line, window, cx);
+                let Body::Edit(e) = &self.body else { return };
+                e.state.update(cx, |s, cx| {
+                    let row = (line.saturating_sub(1) as usize).min(s.text().lines_len().saturating_sub(1));
+                    let (start, end) = (s.text().line_start_offset(row), s.text().line_end_offset(row));
+                    let from = (start + cols.start).min(end);
+                    let to = (start + cols.end).clamp(from, end);
+                    s.set_selected_range(from..to, cx);
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    /// The buffer, while it has changes not saved: what a search looks in rather than the file on disk.
+    pub fn unsaved_text(&self, cx: &App) -> Option<Rope> {
+        match &self.body {
+            Body::Edit(e) if e.tracker.is_dirty() => Some(e.state.read(cx).text().clone()),
+            _ => None,
         }
     }
 

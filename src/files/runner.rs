@@ -184,6 +184,8 @@ pub async fn run(host: &Host, cmd: Cmd, limits: Limits) -> Result<Output, RunErr
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
     Lines(Vec<Vec<u8>>),
+    /// Only from `stream_lines`, before its end: this many lines were longer than its cap and were dropped.
+    Skipped(usize),
     /// The last item of a child that ran to its end: its exit code (`None` when a signal ended it) and the last
     /// `STREAM_STDERR` bytes of its stderr, lossy. rg's exit 2 with its complaints is not "no results" (exit 1).
     Exit { code: Option<i32>, stderr: String },
@@ -198,10 +200,17 @@ pub type Batches = mpsc::UnboundedReceiver<Result<Item, RunError>>;
 /// or the receiver is dropped. Aborting the handle, the deadline and a dropped receiver all kill the child. The channel is unbounded:
 /// `max_bytes` bounds what it can hold, and a receiver that stops reading cannot hold the deadline off.
 pub fn stream(host: &Host, cmd: Cmd, limits: Limits, rt: &Handle) -> (Batches, AbortHandle) {
+    stream_lines(host, cmd, limits, None, rt)
+}
+
+/// `stream`, with lines longer than `max_line` bytes dropped as they are read: never held, not counted toward
+/// `max_bytes` (one minified bundle's line would otherwise fill a search's whole cap), and counted in a `Skipped`
+/// before the end.
+pub fn stream_lines(host: &Host, cmd: Cmd, limits: Limits, max_line: Option<usize>, rt: &Handle) -> (Batches, AbortHandle) {
     let (tx, rx) = mpsc::unbounded();
     let host = host.clone();
     let task = rt.spawn(async move {
-        if let Err(e) = pump(&host, cmd, limits, &tx).await {
+        if let Err(e) = pump(&host, cmd, limits, max_line.unwrap_or(usize::MAX), &tx).await {
             let _ = tx.unbounded_send(Err(e));
         }
     });
@@ -241,7 +250,10 @@ impl Drop for AbortOnDrop {
     }
 }
 
-async fn pump(host: &Host, cmd: Cmd, limits: Limits, tx: &Sender) -> Result<(), RunError> {
+/// How much of a line being dropped (`stream_lines`) is read at a time.
+const SKIP_CHUNK: u64 = 64 * 1024;
+
+async fn pump(host: &Host, cmd: Cmd, limits: Limits, max_line: usize, tx: &Sender) -> Result<(), RunError> {
     if let Host::Ssh { .. } = host {
         return Err(RunError::RemoteUnsupported);
     }
@@ -256,17 +268,40 @@ async fn pump(host: &Host, cmd: Cmd, limits: Limits, tx: &Sender) -> Result<(), 
     tokio::pin!(deadline);
     let mut tick = tokio::time::interval(BATCH_EVERY);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // `total` counts the lines sent; `line` the one being read, never past one byte over the cap
+    // `total` counts the lines sent; `line` the one being read, never past one byte over the cap (or `max_line`);
+    // `skipping` while the rest of a line over `max_line` is read into `skipped` and thrown away
     let (mut batch, mut line, mut total) = (Vec::new(), Vec::new(), 0usize);
+    let (mut skipping, mut skipped, mut dropped) = (false, Vec::new(), 0usize);
     let send = |batch: &mut Vec<Vec<u8>>| batch.is_empty() || tx.unbounded_send(Ok(Item::Lines(std::mem::take(batch)))).is_ok();
     let end = loop {
-        let budget = (limits.max_bytes + 1).saturating_sub(total + line.len()) as u64;
+        let budget = if skipping {
+            SKIP_CHUNK
+        } else {
+            // room for `max_line` bytes and their newline; one more byte without one says the line is longer
+            let line_room = max_line.saturating_add(2).saturating_sub(line.len());
+            (limits.max_bytes + 1).saturating_sub(total + line.len()).min(line_room) as u64
+        };
         let mut limited = (&mut reader).take(budget);
+        let into = if skipping { &mut skipped } else { &mut line };
         tokio::select! {
             // read_until keeps what it read in `line` when another branch wins, and goes on from there next time;
             // `take` stops a minified file's one huge line at the cap rather than buffering all of it
-            read = limited.read_until(b'\n', &mut line) => match read {
+            read = limited.read_until(b'\n', into) => match read {
+                Ok(n) if skipping => {
+                    let ended = n == 0 || skipped.last() == Some(&b'\n');
+                    skipped.clear();
+                    if n == 0 {
+                        break Ok(());
+                    }
+                    skipping = !ended;
+                }
                 Ok(_) if total + line.len() > limits.max_bytes => break Err(RunError::Truncated),
+                Ok(_) if line.len() - usize::from(line.last() == Some(&b'\n')) > max_line => {
+                    // the whole line, or the start of one longer still
+                    dropped += 1;
+                    skipping = line.last() != Some(&b'\n');
+                    line.clear();
+                }
                 Ok(0) => {
                     if !line.is_empty() {
                         batch.push(std::mem::take(&mut line));
@@ -295,6 +330,9 @@ async fn pump(host: &Host, cmd: Cmd, limits: Limits, tx: &Sender) -> Result<(), 
         }
     };
     send(&mut batch);
+    if dropped > 0 {
+        let _ = tx.unbounded_send(Ok(Item::Skipped(dropped)));
+    }
     if let Err(e) = end {
         // at the cap or the deadline the child may still be running
         let _ = child.start_kill();
@@ -471,6 +509,22 @@ mod tests {
             assert!(tail.len() <= 8);
         }
         assert!(tail.ends_with(b"wxyz"));
+    }
+
+    #[tokio::test]
+    async fn lines_over_the_line_cap_are_dropped_and_not_counted() {
+        // a 200 KB line between two short ones, under a 1000-byte cap it would fill on its own
+        let script = "printf 'short\\n'; head -c 200000 /dev/zero | tr '\\0' x; printf '\\nafter\\n'; head -c 50 /dev/zero | tr '\\0' y; printf '\\nend'";
+        let (rx, _) = stream_lines(&Host::Local, sh(script), limits(5000, 1000), Some(40), &Handle::current());
+        let mut got: Vec<_> = rx.collect().await;
+        assert!(matches!(got.pop(), Some(Ok(Item::Exit { code: Some(0), .. }))), "{got:?}");
+        assert_eq!(got.pop(), Some(Ok(Item::Skipped(2))));
+        assert_eq!(lines(got), [b"short".to_vec(), b"after".to_vec(), b"end".to_vec()]);
+        // a line exactly at the cap stays
+        let (rx, _) = stream_lines(&Host::Local, sh("printf 'abcd\\nabcde\\n'"), limits(5000, 1000), Some(4), &Handle::current());
+        let got: Vec<_> = rx.collect().await;
+        assert_eq!(got[0], Ok(Item::Lines(vec![b"abcd".to_vec()])));
+        assert_eq!(got[1], Ok(Item::Skipped(1)));
     }
 
     async fn wait_gone(pid_file: &Path) -> bool {

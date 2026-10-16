@@ -41,6 +41,9 @@ similar = { version = "2.7", default-features = false }
 # The Files tab and Changes refresh when the disk changes: inotify on Linux, FSEvents on macOS (CC0-1.0; its default
 # features are FSEvents alone).
 notify = "8.2"
+# The Search tab's include and exclude globs, matched against each result's whole path (rg's --type-add sees only
+# the file's name); ripgrep's own (MIT OR Unlicense), no log.
+globset = { version = "0.4.20", default-features = false }
 # An image's size from its header, for the viewer's pixel budget (already in the tree, through gpui).
 imagesize = "0.14"
 
