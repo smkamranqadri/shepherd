@@ -400,9 +400,36 @@ impl Shell {
 
     /// The place a swipe of `travel` px goes to: fingers to the left bring the next one, as in Arc.
     fn neighbour(&self, travel: f32) -> Option<Place> {
-        let at = self.places.iter().position(|p| self.places_shown(p))?;
-        let to = if travel < 0. { at.checked_add(1)? } else { at.checked_sub(1)? };
-        self.places.get(to).cloned()
+        let at = self.places.iter().position(|p| self.places_shown(p));
+        self.places.get(step(at?, self.places.len(), travel < 0., false)?).cloned()
+    }
+
+    /// The next place in the bar (or the last one), round to the first from the end and back: the keyboard's way
+    /// along the bar. Shown from a socket of one's own, it starts at either end.
+    pub(super) fn step_place(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let n = self.places.len();
+        let to = match self.places.iter().position(|p| self.places_shown(p)) {
+            Some(at) => step(at, n, forward, true),
+            None => (n > 0).then(|| if forward { 0 } else { n - 1 }),
+        };
+        if let Some(place) = to.and_then(|i| self.places.get(i).cloned()) {
+            self.show_place(place, forward, cx);
+        }
+    }
+
+    /// Shows `place`, the list sliding in from the side a swipe would bring it from: from the right going `forward`.
+    pub(super) fn show_place(&mut self, place: Place, forward: bool, cx: &mut Context<Self>) {
+        if self.places_shown(&place) {
+            return;
+        }
+        let left = self.places.iter().find(|p| self.places_shown(p)).cloned();
+        self.switch_to(place.clone(), cx);
+        // a machine out of reach stays where it was, with a toast
+        if self.places_shown(&place) {
+            let width = self.sidebar_width;
+            self.slide = Some((if forward { width } else { -width }, Instant::now(), left));
+        }
+        cx.notify();
     }
 
     /// Whether `place` is the one shown.
@@ -670,8 +697,23 @@ impl Shell {
     }
 }
 
+/// The index one place on from `at` among `len`, forward or back: past either end none, or with `wrap` the one at
+/// the other end. None where `at` is the only place.
+fn step(at: usize, len: usize, forward: bool, wrap: bool) -> Option<usize> {
+    if at >= len || len < 2 {
+        return None;
+    }
+    match (forward, wrap) {
+        (true, _) if at + 1 < len => Some(at + 1),
+        (false, _) if at > 0 => Some(at - 1),
+        (true, true) => Some(0),
+        (false, true) => Some(len - 1),
+        (_, false) => None,
+    }
+}
+
 /// A place's icon drawn at `size`: a drawn icon (`icon:<name>`) in `color`, or the emoji.
-pub(super) fn icon_mark(icon: &str, size: f32, color: gpui::Hsla) -> gpui::AnyElement {
+pub(crate) fn icon_mark(icon: &str, size: f32, color: gpui::Hsla) -> gpui::AnyElement {
     match icon.strip_prefix("icon:") {
         Some(name) => gpui::svg().path(SharedString::from(format!("icons/solar/{name}.svg"))).size(px(size)).flex_none().text_color(color).into_any_element(),
         None => div().text_size(px(size)).child(icon.to_string()).into_any_element(),
@@ -681,6 +723,32 @@ pub(super) fn icon_mark(icon: &str, size: f32, color: gpui::Hsla) -> gpui::AnyEl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_swipe_stops_at_either_end() {
+        assert_eq!(step(0, 3, true, false), Some(1));
+        assert_eq!(step(2, 3, true, false), None);
+        assert_eq!(step(0, 3, false, false), None);
+        assert_eq!(step(2, 3, false, false), Some(1));
+    }
+
+    #[test]
+    fn the_keys_wrap_round_the_bar() {
+        assert_eq!(step(2, 3, true, true), Some(0));
+        assert_eq!(step(0, 3, false, true), Some(2));
+        assert_eq!(step(1, 3, true, true), Some(2));
+        assert_eq!(step(1, 3, false, true), Some(0));
+        assert_eq!(step(0, 2, true, true), Some(1));
+        assert_eq!(step(1, 2, true, true), Some(0));
+    }
+
+    #[test]
+    fn one_place_has_nowhere_to_go() {
+        assert_eq!(step(0, 1, true, true), None);
+        assert_eq!(step(0, 1, false, true), None);
+        assert_eq!(step(0, 0, true, true), None);
+        assert_eq!(step(3, 2, true, true), None, "a stale index");
+    }
 
     #[test]
     fn emoji_search_by_name() {

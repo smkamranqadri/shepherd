@@ -43,6 +43,9 @@ app_actions! {
     NextTab: "Next tab",
     PreviousWorkspace: "Previous workspace",
     NextWorkspace: "Next workspace",
+    PreviousSession: "Previous session",
+    NextSession: "Next session",
+    SwitchSession: "Switch session",
     ToggleSidebar: "Toggle sidebar",
     ToggleReview: "Toggle pull request panel",
     FontSizeUp: "Bigger text",
@@ -83,6 +86,9 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("NextTab", "cmd-}"),
     ("PreviousWorkspace", "cmd-up"),
     ("NextWorkspace", "cmd-down"),
+    // the sessions and machines of the sidebar's bar; Cmd+Opt+Up/Down is taken, by focus up and down
+    ("PreviousSession", "ctrl-cmd-up"),
+    ("NextSession", "ctrl-cmd-down"),
     ("ToggleSidebar", "cmd-b"),
     ("ToggleReview", "cmd-alt-b"),
     ("FontSizeUp", "cmd-="),
@@ -124,6 +130,9 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("NextTab", "ctrl-pagedown"),
     ("PreviousWorkspace", "ctrl-shift-pageup"),
     ("NextWorkspace", "ctrl-shift-pagedown"),
+    // the sessions and machines of the sidebar's bar: the workspace chords with Alt
+    ("PreviousSession", "ctrl-shift-alt-pageup"),
+    ("NextSession", "ctrl-shift-alt-pagedown"),
     ("ToggleSidebar", "ctrl-shift-b"),
     ("ToggleReview", "ctrl-alt-b"),
     ("FontSizeUp", "ctrl-="),
@@ -246,6 +255,9 @@ fn menus(secure_input: bool) -> Vec<gpui::Menu> {
             I::action("Next Tab", NextTab),
             I::action("Previous Workspace", PreviousWorkspace),
             I::action("Next Workspace", NextWorkspace),
+            I::action("Previous Session", PreviousSession),
+            I::action("Next Session", NextSession),
+            I::action("Switch Session…", SwitchSession),
             I::separator(),
             I::action("Focus Pane Left", FocusLeft),
             I::action("Focus Pane Right", FocusRight),
@@ -408,5 +420,147 @@ mod tests {
             assert!(ACTIONS.iter().any(|(name, _)| name == action), "{action}");
             assert!(normalize(chord).is_some(), "{chord}");
         }
+    }
+
+    /// Upstream's defaults as they were before Shepherd's own were added: they must stay as they are.
+    #[cfg(target_os = "macos")]
+    const UPSTREAM: &[(&str, &str)] = &[
+        ("NewTab", "cmd-t"),
+        ("CloseTab", "cmd-shift-w"),
+        ("NewWorkspace", "cmd-shift-n"),
+        ("SplitRight", "cmd-d"),
+        ("SplitDown", "cmd-shift-d"),
+        ("ClosePane", "cmd-w"),
+        ("FocusLeft", "cmd-alt-left"),
+        ("FocusRight", "cmd-alt-right"),
+        ("FocusUp", "cmd-alt-up"),
+        ("FocusDown", "cmd-alt-down"),
+        ("ToggleZoom", "cmd-shift-enter"),
+        ("Tab1", "cmd-1"),
+        ("Tab2", "cmd-2"),
+        ("Tab3", "cmd-3"),
+        ("Tab4", "cmd-4"),
+        ("Tab5", "cmd-5"),
+        ("Tab6", "cmd-6"),
+        ("Tab7", "cmd-7"),
+        ("Tab8", "cmd-8"),
+        ("Tab9", "cmd-9"),
+        ("PreviousTab", "cmd-{"),
+        ("NextTab", "cmd-}"),
+        ("PreviousWorkspace", "cmd-up"),
+        ("NextWorkspace", "cmd-down"),
+        ("ToggleSidebar", "cmd-b"),
+        ("ToggleReview", "cmd-alt-b"),
+        ("FontSizeUp", "cmd-="),
+        ("FontSizeUp", "cmd-+"),
+        ("FontSizeDown", "cmd--"),
+        ("FontSizeReset", "cmd-0"),
+        ("OpenSettings", "cmd-,"),
+        ("CommandPanel", "cmd-k"),
+        ("CommandPanel", "cmd-shift-p"),
+        ("AgentsPanel", "cmd-shift-a"),
+        ("Quit", "cmd-q"),
+    ];
+
+    #[cfg(not(target_os = "macos"))]
+    const UPSTREAM: &[(&str, &str)] = &[
+        ("NewTab", "ctrl-shift-t"),
+        ("CloseTab", "ctrl-alt-w"),
+        ("NewWorkspace", "ctrl-shift-n"),
+        ("SplitRight", "ctrl-shift-o"),
+        ("SplitDown", "ctrl-shift-e"),
+        ("ClosePane", "ctrl-shift-w"),
+        ("FocusLeft", "ctrl-alt-left"),
+        ("FocusRight", "ctrl-alt-right"),
+        ("FocusUp", "ctrl-alt-up"),
+        ("FocusDown", "ctrl-alt-down"),
+        ("ToggleZoom", "ctrl-shift-enter"),
+        ("Tab1", "alt-1"),
+        ("Tab2", "alt-2"),
+        ("Tab3", "alt-3"),
+        ("Tab4", "alt-4"),
+        ("Tab5", "alt-5"),
+        ("Tab6", "alt-6"),
+        ("Tab7", "alt-7"),
+        ("Tab8", "alt-8"),
+        ("Tab9", "alt-9"),
+        ("PreviousTab", "ctrl-pageup"),
+        ("NextTab", "ctrl-pagedown"),
+        ("PreviousWorkspace", "ctrl-shift-pageup"),
+        ("NextWorkspace", "ctrl-shift-pagedown"),
+        ("ToggleSidebar", "ctrl-shift-b"),
+        ("ToggleReview", "ctrl-alt-b"),
+        ("FontSizeUp", "ctrl-="),
+        ("FontSizeUp", "ctrl-+"),
+        ("FontSizeDown", "ctrl--"),
+        ("FontSizeReset", "ctrl-0"),
+        ("OpenSettings", "ctrl-,"),
+        ("CommandPanel", "ctrl-shift-p"),
+        ("AgentsPanel", "ctrl-shift-a"),
+        ("Quit", "ctrl-shift-q"),
+    ];
+
+    /// gpui-base's Input bindings near the chords added here, as its input state binds them on each OS.
+    #[cfg(target_os = "macos")]
+    const INPUT: &[&str] = &["cmd-up", "cmd-down", "cmd-shift-up", "cmd-shift-down", "ctrl-cmd-space", "cmd-left", "cmd-right", "alt-left", "alt-right", "cmd-enter"];
+
+    #[cfg(not(target_os = "macos"))]
+    const INPUT: &[&str] = &["pageup", "pagedown", "ctrl-left", "ctrl-right", "ctrl-shift-left", "ctrl-shift-right", "ctrl-enter"];
+
+    /// The defaults added to upstream's.
+    fn added() -> Vec<(&'static str, &'static str)> {
+        DEFAULTS.iter().filter(|d| !UPSTREAM.contains(d)).copied().collect()
+    }
+
+    #[test]
+    fn upstream_defaults_stay_as_they_are() {
+        let eff = effective(&user(&[]));
+        for (action, chord) in UPSTREAM {
+            assert!(DEFAULTS.contains(&(action, chord)), "{action} {chord}");
+            let chord = normalize(chord).unwrap();
+            assert!(eff.iter().any(|(a, k)| a == action && *k == chord), "{action} lost {chord}");
+        }
+    }
+
+    #[test]
+    fn no_two_defaults_share_a_chord() {
+        let chords: Vec<String> = DEFAULTS.iter().map(|(_, k)| normalize(k).unwrap()).collect();
+        for (i, k) in chords.iter().enumerate() {
+            assert!(!chords[..i].contains(k), "{k} twice");
+        }
+    }
+
+    #[test]
+    fn added_defaults_miss_the_input_keys() {
+        let input: Vec<String> = INPUT.iter().map(|k| normalize(k).unwrap()).collect();
+        let added = added();
+        assert!(!added.is_empty());
+        for (action, chord) in added {
+            assert!(!input.contains(&normalize(chord).unwrap()), "{action}'s {chord} is an input key");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn sessions_step_on_ctrl_cmd_up_and_down() {
+        let eff = effective(&user(&[]));
+        assert_eq!(chord(&eff, "NextSession"), normalize("ctrl-cmd-down").as_deref());
+        assert_eq!(chord(&eff, "PreviousSession"), normalize("ctrl-cmd-up").as_deref());
+        // Cmd+Opt+Down, the chord first thought of, is focus down's
+        assert_eq!(chord(&eff, "FocusDown"), normalize("alt-cmd-down").as_deref());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn sessions_step_on_the_workspace_chords_with_alt() {
+        let eff = effective(&user(&[]));
+        assert_eq!(chord(&eff, "NextSession"), normalize("ctrl-shift-alt-pagedown").as_deref());
+        assert_eq!(chord(&eff, "PreviousSession"), normalize("ctrl-shift-alt-pageup").as_deref());
+        assert_eq!(chord(&eff, "NextWorkspace"), normalize("ctrl-shift-pagedown").as_deref());
+    }
+
+    #[test]
+    fn the_session_switcher_has_no_default_chord() {
+        assert_eq!(chord(&effective(&user(&[])), "SwitchSession"), None);
     }
 }

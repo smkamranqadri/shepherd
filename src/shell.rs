@@ -39,6 +39,7 @@ use sync::sync_loop;
 pub(crate) use widgets::{menu_card, modal, row, status_dot, status_icon, tip};
 use widgets::*;
 pub(crate) use tab_bar::agent_favicon;
+pub(crate) use sessions::icon_mark;
 
 const TITLEBAR_HEIGHT: f32 = 38.0;
 /// The titlebar's left cluster: traffic lights, then the sidebar toggle at Zeron's `titlebar_cluster_start` (88).
@@ -595,6 +596,24 @@ impl Shell {
                 None => Vec::new(),
             },
             Kind::Worktrees => Vec::new(), // herdr's list fills it: see `open_worktrees_panel`
+            Kind::Places => crate::ui::command_panel::place_items(
+                self.places
+                    .iter()
+                    .map(|place| {
+                        let (name, icon) = place.look(cx);
+                        crate::ui::command_panel::PlaceRow {
+                            key: place.key(),
+                            name,
+                            icon,
+                            remote: match place {
+                                sessions::Place::Machine(m) => Some(m.target.clone()),
+                                sessions::Place::Session(_) => None,
+                            },
+                            shown: self.places_shown(place),
+                        }
+                    })
+                    .collect(),
+            ),
             Kind::Themes => {
                 let appearance = Theme::of(cx).appearance;
                 let dark = appearance == crate::theme::Appearance::Dark;
@@ -657,6 +676,12 @@ impl Shell {
                             });
                         }
                     }
+                }
+                PanelEvent::Run(Run::Place(key)) => {
+                    let places = &this.places;
+                    let (Some(to), at) = (places.iter().position(|p| &p.key() == key), places.iter().position(|p| this.places_shown(p))) else { return };
+                    // from the right when it sits after the one shown in the bar
+                    this.show_place(places[to].clone(), at.is_none_or(|at| to > at), cx);
                 }
                 PanelEvent::Dismiss => {}
             }
@@ -1490,6 +1515,9 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &NextTab, _, cx| this.step_tab(true, cx)))
             .on_action(cx.listener(|this, _: &PreviousWorkspace, _, cx| this.step_workspace(false, cx)))
             .on_action(cx.listener(|this, _: &NextWorkspace, _, cx| this.step_workspace(true, cx)))
+            .on_action(cx.listener(|this, _: &PreviousSession, _, cx| this.step_place(false, cx)))
+            .on_action(cx.listener(|this, _: &NextSession, _, cx| this.step_place(true, cx)))
+            .on_action(cx.listener(|this, _: &SwitchSession, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Places, w, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &ToggleReview, _, cx| this.toggle_review(cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.toggle_settings_here(window, cx)))

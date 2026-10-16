@@ -59,6 +59,7 @@ Shepherd needs macOS 14 or later (or Linux) and herdr. It talks to the herdr ser
 | `⇧⌘↩` | Zoom the pane |
 | `⌘1` … `⌘9`, `⇧⌘[`, `⇧⌘]` | Go to a tab, previous or next tab |
 | `⌘↑`, `⌘↓` | Previous or next workspace |
+| `⌃⌘↑`, `⌃⌘↓` | Previous or next session or machine (`Ctrl+Shift+Alt+PageUp`, `PageDown` on Linux) |
 | `⇧⌘N` | New workspace, in a folder you pick (on a remote machine, the focused pane's) |
 | `⌘B`, `⌥⌘B` | Toggle the sidebar, the review panel |
 | `⌘K`, `⇧⌘A` | Command panel, agents panel |

@@ -27,6 +27,8 @@ pub enum Run {
     /// Show this worktree of `repo`'s repo (a workspace of its checkout): its workspace when one has it open, else
     /// herdr opens it.
     Worktree { repo: String, path: String, workspace_id: Option<String> },
+    /// Show this session or machine, by its key in the sidebar's bar.
+    Place(String),
 }
 
 /// The heading an item sits under; also searched, so "tab" finds the tabs.
@@ -40,6 +42,7 @@ pub enum Section {
     Branches,
     Themes,
     Worktrees,
+    Places,
 }
 
 impl Section {
@@ -53,6 +56,7 @@ impl Section {
             Section::Branches => "Branches",
             Section::Themes => "Themes",
             Section::Worktrees => "Worktrees",
+            Section::Places => "Sessions",
         }
     }
 }
@@ -63,6 +67,8 @@ pub struct Item {
     pub key: String,
     pub section: Section,
     pub icon: &'static str,
+    /// A place's own icon, drawn instead of `icon`: a drawn one (`icon:<name>`) or an emoji.
+    pub mark: Option<String>,
     pub label: String,
     /// Faint text on the right: the workspace of a tab or agent.
     pub hint: Option<String>,
@@ -79,8 +85,8 @@ impl Item {
     fn haystack(&self) -> String {
         match self.run {
             Run::Action(_) | Run::Branch(_) | Run::Herdr(_) | Run::Theme(_) => self.label.clone(),
-            // the branch, then its folder
-            Run::Worktree { .. } => [Some(self.label.as_str()), self.hint.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" "),
+            // the branch, then its folder; the place, then where it is
+            Run::Worktree { .. } | Run::Place(_) => [Some(self.label.as_str()), self.hint.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" "),
             Run::Tab(_) => [Some(self.label.as_str()), self.hint.as_deref(), Some(self.section.title())].into_iter().flatten().collect::<Vec<_>>().join(" "),
         }
     }
@@ -95,6 +101,7 @@ pub enum Kind {
     Branches,
     Themes,
     Worktrees,
+    Places,
 }
 
 impl Kind {
@@ -106,6 +113,7 @@ impl Kind {
             Kind::Branches => "", // opened from the status bar, no chord
             Kind::Worktrees => "", // opened from a workspace's menu, no chord
             Kind::Themes => "ChangeTheme",
+            Kind::Places => "SwitchSession",
         }
     }
 }
@@ -135,6 +143,9 @@ fn action_icon(name: &str) -> &'static str {
         "NextTab" => "icons/alt-arrow-right.svg",
         "PreviousWorkspace" => "icons/alt-arrow-up.svg",
         "NextWorkspace" => "icons/alt-arrow-down.svg",
+        "PreviousSession" => "icons/solar/double-alt-arrow-left.svg",
+        "NextSession" => "icons/solar/double-alt-arrow-right.svg",
+        "SwitchSession" => "icons/solar/round-transfer-horizontal.svg",
         "ToggleSidebar" => "icons/sidebar-minimalistic-left.svg",
         "ToggleReview" => "icons/sidebar-minimalistic-right.svg",
         "OpenSettings" => "icons/settings.svg",
@@ -192,6 +203,7 @@ pub fn workspace_items(snapshot: Option<&Snapshot>) -> Vec<Item> {
                 section: Section::Workspaces,
                 icon: if linked { "icons/git-branch.svg" } else { "icons/folder.svg" },
                 label: w.label.clone(),
+                mark: None,
                 hint: None,
                 chord: None,
                 status: busy(w.agent_status),
@@ -210,6 +222,7 @@ pub fn items(snapshot: Option<&Snapshot>, bindings: &[(String, String)], plugin_
             key: name.to_string(),
             section: Section::Commands,
             icon: action_icon(name),
+            mark: None,
             label: label.to_string(),
             hint: None,
             chord: bindings.iter().find(|(action, _)| action == name).map(|(_, keys)| keys.clone()),
@@ -221,6 +234,7 @@ pub fn items(snapshot: Option<&Snapshot>, bindings: &[(String, String)], plugin_
         key: format!("plugin:{id}"),
         section: Section::Commands,
         icon: "icons/widget.svg",
+        mark: None,
         label: title.clone(),
         hint: None,
         chord: None,
@@ -235,6 +249,7 @@ pub fn items(snapshot: Option<&Snapshot>, bindings: &[(String, String)], plugin_
                 key: format!("tab:{}", t.tab_id),
                 section: Section::Tabs,
                 icon: "icons/terminal.svg",
+                mark: None,
                 label: short_tab_label(&t.label).to_string(),
                 hint: Some(w.label.clone()),
                 chord: None,
@@ -287,6 +302,7 @@ pub fn agent_items(snapshot: Option<&Snapshot>, sort: AgentSort, since: &Since) 
                 key: format!("agent:{}", p.pane_id),
                 section: Section::Agents,
                 icon: agent_icon(&agent),
+                mark: None,
                 label: p.terminal_title_stripped.clone().filter(|t| !t.is_empty()).unwrap_or(agent),
                 hint: s.workspaces.iter().find(|w| w.workspace_id == p.workspace_id).map(|w| match waiting_since(since, p) {
                     Some(at) => format!("{} · {}", ago(at.elapsed()), w.label),
@@ -310,6 +326,7 @@ pub fn branch_items(refs: &str, current: Option<&str>) -> Vec<Item> {
             key: format!("branch:{name}"),
             section: Section::Branches,
             icon: "icons/git-branch.svg",
+            mark: None,
             label: name.to_string(),
             hint: (Some(name) == current).then(|| "current".into()),
             chord: None,
@@ -329,6 +346,7 @@ pub fn theme_items(variants: Vec<(String, String)>, dark: bool, current: &str) -
             key: format!("theme:{id}"),
             section: Section::Themes,
             icon: if dark { "icons/moon.svg" } else { "icons/sun.svg" },
+            mark: None,
             label: name,
             hint: (id == current).then(|| "current".into()),
             chord: None,
@@ -357,6 +375,7 @@ pub fn worktree_items(list: &serde_json::Value, repo: &str, home: &str) -> Vec<I
                 key: format!("worktree:{path}"),
                 section: Section::Worktrees,
                 icon: if w["is_linked_worktree"].as_bool().unwrap_or(false) { "icons/git-branch.svg" } else { "icons/folder.svg" },
+                mark: None,
                 label: w["branch"].as_str().unwrap_or("detached").to_string(),
                 hint: Some(match state {
                     Some(state) => format!("{state} · {shown}"),
@@ -366,6 +385,44 @@ pub fn worktree_items(list: &serde_json::Value, repo: &str, home: &str) -> Vec<I
                 status: None,
                 run: Run::Worktree { repo: repo.to_string(), path, workspace_id },
             })
+        })
+        .collect()
+}
+
+/// A session or machine of the sidebar's bar, as the session switcher lists it.
+pub struct PlaceRow {
+    /// Its key in the bar, run to show it.
+    pub key: String,
+    /// Its name in Shepherd.
+    pub name: String,
+    /// Its own icon, if one was given.
+    pub icon: Option<String>,
+    /// The machine's SSH target, for a machine; None for a session here.
+    pub remote: Option<String>,
+    /// The one shown now.
+    pub shown: bool,
+}
+
+/// The sidebar bar's sessions and machines, in its order: each with its own icon or a session's or machine's, then
+/// whether it is here or on a machine, the one shown marked.
+pub fn place_items(rows: Vec<PlaceRow>) -> Vec<Item> {
+    rows.into_iter()
+        .map(|row| {
+            let at = match &row.remote {
+                Some(target) => format!("remote · {target}"),
+                None => "local".to_string(),
+            };
+            Item {
+                key: format!("place:{}", row.key),
+                section: Section::Places,
+                icon: if row.remote.is_some() { "icons/remote-server.svg" } else { "icons/terminal.svg" },
+                mark: row.icon,
+                label: row.name,
+                hint: Some(if row.shown { format!("current · {at}") } else { at }),
+                chord: None,
+                status: None,
+                run: Run::Place(row.key),
+            }
         })
         .collect()
 }
@@ -521,7 +578,7 @@ impl Panel {
     pub fn new(kind: Kind, items: Vec<Item>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let items = match kind {
             Kind::Commands => with_recent(items, &crate::settings::SettingsGlobal::of(cx).settings.recent_commands),
-            Kind::Agents | Kind::Workspaces | Kind::Branches | Kind::Themes | Kind::Worktrees => items,
+            Kind::Agents | Kind::Workspaces | Kind::Branches | Kind::Themes | Kind::Worktrees | Kind::Places => items,
         };
         let theme = Theme::of(cx).clone();
         let placeholder = match kind {
@@ -531,6 +588,7 @@ impl Panel {
             Kind::Branches => "Switch branch",
             Kind::Themes => "Change theme",
             Kind::Worktrees => "Open worktree",
+            Kind::Places => "Switch session or machine",
         };
         let input = cx.new(|cx| {
             let mut input = InputState::new(window, cx).placeholder(placeholder);
@@ -644,10 +702,15 @@ impl Render for Panel {
                         }
                     }))
                     .on_click(cx.listener(move |panel, _, _, cx| panel.run(row, cx)))
-                    .child(gpui::svg().path(item.icon).size(px(16.)).flex_none().text_color(icon_ink(
-                        item.icon,
-                        if selected { theme.text } else { theme.text_muted },
-                    )))
+                    .child(match &item.mark {
+                        Some(mark) => crate::shell::icon_mark(mark, 16., if selected { theme.text } else { theme.text_muted }),
+                        None => gpui::svg()
+                            .path(item.icon)
+                            .size(px(16.))
+                            .flex_none()
+                            .text_color(icon_ink(item.icon, if selected { theme.text } else { theme.text_muted }))
+                            .into_any_element(),
+                    })
                     .child(div().flex_1().min_w_0().truncate().child(highlighted(&item.label, &self.query, &theme)))
                     .children(item.hint.clone().map(|hint| div().flex_none().max_w(px(160.)).truncate().text_size(px(12.)).text_color(theme.text_faint).child(hint)))
                     .children(item.status.map(|status| crate::shell::status_dot(status, &theme)))
@@ -677,6 +740,8 @@ impl Render for Panel {
                 // herdr always lists the repo's own checkout, so an empty list is one still on its way
                 Kind::Worktrees if self.items.is_empty() => ("Asking herdr…", "Its worktrees of this repo show up here."),
                 Kind::Worktrees => ("No results", "Try a branch or a folder."),
+                Kind::Places if self.items.is_empty() => ("No sessions", "herdr's sessions and saved machines show up here."),
+                Kind::Places => ("No results", "Try a session's name, a machine's, or remote."),
             };
             div().py(px(24.)).flex().flex_col().items_center().gap(px(6.)).child(title).child(div().text_color(theme.text_muted).child(hint))
         });
@@ -808,7 +873,7 @@ mod tests {
 
     fn item(section: Section, label: &str) -> Item {
         let run = if section == Section::Commands { Run::Action("NewTab") } else { Run::Tab("t".into()) };
-        Item { key: label.into(), section, icon: "", label: label.into(), hint: None, chord: None, status: None, run }
+        Item { key: label.into(), section, icon: "", mark: None, label: label.into(), hint: None, chord: None, status: None, run }
     }
 
     #[test]
@@ -943,6 +1008,30 @@ mod tests {
             ],
             "a workspace without tabs has nothing to show; idle ones show no dot"
         );
+    }
+
+    #[test]
+    fn places_list_the_bar_in_order_and_say_where_they_are() {
+        let row = |key: &str, remote: Option<&str>, shown: bool| PlaceRow {
+            key: key.into(),
+            name: key.to_uppercase(),
+            icon: (key == "b").then(|| "🚀".to_string()),
+            remote: remote.map(str::to_string),
+            shown,
+        };
+        let items = place_items(vec![row("a", None, true), row("b", None, false), row("m", Some("me@box"), false)]);
+        let rows: Vec<_> = items.iter().map(|i| (i.label.as_str(), i.hint.as_deref(), i.icon, i.mark.as_deref())).collect();
+        assert_eq!(
+            rows,
+            [
+                ("A", Some("current · local"), "icons/terminal.svg", None),
+                ("B", Some("local"), "icons/terminal.svg", Some("🚀")),
+                ("M", Some("remote · me@box"), "icons/remote-server.svg", None),
+            ]
+        );
+        assert_eq!(items[2].run, Run::Place("m".into()));
+        assert_eq!(ranked("remote", &items), ["M"], "a machine is found by where it is");
+        assert_eq!(ranked("box", &items), ["M"]);
     }
 
     #[test]
