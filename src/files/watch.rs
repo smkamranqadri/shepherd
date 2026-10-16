@@ -291,6 +291,10 @@ pub fn classify(spot: &Spot, skip: &HashSet<PathBuf>, kind: &EventKind, path: &P
     if matches!(kind, EventKind::Access(_)) {
         return batch;
     }
+    // a save's own temp file (`files::save`), made and renamed over its file: the file's own event says it changed
+    if path.file_name().is_some_and(super::save::is_temp_name) {
+        return batch;
+    }
     if departed(kind) {
         // only those watched are kept (`run`): a deleted file costs nothing
         batch.gone.insert(path.to_path_buf());
@@ -715,6 +719,17 @@ mod tests {
         assert_eq!(b.dirs, set(&["/r/a", "/r/a/x", "/r/b", "/r/b/x"]));
         // the first path went (its watch is let go of), the second came (watched afresh)
         assert_eq!((b.gone, b.new_dirs), (set(&["/r/a/x"]), set(&["/r/b/x"])));
+    }
+
+    /// A save writes a temp file beside its file and renames it over: only the file's own end counts.
+    #[test]
+    fn a_save_s_temp_file_is_not_a_change() {
+        assert!(modify("/r/src/.a.rs.shepherd-41-3~").is_empty());
+        let renamed = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both))).add_path("/r/src/.a.rs.shepherd-41-3~".into()).add_path("/r/src/a.rs".into());
+        let b = classify_event(&spot(), &HashSet::new(), &renamed, &|_| false);
+        assert_eq!((b.dirs, b.status, b.gone), (set(&["/r/src", "/r/src/a.rs"]), true, BTreeSet::new()));
+        // a name only like one is a file like any other
+        assert!(!modify("/r/src/.a.rs.shepherd-x~").is_empty());
     }
 
     /// A folder deleted or moved away is forgotten, so the same path made again is watched; one under an
