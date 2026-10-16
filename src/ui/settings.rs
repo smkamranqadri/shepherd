@@ -150,6 +150,7 @@ pub fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) {
     let Some(settings) = SettingsGlobal::of(cx).settings.changed_by(change) else { return };
     let keys_changed = settings.keys != SettingsGlobal::of(cx).settings.keys;
     let secure_changed = settings.secure_input != SettingsGlobal::of(cx).settings.secure_input;
+    let translucent_changed = settings.translucent_window != SettingsGlobal::of(cx).settings.translucent_window;
     let path = {
         let global = cx.global_mut::<SettingsGlobal>();
         global.settings = settings.clone();
@@ -160,6 +161,12 @@ pub fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) {
     set_binary(settings.herdr_bin.clone());
     set_socket(settings.herdr_socket.clone());
     cx.set_global(settings.theme(cx.window_appearance()));
+    if translucent_changed {
+        let background = crate::shell::window_background(settings.translucent_window);
+        for window in cx.windows() {
+            let _ = window.update(cx, |_, window, _| window.set_background_appearance(background));
+        }
+    }
     if keys_changed {
         rebind(cx, &settings.keys);
     } else if secure_changed {
@@ -1096,6 +1103,24 @@ impl Render for SettingsView {
                         card(&theme)
                             .child(card_row(&theme, true).child(row_text(&theme, "Light theme", "When the window is light.")).child(light_select))
                             .child(card_row(&theme, false).child(row_text(&theme, "Dark theme", "When the window is dark.")).child(dark_select)),
+                    )
+                    .child(section_label(&theme, "Window"))
+                    .child(
+                        card(&theme).mt_0().child(
+                            card_row(&theme, true)
+                                .child(row_text(
+                                    &theme,
+                                    "Translucent window",
+                                    if cfg!(target_os = "macos") {
+                                        "The desktop shows through the window, blurred."
+                                    } else {
+                                        "The desktop shows through the window. Whether it is blurred depends on your compositor."
+                                    },
+                                ))
+                                .child(toggle(&theme, "translucent-window", settings.translucent_window).on_click(cx.listener(
+                                    |_, _: &ClickEvent, _, cx| update(cx, |s| s.translucent_window = !s.translucent_window),
+                                ))),
+                        ),
                     )
             }
             Section::Notifications => {
