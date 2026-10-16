@@ -117,8 +117,39 @@ impl Shell {
         cx.notify();
     }
 
+    /// Asks for the new workspace's folder with the system's folder picker. A remote machine, or no picker to
+    /// ask with, leaves the folder to herdr (the focused pane's); a cancelled picker makes nothing.
     pub(super) fn new_workspace(&mut self, cx: &mut Context<Self>) {
-        self.send(Command::NewWorkspace { cwd: None }, cx, |shell, result, cx| {
+        if !picks_folder(self.machine_label.as_deref()) {
+            self.create_workspace(None, cx);
+            return;
+        }
+        // gpui's picker takes no starting folder: it opens where the system's picker chooses
+        let answer = cx.prompt_for_paths(gpui::PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Open".into()) });
+        let place = self.machine_label.clone();
+        cx.spawn(async move |this, cx| {
+            let pick = after_pick(answer.await.ok());
+            let _ = this.update(cx, |shell, cx| {
+                // a local folder means nothing on a machine switched to while the picker was open
+                if shell.machine_label != place {
+                    return;
+                }
+                match pick {
+                    AfterPick::Create(cwd) => shell.create_workspace(Some(cwd), cx),
+                    AfterPick::Nothing => {}
+                    AfterPick::Default(why) => {
+                        eprintln!("shepherd: the folder picker did not open: {why}");
+                        crate::ui::toast::info(cx, "No folder picker is available, so the workspace opens in the focused pane's folder", None);
+                        shell.create_workspace(None, cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn create_workspace(&mut self, cwd: Option<String>, cx: &mut Context<Self>) {
+        self.send(Command::NewWorkspace { cwd }, cx, |shell, result, cx| {
             shell.selected_tab = crate::commands::created_tab_id(result);
             cx.notify();
         });
@@ -181,4 +212,63 @@ impl Shell {
 pub(super) fn new_branch_name() -> String {
     let micros = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
     crate::commands::generated_branch(micros)
+}
+
+/// Whether New workspace asks for a folder: not on a remote machine (`machine_label` set), whose folders a local
+/// picker cannot show.
+pub(super) fn picks_folder(machine_label: Option<&str>) -> bool {
+    machine_label.is_none()
+}
+
+/// What New workspace does once the folder picker answers.
+#[derive(Debug, PartialEq)]
+pub(super) enum AfterPick {
+    /// The folder picked.
+    Create(String),
+    /// Cancelled.
+    Nothing,
+    /// No picker opened (why): herdr's own folder, with a note.
+    Default(String),
+}
+
+/// `answer` is `None` when the picker went away without one.
+pub(super) fn after_pick(answer: Option<anyhow::Result<Option<Vec<std::path::PathBuf>>>>) -> AfterPick {
+    match answer {
+        Some(Ok(Some(paths))) => match paths.into_iter().next() {
+            Some(path) => AfterPick::Create(path.to_string_lossy().into_owned()),
+            None => AfterPick::Nothing,
+        },
+        Some(Ok(None)) => AfterPick::Nothing,
+        Some(Err(err)) => AfterPick::Default(format!("{err:#}")),
+        None => AfterPick::Default("the picker closed without an answer".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn new_workspace_picked_folder_is_its_cwd() {
+        assert_eq!(after_pick(Some(Ok(Some(vec![PathBuf::from("/home/me/code")])))), AfterPick::Create("/home/me/code".into()));
+    }
+
+    #[test]
+    fn new_workspace_cancelled_makes_nothing() {
+        assert_eq!(after_pick(Some(Ok(None))), AfterPick::Nothing);
+        assert_eq!(after_pick(Some(Ok(Some(vec![])))), AfterPick::Nothing);
+    }
+
+    #[test]
+    fn new_workspace_without_picker_falls_back() {
+        assert!(matches!(after_pick(Some(Err(anyhow::anyhow!("no portal")))), AfterPick::Default(why) if why.contains("no portal")));
+        assert!(matches!(after_pick(None), AfterPick::Default(_)));
+    }
+
+    #[test]
+    fn new_workspace_on_remote_machine_skips_picker() {
+        assert!(picks_folder(None));
+        assert!(!picks_folder(Some("build box")));
+    }
 }
