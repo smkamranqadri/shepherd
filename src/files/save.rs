@@ -16,18 +16,16 @@
 //! So a stamp is only trusted once it is older than `GRANULARITY_NS`, and a save never trusts one: it always
 //! compares the bytes on disk with the baseline, and right before the rename checks that the path is still the file
 //! it compared, untouched.
+//!
+//! Off unix (Windows) a file has no owner, group, mode bits or inode number to keep or compare (`os`): the stamp is
+//! the length and modification time, a read-only file is refused, and a deleted file comes back through a hard link
+//! or an exclusive create, as on a unix file system without a no-replace rename.
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions, Permissions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-unsafe extern "C" {
-    fn geteuid() -> u32;
-}
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 /// How long after a change a file's stamp may still be the one a further change leaves (a write in the same clock
@@ -114,13 +112,7 @@ pub struct Stamp {
 
 impl Stamp {
     pub fn of(meta: &fs::Metadata) -> Stamp {
-        Stamp {
-            len: meta.size(),
-            mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
-            ctime_ns: i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()),
-            ino: meta.ino(),
-            dev: meta.dev(),
-        }
+        os::stamp(meta)
     }
 
     /// Whether a change made at `now_ns` could still leave this stamp: its times are within the clock's granularity
@@ -190,7 +182,7 @@ impl Baseline {
         }
         let mut bytes = Vec::with_capacity(meta.len() as usize);
         file.read_to_end(&mut bytes)?;
-        Ok(Baseline { mode: meta.mode() & 0o777, ..Baseline::new(bytes, Stamp::of(&meta)) })
+        Ok(Baseline { mode: os::mode(&meta), ..Baseline::new(bytes, Stamp::of(&meta)) })
     }
 
     /// The baseline after writing `bytes` (encoded from this one) to the file now `meta`: same ending and BOM, mixed
@@ -205,7 +197,7 @@ impl Baseline {
             bom: self.bom,
             final_newline,
             mixed: false,
-            mode: meta.mode() & 0o777,
+            mode: os::mode(meta),
             settled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -359,9 +351,7 @@ fn held_if_same(path: &Path, expected: &[u8]) -> io::Result<Option<(File, Stamp)
 /// real path, when `root` is a link) or relative to it, with no `.`, `..` or empty parts; its real path must be inside `root`'s real path, and a regular file when
 /// it exists (a missing one is where a deleted file would be recreated).
 pub fn contained(root: &Path, path: &Path) -> Result<PathBuf, SaveError> {
-    let raw = path.as_os_str().as_bytes();
-    let parts = if path.is_absolute() { &raw[1..] } else { raw };
-    if parts.is_empty() || parts.split(|&c| c == b'/').any(|p| p.is_empty() || p == b"." || p == b"..") {
+    if !os::plain(path) {
         return Err(SaveError::OutsideRoot);
     }
     let real_root = fs::canonicalize(root).map_err(|e| io_error("Couldn't find the workspace folder", root, e))?;
@@ -410,7 +400,8 @@ fn real_path(path: &Path) -> Result<PathBuf, SaveError> {
 
 /// Whether `name` is one of a save's temp files (`.name.shepherd-PID-N~`), which a file tree should never show.
 pub fn is_temp_name(name: &OsStr) -> bool {
-    let b = name.as_bytes();
+    let b = crate::platform::os_bytes(name);
+    let b = &b[..];
     let Some(body) = b.strip_prefix(b".").and_then(|b| b.strip_suffix(b"~")) else { return false };
     const TAG: &[u8] = b".shepherd-";
     let Some(at) = body.windows(TAG.len()).rposition(|w| w == TAG) else { return false };
@@ -424,12 +415,13 @@ pub fn is_temp_name(name: &OsStr) -> bool {
 fn temp_name(name: &OsStr, n: u64) -> OsString {
     let suffix = format!(".shepherd-{}-{n}~", std::process::id());
     let room = NAME_MAX - 1 - suffix.len();
-    let mut stem = name.as_bytes();
+    let whole = crate::platform::os_bytes(name);
+    let mut stem = &whole[..];
     if stem.len() > room {
         stem = &stem[..room];
         if let Err(e) = std::str::from_utf8(stem)
             && e.error_len().is_none()
-            && std::str::from_utf8(name.as_bytes()).is_ok()
+            && std::str::from_utf8(&whole).is_ok()
         {
             stem = &stem[..e.valid_up_to()];
         }
@@ -438,7 +430,7 @@ fn temp_name(name: &OsStr, n: u64) -> OsString {
     out.push(b'.');
     out.extend_from_slice(stem);
     out.extend_from_slice(suffix.as_bytes());
-    OsString::from_vec(out)
+    crate::platform::os_from_bytes(&out)
 }
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -494,15 +486,15 @@ fn save_with(root: &Path, path: &Path, text: &str, b: &Baseline, mode: SaveMode,
     if !meta.is_file() {
         return Err(SaveError::NotAFile);
     }
-    // SAFETY: geteuid takes nothing and cannot fail.
-    let ours = meta.uid() == unsafe { geteuid() };
-    if ours && meta.mode() & 0o200 == 0 {
+    let ours = os::ours(&meta);
+    if ours && os::read_only(&meta) {
         return Err(SaveError::ReadOnly);
     }
     match mode {
         SaveMode::Safe | SaveMode::Overwrite => {
-            if meta.nlink() > 1 {
-                return Err(SaveError::HardLinked(meta.nlink()));
+            let links = os::links(&meta);
+            if links > 1 {
+                return Err(SaveError::HardLinked(links));
             }
             if !ours {
                 return Err(SaveError::OwnerDiffers);
@@ -525,11 +517,11 @@ fn replace(target: &Path, meta: &fs::Metadata, bytes: Vec<u8>, b: &Baseline, che
     write(&mut file, &bytes, hooks).map_err(failed)?;
     // the group first, while the temp is still 0600 (the folder's or the user's group may be one the file's readers
     // aren't in): the file's own if the user is in it, else refuse
-    if file.metadata().map_err(failed)?.gid() != meta.gid() {
-        std::os::unix::fs::fchown(&file, None, Some(meta.gid())).map_err(|_| SaveError::OwnerDiffers)?;
+    if !os::take_group(&file, meta).map_err(failed)? {
+        return Err(SaveError::OwnerDiffers);
     }
     // then exactly the old mode
-    file.set_permissions(Permissions::from_mode(meta.mode() & 0o777)).map_err(failed)?;
+    os::set_mode(&file, os::mode(meta)).map_err(failed)?;
     sync(&file, hooks).map_err(failed)?;
     hooks.before_check();
     let held = if check {
@@ -602,7 +594,7 @@ fn recreate(target: &Path, bytes: Vec<u8>, b: &Baseline, hooks: &mut Hooks) -> R
     let mut guard = Unlink(Some(temp.clone()));
     let failed = |e| io_error("Couldn't write", target, e);
     write(&mut file, &bytes, hooks).map_err(failed)?;
-    file.set_permissions(Permissions::from_mode(b.mode & 0o777)).map_err(failed)?;
+    os::set_mode(&file, b.mode).map_err(failed)?;
     sync(&file, hooks).map_err(failed)?;
     hooks.before_check();
     match rename_noreplace(&temp, target, hooks.no_noreplace) {
@@ -621,7 +613,7 @@ fn recreate(target: &Path, bytes: Vec<u8>, b: &Baseline, hooks: &mut Hooks) -> R
 
 /// `recreate` where nothing atomic works: O_CREAT|O_EXCL on the file itself, removed again if the write fails.
 fn recreate_exclusive(target: &Path, bytes: Vec<u8>, b: &Baseline, hooks: &mut Hooks) -> Result<Baseline, SaveError> {
-    let open = || OpenOptions::new().write(true).create_new(true).mode(0o600).open(target);
+    let open = || os::private(OpenOptions::new().write(true).create_new(true)).open(target);
     let mut file = retry(open).map_err(|e| match e.kind() {
         io::ErrorKind::AlreadyExists => SaveError::Conflict,
         io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem => SaveError::FolderNotWritable,
@@ -630,7 +622,7 @@ fn recreate_exclusive(target: &Path, bytes: Vec<u8>, b: &Baseline, hooks: &mut H
     let mut guard = Unlink(Some(target.to_path_buf()));
     let failed = |e| io_error("Couldn't write", target, e);
     write(&mut file, &bytes, hooks).map_err(failed)?;
-    file.set_permissions(Permissions::from_mode(b.mode & 0o777)).map_err(failed)?;
+    os::set_mode(&file, b.mode).map_err(failed)?;
     sync(&file, hooks).map_err(failed)?;
     guard.0 = None;
     if let Some(dir) = target.parent() {
@@ -647,13 +639,7 @@ fn unsupported(e: &io::Error) -> bool {
 /// Renames `from` to `to` unless `to` exists (`AlreadyExists`), atomically: the system's no-replace rename, else
 /// (`fallback`, or a file system without it) a hard link and the unlink of `from`.
 fn rename_noreplace(from: &Path, to: &Path, fallback: bool) -> io::Result<()> {
-    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput));
-    let (from_c, to_c) = (c(from)?, c(to)?);
-    let atomic = if fallback {
-        Err(io::Error::from(io::ErrorKind::Unsupported))
-    } else {
-        retry(|| noreplace(&from_c, &to_c))
-    };
+    let atomic = if fallback { Err(io::Error::from(io::ErrorKind::Unsupported)) } else { os::rename_noreplace(from, to) };
     match atomic {
         Err(e) if unsupported(&e) => {
             retry(|| fs::hard_link(from, to))?;
@@ -685,7 +671,7 @@ fn noreplace(from: &std::ffi::CStr, to: &std::ffi::CStr) -> io::Result<()> {
     if unsafe { renamex_np(from.as_ptr(), to.as_ptr(), RENAME_EXCL) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn noreplace(_: &std::ffi::CStr, _: &std::ffi::CStr) -> io::Result<()> {
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }
@@ -695,7 +681,7 @@ fn noreplace(_: &std::ffi::CStr, _: &std::ffi::CStr) -> io::Result<()> {
 fn create_temp(dir: &Path, name: &OsStr, target: &Path) -> Result<(PathBuf, File), SaveError> {
     for _ in 0..100 {
         let temp = dir.join(temp_name(name, TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)));
-        match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp) {
+        match os::private(OpenOptions::new().write(true).create_new(true)).open(&temp) {
             Ok(file) => return Ok((temp, file)),
             Err(e) if matches!(e.kind(), io::ErrorKind::AlreadyExists | io::ErrorKind::Interrupted) => continue,
             Err(e) if matches!(e.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem) => {
@@ -756,10 +742,141 @@ impl Drop for Unlink {
     }
 }
 
-#[cfg(test)]
+/// What a save needs of the system: owners, groups, modes and links, as unix keeps them.
+#[cfg(unix)]
+mod os {
+    use super::{Stamp, noreplace, retry};
+    use std::fs::{self, File, OpenOptions, Permissions};
+    use std::io;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::path::Path;
+
+    unsafe extern "C" {
+        pub(super) fn geteuid() -> u32;
+    }
+
+    pub(super) fn stamp(meta: &fs::Metadata) -> Stamp {
+        Stamp {
+            len: meta.size(),
+            mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+            ctime_ns: i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()),
+            ino: meta.ino(),
+            dev: meta.dev(),
+        }
+    }
+
+    /// The permission bits.
+    pub(super) fn mode(meta: &fs::Metadata) -> u32 {
+        meta.mode() & 0o777
+    }
+
+    /// The file is this user's.
+    pub(super) fn ours(meta: &fs::Metadata) -> bool {
+        // SAFETY: geteuid takes nothing and cannot fail.
+        meta.uid() == unsafe { geteuid() }
+    }
+
+    /// Its owner may not write it.
+    pub(super) fn read_only(meta: &fs::Metadata) -> bool {
+        meta.mode() & 0o200 == 0
+    }
+
+    pub(super) fn links(meta: &fs::Metadata) -> u64 {
+        meta.nlink()
+    }
+
+    /// Gives `file` the group of the file `meta` is; false when this user can't.
+    pub(super) fn take_group(file: &File, meta: &fs::Metadata) -> io::Result<bool> {
+        Ok(file.metadata()?.gid() == meta.gid() || std::os::unix::fs::fchown(file, None, Some(meta.gid())).is_ok())
+    }
+
+    pub(super) fn set_mode(file: &File, mode: u32) -> io::Result<()> {
+        file.set_permissions(Permissions::from_mode(mode & 0o777))
+    }
+
+    /// Opens 0600: the temp is no one else's to read until it has the file's group and mode.
+    pub(super) fn private(options: &mut OpenOptions) -> &mut OpenOptions {
+        options.mode(0o600)
+    }
+
+    /// `path` has no `.`, `..` or empty parts, and is not the root alone.
+    pub(super) fn plain(path: &Path) -> bool {
+        let raw = path.as_os_str().as_bytes();
+        let parts = if path.is_absolute() { &raw[1..] } else { raw };
+        !parts.is_empty() && !parts.split(|&c| c == b'/').any(|p| p.is_empty() || p == b"." || p == b"..")
+    }
+
+    pub(super) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+        let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput));
+        let (from, to) = (c(from)?, c(to)?);
+        retry(|| noreplace(&from, &to))
+    }
+}
+
+/// Off unix (Windows): no owner, group, mode bits, inode or link count to keep; the read-only flag is what refuses a
+/// save.
+#[cfg(not(unix))]
+mod os {
+    use super::Stamp;
+    use std::fs::{self, File, OpenOptions};
+    use std::io;
+    use std::path::{Component, Path};
+
+    pub(super) fn stamp(meta: &fs::Metadata) -> Stamp {
+        let ns = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as i128);
+        Stamp { len: meta.len(), mtime_ns: ns, ctime_ns: ns, ino: 0, dev: 0 }
+    }
+
+    /// What the file's mode would be: read-only or not.
+    pub(super) fn mode(meta: &fs::Metadata) -> u32 {
+        if meta.permissions().readonly() { 0o444 } else { 0o644 }
+    }
+
+    pub(super) fn ours(_: &fs::Metadata) -> bool {
+        true
+    }
+
+    pub(super) fn read_only(meta: &fs::Metadata) -> bool {
+        meta.permissions().readonly()
+    }
+
+    pub(super) fn links(_: &fs::Metadata) -> u64 {
+        1
+    }
+
+    pub(super) fn take_group(_: &File, _: &fs::Metadata) -> io::Result<bool> {
+        Ok(true)
+    }
+
+    pub(super) fn set_mode(file: &File, mode: u32) -> io::Result<()> {
+        let mut permissions = file.metadata()?.permissions();
+        permissions.set_readonly(mode & 0o200 == 0);
+        file.set_permissions(permissions)
+    }
+
+    pub(super) fn private(options: &mut OpenOptions) -> &mut OpenOptions {
+        options
+    }
+
+    pub(super) fn plain(path: &Path) -> bool {
+        path.components().any(|c| matches!(c, Component::Normal(_)))
+            && !path.components().any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+    }
+
+    /// No atomic rename-unless-there: the hard link fallback.
+    pub(super) fn rename_noreplace(_: &Path, _: &Path) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+// The tests make links, modes and other users' files, as unix has them.
+#[cfg(all(test, unix))]
 mod tests {
+    use super::os::geteuid;
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::fs::Permissions;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     fn names(dir: &Path) -> Vec<String> {
         let mut v: Vec<String> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();

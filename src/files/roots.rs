@@ -146,6 +146,7 @@ mod tests {
         assert!(!is_too_broad(Path::new("/opt/app"), home));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_link_to_home_is_too_broad() {
         let dir = tempfile::tempdir().unwrap();

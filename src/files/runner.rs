@@ -106,6 +106,9 @@ fn git_cmd_in(cwd: &Path, args: &[&str], inherited: impl IntoIterator<Item = Str
 fn spawn(cmd: &Cmd, stderr: bool) -> Result<tokio::process::Child, RunError> {
     let mut command = tokio::process::Command::new(&cmd.program);
     command.args(&cmd.args).current_dir(&cmd.cwd).kill_on_drop(true);
+    // git and rg are console programs: on Windows they'd each open a console window (`crate::process::command`)
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
     for key in &cmd.env_remove {
         command.env_remove(key);
     }
@@ -312,7 +315,8 @@ async fn pump(host: &Host, cmd: Cmd, limits: Limits, tx: &Sender) -> Result<(), 
     Ok(())
 }
 
-#[cfg(test)]
+// The tests run sh and ps.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use futures::StreamExt;

@@ -684,6 +684,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn reads_mark_what_git_ignores_and_a_poll_hears_only_of_changes() {
         let dir = tempfile::tempdir().unwrap();

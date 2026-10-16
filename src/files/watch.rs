@@ -385,11 +385,10 @@ pub fn walk(start: &Path, link_ok: bool, skip: &mut HashSet<PathBuf>, cancel: &A
 /// The folders git ignores in `out` (`git ls-files -z --others --ignored --directory`, paths from `root`: a folder
 /// ends in `/`), under `root`.
 pub fn parse_ignored(root: &Path, out: &[u8]) -> HashSet<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
     out.split(|&b| b == 0)
         .filter_map(|p| p.strip_suffix(b"/"))
         .filter(|p| !p.is_empty())
-        .map(|p| root.join(std::ffi::OsStr::from_bytes(p)))
+        .map(|p| root.join(crate::platform::os_from_bytes(p)))
         .collect()
 }
 
@@ -405,18 +404,17 @@ async fn ignored_dirs(root: &Path) -> HashSet<PathBuf> {
 
 /// Of `dirs` (new folders under `root`), those git ignores.
 async fn ignored_of(root: &Path, dirs: &[PathBuf]) -> HashSet<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
     let mut input = Vec::new();
     for dir in dirs {
         if let Ok(rel) = dir.strip_prefix(root) {
-            input.extend_from_slice(rel.as_os_str().as_bytes());
+            input.extend_from_slice(&crate::platform::git_path(rel));
             input.push(0);
         }
     }
     let mut cmd = runner::git_cmd(root, &["check-ignore", "-z", "--stdin"]);
     cmd.stdin = Some(input);
     match runner::run(&Host::Local, cmd, IGNORED).await {
-        Ok(out) if out.code == Some(0) => out.stdout.split(|&b| b == 0).filter(|p| !p.is_empty()).map(|p| root.join(std::ffi::OsStr::from_bytes(p))).collect(),
+        Ok(out) if out.code == Some(0) => out.stdout.split(|&b| b == 0).filter(|p| !p.is_empty()).map(|p| root.join(crate::platform::os_from_bytes(p))).collect(),
         _ => HashSet::new(),
     }
 }
@@ -828,6 +826,7 @@ mod tests {
 
     /// The walk leaves out `.git`, `node_modules`, a tagged cache and what git ignores, follows no link, and stops
     /// past its budget.
+    #[cfg(unix)]
     #[test]
     fn the_walk_leaves_out_heavy_folders_and_keeps_to_its_budget() {
         let dir = tempfile::tempdir().unwrap();
@@ -895,6 +894,7 @@ mod tests {
     /// (watched again), a link to the folder above (not followed), git's index, and nothing from under
     /// `node_modules`.
     #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_real_watch_hears_edits_new_folders_and_the_index() {
         use futures::StreamExt;

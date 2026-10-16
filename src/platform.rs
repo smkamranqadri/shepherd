@@ -126,6 +126,43 @@ pub fn ctrl_copy_paste(key: &str, mods: &Modifiers, enabled: bool, has_selection
     }
 }
 
+/// A path's or name's bytes as git reads and writes them: the system's own on unix, UTF-8 elsewhere (Windows, where
+/// git speaks UTF-8).
+pub fn os_bytes(s: &std::ffi::OsStr) -> std::borrow::Cow<'_, [u8]> {
+    #[cfg(unix)]
+    {
+        std::borrow::Cow::Borrowed(std::os::unix::ffi::OsStrExt::as_bytes(s))
+    }
+    #[cfg(not(unix))]
+    {
+        match s.to_string_lossy() {
+            std::borrow::Cow::Borrowed(s) => std::borrow::Cow::Borrowed(s.as_bytes()),
+            std::borrow::Cow::Owned(s) => std::borrow::Cow::Owned(s.into_bytes()),
+        }
+    }
+}
+
+/// A path under a repository as git reads it: `os_bytes`, with `/` between the folders on Windows too.
+pub fn git_path(path: &std::path::Path) -> std::borrow::Cow<'_, [u8]> {
+    let bytes = os_bytes(path.as_os_str());
+    if cfg!(windows) && bytes.contains(&b'\\') {
+        return std::borrow::Cow::Owned(bytes.iter().map(|&b| if b == b'\\' { b'/' } else { b }).collect());
+    }
+    bytes
+}
+
+/// `os_bytes` the other way: a path or name from git's bytes.
+pub fn os_from_bytes(bytes: &[u8]) -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(bytes).to_os_string()
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8_lossy(bytes).into_owned().into()
+    }
+}
+
 /// The modifier that turns a link under the pointer into a click target: Cmd on macOS, Ctrl elsewhere.
 pub fn link_modifier(mods: &Modifiers) -> bool {
     crate::terminal::keys::link_modifier(mods)
@@ -164,6 +201,7 @@ mod tests {
         assert_eq!(terminal_chord("v", &m(false, false, true)), None, "Super is the desktop's");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_launch_says_why_it_failed() {
         let argv = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
@@ -173,6 +211,7 @@ mod tests {
         assert!(launch(&[]).await.is_err());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_launched_program_has_a_session_of_its_own() {
         let dir = tempfile::tempdir().unwrap();

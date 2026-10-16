@@ -5,7 +5,6 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /// A folder lists at most this many entries: a `node_modules/.cache` or a mail spool with 300k files is not read
@@ -243,7 +242,7 @@ pub fn parse_check_ignore(out: &[u8]) -> Vec<Vec<u8>> {
 pub fn check_ignore_input(rel: &Path, listing: &Listing) -> Vec<u8> {
     let mut input = Vec::new();
     for entry in &listing.entries {
-        input.extend_from_slice(rel.join(&entry.os_name).as_os_str().as_bytes());
+        input.extend_from_slice(&crate::platform::git_path(&rel.join(&entry.os_name)));
         if entry.kind == EntryKind::Dir {
             input.push(b'/');
         }
@@ -256,7 +255,7 @@ pub fn check_ignore_input(rel: &Path, listing: &Listing) -> Vec<u8> {
 pub fn mark_ignored(listing: &mut Listing, rel: &Path, ignored: &[Vec<u8>]) {
     let ignored: HashSet<&[u8]> = ignored.iter().map(|p| p.strip_suffix(b"/").unwrap_or(p)).collect();
     for entry in &mut listing.entries {
-        entry.ignored = ignored.contains(rel.join(&entry.os_name).as_os_str().as_bytes());
+        entry.ignored = ignored.contains(&*crate::platform::git_path(&rel.join(&entry.os_name)));
     }
 }
 
@@ -367,6 +366,7 @@ mod tests {
 
     /// A name that is not UTF-8 goes to git, and is matched in its answer, byte for byte: a lossy `�` would match
     /// nothing (or the wrong file).
+    #[cfg(unix)]
     #[test]
     fn a_name_that_is_not_utf8_goes_to_git_as_its_bytes() {
         use std::os::unix::ffi::OsStringExt;
@@ -378,6 +378,7 @@ mod tests {
         assert_eq!(listing.entries.iter().map(|e| e.ignored).collect::<Vec<_>>(), [true, false]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_link_out_of_the_root_is_not_opened_and_one_inside_is() {
         let outside = tempfile::tempdir().unwrap();

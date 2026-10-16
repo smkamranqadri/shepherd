@@ -172,16 +172,24 @@ enum Note {
     TooLarge,
 }
 
+#[cfg(unix)]
 unsafe extern "C" {
     fn access(path: *const std::ffi::c_char, mode: std::ffi::c_int) -> std::ffi::c_int;
 }
 
 /// Whether this user may write `path` (the kernel's answer: mode bits, ACLs, a read-only mount).
+#[cfg(unix)]
 fn writable(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
     // SAFETY: a NUL-terminated path, read by access(2) only
     unsafe { access(c.as_ptr(), 2) == 0 }
+}
+
+/// Off unix: the file's read-only flag.
+#[cfg(not(unix))]
+fn writable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| !m.permissions().readonly())
 }
 
 /// Reads `path` for editing (blocking: the runtime's blocking pool runs it). `force` opens text with long lines too.
