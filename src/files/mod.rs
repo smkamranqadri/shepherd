@@ -5,6 +5,8 @@ pub mod highlight;
 pub mod icons;
 pub mod line_changes;
 pub mod open_files;
+pub mod pdf;
+pub mod pdf_worker;
 pub mod roots;
 pub mod runner;
 pub mod save;

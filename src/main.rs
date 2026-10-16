@@ -2,6 +2,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    // a PDF tab's worker process (`files::pdf_worker`): no window, no runtime, only its pipes
+    if std::env::args_os().nth(1).is_some_and(|a| a == shepherd::files::pdf_worker::ARG) {
+        shepherd::files::pdf_worker::serve();
+        return;
+    }
     let rt = tokio::runtime::Runtime::new().expect("tokio");
     let handle = rt.handle().clone();
     gpui_platform::application().with_assets(shepherd::assets::Assets).run(move |cx| {

@@ -351,6 +351,25 @@ pub fn set_menus(cx: &mut App) {
 // Window-management items macOS apps carry; not rebindable, so outside `app_actions!`.
 gpui::actions!(shepherd, [Hide, HideOthers, ShowAll, Minimize, Zoom, ToggleFullScreen]);
 
+// A PDF tab's zoom, in its view only (`PDF_VIEW`); not rebindable, so outside `app_actions!`.
+gpui::actions!(shepherd, [PdfZoomIn, PdfZoomOut, PdfZoomReset]);
+
+/// Where a PDF tab's zoom chords are bound: its pages' view, which has the keyboard while the tab shows.
+pub const PDF_VIEW: &str = "PdfView";
+
+/// A PDF tab's zoom: Cmd/Ctrl with +, − and 0, the text size's chords everywhere else. Bound after the app's
+/// (`apply`), so in the PDF view, where both match as deep, these win; anywhere else the app's stay.
+fn pdf_keys() -> Vec<KeyBinding> {
+    let primary = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+    let chord = |key: &str| format!("{primary}-{key}");
+    vec![
+        KeyBinding::new(&chord("="), PdfZoomIn, Some(PDF_VIEW)),
+        KeyBinding::new(&chord("+"), PdfZoomIn, Some(PDF_VIEW)),
+        KeyBinding::new(&chord("-"), PdfZoomOut, Some(PDF_VIEW)),
+        KeyBinding::new(&chord("0"), PdfZoomReset, Some(PDF_VIEW)),
+    ]
+}
+
 fn menus(secure_input: bool) -> Vec<gpui::Menu> {
     use gpui::{Menu, MenuItem as I, SystemMenuType};
     vec![
@@ -455,6 +474,7 @@ pub fn apply(cx: &mut App, previous: &[(String, String)], next: &[(String, Strin
         .map(|(chord, context, _)| KeyBinding::new(chord, NoAction, *context))
         .collect();
     bindings.extend(after.iter().filter_map(|(chord, context, action)| binding(action, chord, *context)));
+    bindings.extend(pdf_keys());
     cx.bind_keys(bindings);
 }
 
@@ -722,6 +742,32 @@ mod tests {
         {
             assert_eq!(fired("cmd-up", &editor).as_deref(), Some("input::SelectToStart"), "not the previous workspace");
             assert_eq!(fired("cmd-up", &pane).as_deref(), Some("shepherd::PreviousWorkspace"));
+        }
+    }
+
+    /// In a PDF tab the text size's chords zoom its pages; everywhere else they are the app's, as before. A keymap in
+    /// `apply`'s order: the app's bindings, then the PDF view's.
+    #[test]
+    fn the_zoom_chords_zoom_a_pdf_only_in_its_view() {
+        let text = text_chords_here();
+        let eff = effective(&user(&[]));
+        let mut keymap = gpui::Keymap::new(placed(&eff, &text).into_iter().filter_map(|(chord, context, action)| binding(action, chord, context)).collect());
+        keymap.add_bindings(pdf_keys());
+        let fired = |chord: &str, at: &[gpui::KeyContext]| {
+            let typed = gpui::Keystroke::parse(chord).unwrap();
+            keymap.bindings_for_input(&[typed], at).0.first().map(|b| b.action().name().to_string())
+        };
+        let pdf = stack(&["Workspace", "FileEditor", "FileViewer", PDF_VIEW]);
+        let viewer = stack(&["Workspace", "FileEditor", "FileViewer"]);
+        let pane = stack(&["Workspace", "Terminal"]);
+        let primary = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+        for (key, zoom, app) in [("=", "PdfZoomIn", "FontSizeUp"), ("+", "PdfZoomIn", "FontSizeUp"), ("-", "PdfZoomOut", "FontSizeDown"), ("0", "PdfZoomReset", "FontSizeReset")] {
+            let chord = format!("{primary}-{key}");
+            assert_eq!(fired(&chord, &pdf).as_deref(), Some(format!("shepherd::{zoom}").as_str()), "{chord} in a PDF");
+            // the same keys as the text size's: theirs outside the PDF view
+            assert!(eff.iter().any(|(a, k)| a == app && Some(k) == normalize(&chord).as_ref()), "{chord} is {app}'s");
+            assert_eq!(fired(&chord, &viewer).as_deref(), Some(format!("shepherd::{app}").as_str()), "{chord} in the viewer");
+            assert_eq!(fired(&chord, &pane).as_deref(), Some(format!("shepherd::{app}").as_str()), "{chord} in a pane");
         }
     }
 

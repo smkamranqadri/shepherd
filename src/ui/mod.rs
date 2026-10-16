@@ -6,6 +6,7 @@ pub mod editor;
 pub mod editor_highlight;
 pub mod loader;
 pub mod markdown;
+pub mod pdf_view;
 pub mod project_icon;
 pub mod review;
 pub mod settings;

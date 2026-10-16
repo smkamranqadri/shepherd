@@ -27,12 +27,12 @@ pub enum FileKind {
     Text,
     Markdown,
     Image,
-    /// Shown by a placeholder until the viewer draws PDFs itself (M4b), never handed to an outside app.
+    /// Drawn page by page in the viewer (`files::pdf`, `ui::pdf_view`).
     Pdf,
     Binary,
     /// Text in another encoding (no NUL, but not UTF-8): Latin-1, UTF-16 without NULs in its head, …
     NotUtf8,
-    /// Its size in bytes: over `MAX_TEXT` for text, `MAX_IMAGE` for an image or a PDF.
+    /// Its size in bytes: over `MAX_TEXT` for text, `MAX_IMAGE` for an image, `pdf::MAX_PDF` for a PDF.
     TooLarge(u64),
 }
 
@@ -59,7 +59,7 @@ pub fn kind_of(path: &Path, head: &[u8], size: u64) -> FileKind {
         return if size > MAX_IMAGE { FileKind::TooLarge(size) } else { FileKind::Image };
     }
     if is_pdf(path) {
-        return if size > MAX_IMAGE { FileKind::TooLarge(size) } else { FileKind::Pdf };
+        return if size > super::pdf::MAX_PDF { FileKind::TooLarge(size) } else { FileKind::Pdf };
     }
     let head = &head[..head.len().min(HEAD)];
     let utf8 = match std::str::from_utf8(head) {
@@ -148,7 +148,7 @@ pub enum Content {
     Image(u32, u32),
     /// An SVG within the budget, and its size in CSS pixels (its `width`/`height`, else its `viewBox`).
     Svg(u32, u32),
-    /// A PDF within `MAX_IMAGE`; only its head was read.
+    /// A PDF within `pdf::MAX_PDF`; only its head was read (the PDF view reads the rest).
     Pdf,
     Binary,
     /// Text that is not UTF-8 (no NUL in it): the viewer does not guess encodings.
@@ -417,7 +417,9 @@ mod tests {
         assert_eq!(kind_of(Path::new("shot.png"), b"", MAX_IMAGE + 1), FileKind::TooLarge(MAX_IMAGE + 1));
         // a PDF's head is binary, its name says what it is
         assert_eq!(kind_of(Path::new("paper.PDF"), b"%PDF-1.7\n\xe2\xe3\0", 13), FileKind::Pdf);
-        assert_eq!(kind_of(Path::new("paper.pdf"), b"", MAX_IMAGE + 1), FileKind::TooLarge(MAX_IMAGE + 1));
+        assert_eq!(kind_of(Path::new("paper.pdf"), b"", MAX_IMAGE + 1), FileKind::Pdf, "a PDF's budget is its own");
+        let over = crate::files::pdf::MAX_PDF + 1;
+        assert_eq!(kind_of(Path::new("paper.pdf"), b"", over), FileKind::TooLarge(over));
         // a NUL past the head is not looked for
         let mut head = vec![b'a'; HEAD];
         head.push(0);

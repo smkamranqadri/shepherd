@@ -1,7 +1,8 @@
 //! The file viewer: one file, read-only, a file tab's view in the pane grid's place (the panes keep their size).
 //! It closes as its tab does (Ctrl/Cmd+W, the tab's `×`), so it has no Esc or close button of its own. Text shows at
 //! once in the terminal's font and size, highlighting lands when the runtime has it (`files::highlight`); markdown
-//! previews through `ui::markdown`; images show through gpui; anything else says why not and offers the editor.
+//! previews through `ui::markdown`; images show through gpui; a PDF's pages through `ui::pdf_view`; anything else
+//! says why not and offers the editor.
 //!
 //! The code view is a `uniform_list` (a 100k-line file lays out only the rows on screen), so gpui's own text
 //! selection, which needs every paragraph painted, cannot serve it: it keeps its own, a line-and-byte anchor and
@@ -11,9 +12,10 @@ use crate::files::highlight::{self, Highlights, Token};
 use crate::shell::widgets::{tip, titlebar_button};
 use crate::theme::Theme;
 use crate::ui::markdown::{Link, Links};
+use crate::ui::pdf_view::PdfView;
 use crate::ui::review::Block;
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, DispatchPhase, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
+    AnyElement, App, Bounds, ClickEvent, Context, DispatchPhase, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
     ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollHandle, ScrollStrategy,
     SharedString, StatefulInteractiveElement, Styled, StyledText, TextLayout, TextRun, UniformListScrollHandle, Window, canvas, div, point, prelude::*, px,
 };
@@ -235,13 +237,18 @@ pub struct FileViewer {
     dragging: bool,
     /// The code rows painted last frame and their text layouts, for hit-testing a press or a drag.
     painted: Rc<RefCell<Vec<(usize, TextLayout)>>>,
+    /// A PDF's pages, which have the keyboard while they show.
+    pdf: Option<Entity<PdfView>>,
 }
 
 impl EventEmitter<ViewerEvent> for FileViewer {}
 
 impl Focusable for FileViewer {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match &self.pdf {
+            Some(pdf) => pdf.read(cx).focus_handle(cx),
+            None => self.focus.clone(),
+        }
     }
 }
 
@@ -270,6 +277,7 @@ impl FileViewer {
             sel_at: 0,
             dragging: false,
             painted: Rc::default(),
+            pdf: None,
         }
     }
 
@@ -286,6 +294,7 @@ impl FileViewer {
     /// `LOAD_TIMEOUT`; the old file's highlight stops.
     pub fn open(&mut self, path: PathBuf, line: Option<u32>, root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         self.release(Some(window), cx);
+        self.pdf = None;
         self.generation += 1;
         self.cancel = Arc::default();
         (self.path, self.root, self.shown) = (path.clone(), root.clone(), Shown::Loading);
@@ -319,9 +328,9 @@ impl FileViewer {
                 Err(_) => failed(NOT_RESPONDING),
             }
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             if let Ok(loaded) = job.await {
-                let _ = this.update(cx, |v, cx| v.loaded(generation, loaded, cx));
+                let _ = this.update_in(cx, |v, window, cx| v.loaded(generation, loaded, window, cx));
             }
         })
         .detach();
@@ -335,15 +344,17 @@ impl FileViewer {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
-    /// Drops the shown image's pixels from gpui's cache (an image shown again is read afresh): when the viewer
-    /// goes out of sight, not only when it goes.
+    /// Drops the shown image's pixels from gpui's cache (an image shown again is read afresh), or a PDF's drawn
+    /// pages and its worker: when the viewer goes out of sight, not only when it goes.
     pub fn evict_image(&mut self, window: Option<&mut Window>, cx: &mut App) {
-        if matches!(self.shown, Shown::Other(Content::Image(..) | Content::Svg(..))) {
+        if let Some(pdf) = &self.pdf {
+            pdf.update(cx, |p, _| p.hide(window));
+        } else if matches!(self.shown, Shown::Other(Content::Image(..) | Content::Svg(..))) {
             gpui::ImageSource::from(self.path.clone()).evict(window, cx);
         }
     }
 
-    fn loaded(&mut self, generation: u64, loaded: Loaded, cx: &mut Context<Self>) {
+    fn loaded(&mut self, generation: u64, loaded: Loaded, window: &mut Window, cx: &mut Context<Self>) {
         if generation != self.generation {
             return;
         }
@@ -358,6 +369,16 @@ impl FileViewer {
                     self.scroll.scroll_to_item(line.min(self.text.len().saturating_sub(1)), ScrollStrategy::Center);
                 }
                 Shown::Text
+            }
+            Content::Pdf => {
+                let (path, rt) = (self.path.clone(), self.rt.clone());
+                let pdf = cx.new(|cx| PdfView::new(path, rt, cx));
+                // the viewer had the keyboard: its pages take it
+                if self.focus.is_focused(window) {
+                    window.focus(&pdf.read(cx).focus_handle(cx), cx);
+                }
+                self.pdf = Some(pdf);
+                Shown::Other(Content::Pdf)
             }
             other => Shown::Other(other),
         };
@@ -482,6 +503,10 @@ impl FileViewer {
     }
 
     fn key(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // a PDF's pages take their own keys
+        if self.pdf.is_some() {
+            return;
+        }
         let (key, m) = (e.keystroke.key.as_str(), &e.keystroke.modifiers);
         // Cmd on macOS; Ctrl on Linux, where Ctrl+C has no shell here to interrupt (Ctrl+Shift+C works as in a pane)
         let primary = if cfg!(target_os = "macos") { m.platform && !m.control } else { m.control && !m.platform };
@@ -723,6 +748,10 @@ impl FileViewer {
             Content::Svg(w, h) => image(*w as f32, *h as f32),
             Content::Binary => self.notice(theme, "This file is binary", "The viewer shows text and images.", true, cx),
             Content::NotUtf8 => self.notice(theme, "This file is not UTF-8 text", "The viewer shows UTF-8 text; an editor may read its encoding.", true, cx),
+            Content::TooLarge(size) if content::is_pdf(&self.path) => {
+                let hint = format!("It is {}; the viewer shows PDFs up to {}.", content::human_size(*size), content::human_size(crate::files::pdf::MAX_PDF));
+                self.notice(theme, "This file is too large to show", hint, true, cx)
+            }
             Content::TooLarge(size) => {
                 let hint = format!("It is {}; the viewer shows text up to {} and images up to {}.", content::human_size(*size), content::human_size(MAX_TEXT), content::human_size(content::MAX_IMAGE));
                 self.notice(theme, "This file is too large to show", hint, true, cx)
@@ -742,8 +771,10 @@ impl FileViewer {
                 let editor = why == NOT_RESPONDING;
                 self.notice(theme, "Could not show this file", why.clone(), editor, cx)
             }
-            // ponytail: M4b draws the pages here
-            Content::Pdf => self.notice(theme, "PDF preview is coming", "The viewer will show PDFs in a coming version.", true, cx),
+            Content::Pdf => match &self.pdf {
+                Some(pdf) => pdf.clone().into_any_element(),
+                None => div().into_any_element(),
+            },
             Content::Text(_) | Content::Markdown(_) => div().into_any_element(),
         }
     }
@@ -939,8 +970,9 @@ impl Render for FileViewer {
             .track_focus(&self.focus)
             .key_context("FileViewer")
             .on_key_down(cx.listener(|v, e: &KeyDownEvent, window, cx| v.key(e, window, cx)))
-            // a press anywhere in it gives it the keyboard (it has no inputs of its own to keep it from)
-            .on_mouse_down(MouseButton::Left, cx.listener(|v, _, window, cx| window.focus(&v.focus, cx)))
+            // a press anywhere in it gives it the keyboard (it has no inputs of its own to keep it from); a PDF's
+            // pages, when they show
+            .on_mouse_down(MouseButton::Left, cx.listener(|v, _, window, cx| window.focus(&v.focus_handle(cx), cx)))
             .size_full()
             .flex()
             .flex_col()
