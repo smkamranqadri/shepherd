@@ -462,4 +462,24 @@ mod tests {
         assert_eq!(h.shown(t0 + ms(450) + FADE_IN + FADE_OUT), None);
         assert!(!h.fading(t0 + ms(450) + FADE_IN + FADE_OUT));
     }
+
+    /// What a chord's keys hold down: its modifiers, and Shift for the shifted digit Linux hears Ctrl+Shift+1 as.
+    fn held_by(chord: &str) -> Modifiers {
+        let k = gpui::Keystroke::parse(chord).unwrap();
+        let mut m = k.modifiers;
+        m.shift |= crate::bindings::shifted_digit(&k.key).is_some();
+        m
+    }
+
+    #[test]
+    fn the_hint_modifiers_are_the_numbered_chords_own() {
+        // what is held to see the chips is what goes with the digit: Cmd and Ctrl on macOS, Alt and Ctrl+Shift elsewhere
+        let default = |action: &str| crate::bindings::DEFAULTS.iter().find(|(a, _)| *a == action).unwrap().1;
+        let mac = cfg!(target_os = "macos");
+        for (actions, mode) in [(crate::bindings::TAB_ACTIONS, HintMode::Tabs), (crate::bindings::WORKSPACE_ACTIONS, HintMode::Workspaces)] {
+            for action in actions {
+                assert_eq!(held(&held_by(default(action)), mac), Held::Mode(mode), "{action}");
+            }
+        }
+    }
 }

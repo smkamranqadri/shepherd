@@ -161,8 +161,6 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("Tab9", "cmd-9"),
     ("PreviousTab", "cmd-{"),
     ("NextTab", "cmd-}"),
-    ("PreviousTab", "ctrl-shift-tab"),
-    ("NextTab", "ctrl-tab"),
     ("PreviousWorkspace", "cmd-up"),
     ("NextWorkspace", "cmd-down"),
     // the sessions and machines of the sidebar's bar; Cmd+Opt+Up/Down is taken, by focus up and down
@@ -181,9 +179,9 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("ToggleSidebar", "cmd-b"),
     ("ToggleReview", "cmd-alt-b"),
     ("ShowFiles", "cmd-shift-e"),
-    // Ctrl, not Cmd: Cmd+Shift+G is a pane's find previous. Terminals get Ctrl+Shift+G in the legacy encoding as
-    // Ctrl+G (BEL), which this takes from them; rebind it in Keys settings if a TUI wants it.
-    ("ShowChanges", "ctrl-shift-g"),
+    // Cmd+Alt, beside the panel's toggle: Cmd+Shift+G is a pane's find previous, and Ctrl+Shift+G a key the pane's
+    // app gets
+    ("ShowChanges", "cmd-alt-g"),
     ("ShowSearch", "cmd-shift-f"),
     ("QuickOpen", "cmd-p"),
     ("FontSizeUp", "cmd-="),
@@ -226,9 +224,6 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("Tab9", "alt-9"),
     ("PreviousTab", "ctrl-pageup"),
     ("NextTab", "ctrl-pagedown"),
-    // Ghostty's next and previous tab too
-    ("PreviousTab", "ctrl-shift-tab"),
-    ("NextTab", "ctrl-tab"),
     ("PreviousWorkspace", "ctrl-shift-pageup"),
     ("NextWorkspace", "ctrl-shift-pagedown"),
     // the sessions and machines of the sidebar's bar: the workspace chords with Alt
@@ -507,12 +502,96 @@ mod tests {
         eff.iter().find(|(a, _)| a == action).map(|(_, k)| k.as_str())
     }
 
+    /// Upstream's defaults (freethinkel/shepherd v1.3.0), which the sidebar's actions never change: only its own
+    /// actions gain chords.
+    #[cfg(target_os = "macos")]
+    const UPSTREAM: &[(&str, &str)] = &[
+        ("NewTab", "cmd-t"),
+        ("CloseTab", "cmd-shift-w"),
+        ("NewWorkspace", "cmd-shift-n"),
+        ("SplitRight", "cmd-d"),
+        ("SplitDown", "cmd-shift-d"),
+        ("ClosePane", "cmd-w"),
+        ("FocusLeft", "cmd-alt-left"),
+        ("FocusRight", "cmd-alt-right"),
+        ("FocusUp", "cmd-alt-up"),
+        ("FocusDown", "cmd-alt-down"),
+        ("ToggleZoom", "cmd-shift-enter"),
+        ("Tab1", "cmd-1"),
+        ("Tab2", "cmd-2"),
+        ("Tab3", "cmd-3"),
+        ("Tab4", "cmd-4"),
+        ("Tab5", "cmd-5"),
+        ("Tab6", "cmd-6"),
+        ("Tab7", "cmd-7"),
+        ("Tab8", "cmd-8"),
+        ("Tab9", "cmd-9"),
+        ("PreviousTab", "cmd-{"),
+        ("NextTab", "cmd-}"),
+        ("PreviousWorkspace", "cmd-up"),
+        ("NextWorkspace", "cmd-down"),
+        ("ToggleSidebar", "cmd-b"),
+        ("ToggleReview", "cmd-alt-b"),
+        ("FontSizeUp", "cmd-="),
+        ("FontSizeUp", "cmd-+"),
+        ("FontSizeDown", "cmd--"),
+        ("FontSizeReset", "cmd-0"),
+        ("OpenSettings", "cmd-,"),
+        ("CommandPanel", "cmd-k"),
+        ("CommandPanel", "cmd-shift-p"),
+        ("AgentsPanel", "cmd-shift-a"),
+        ("Quit", "cmd-q"),
+    ];
+    #[cfg(not(target_os = "macos"))]
+    const UPSTREAM: &[(&str, &str)] = &[
+        ("NewTab", "ctrl-shift-t"),
+        ("CloseTab", "ctrl-alt-w"),
+        ("NewWorkspace", "ctrl-shift-n"),
+        ("SplitRight", "ctrl-shift-o"),
+        ("SplitDown", "ctrl-shift-e"),
+        ("ClosePane", "ctrl-shift-w"),
+        ("FocusLeft", "ctrl-alt-left"),
+        ("FocusRight", "ctrl-alt-right"),
+        ("FocusUp", "ctrl-alt-up"),
+        ("FocusDown", "ctrl-alt-down"),
+        ("ToggleZoom", "ctrl-shift-enter"),
+        ("Tab1", "alt-1"),
+        ("Tab2", "alt-2"),
+        ("Tab3", "alt-3"),
+        ("Tab4", "alt-4"),
+        ("Tab5", "alt-5"),
+        ("Tab6", "alt-6"),
+        ("Tab7", "alt-7"),
+        ("Tab8", "alt-8"),
+        ("Tab9", "alt-9"),
+        ("PreviousTab", "ctrl-pageup"),
+        ("NextTab", "ctrl-pagedown"),
+        ("PreviousWorkspace", "ctrl-shift-pageup"),
+        ("NextWorkspace", "ctrl-shift-pagedown"),
+        ("ToggleSidebar", "ctrl-shift-b"),
+        ("ToggleReview", "ctrl-alt-b"),
+        ("FontSizeUp", "ctrl-="),
+        ("FontSizeUp", "ctrl-+"),
+        ("FontSizeDown", "ctrl--"),
+        ("FontSizeReset", "ctrl-0"),
+        ("OpenSettings", "ctrl-,"),
+        ("CommandPanel", "ctrl-shift-p"),
+        ("AgentsPanel", "ctrl-shift-a"),
+        ("Quit", "ctrl-shift-q"),
+    ];
+
     #[test]
-    fn ctrl_tab_steps_through_the_tabs() {
-        let eff = effective(&user(&[]));
-        let bound = |action: &str, chord: &str| eff.iter().any(|(a, k)| a == action && Some(k.as_str()) == normalize(chord).as_deref());
-        assert!(bound("NextTab", "ctrl-tab"));
-        assert!(bound("PreviousTab", "ctrl-shift-tab"));
+    fn upstream_actions_keep_upstreams_chords() {
+        let upstream = |action: &str| UPSTREAM.iter().any(|(a, _)| *a == action);
+        let ours: Vec<_> = DEFAULTS.iter().filter(|(a, _)| upstream(a)).collect();
+        assert_eq!(ours.len(), UPSTREAM.len(), "the same number of upstream chords");
+        for (action, chord) in UPSTREAM {
+            assert!(DEFAULTS.contains(&(*action, *chord)), "{action} keeps {chord}");
+        }
+        // and every upstream action is still an action
+        for (action, _) in UPSTREAM {
+            assert!(known(action), "{action}");
+        }
     }
 
     #[test]
@@ -529,12 +608,43 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     fn linux_defaults_leave_readline_its_ctrl_letters() {
         let eff = effective(&user(&[]));
-        // an editor-only chord never reaches a pane (`editor_chords_never_fire_in_a_pane`)
-        for key in ["p", "n", "r", "e", "a", "f", "u", "y", "l"] {
+        // every Ctrl+letter is the shell's (readline's, ^C, ^D, ^W…); an editor-only chord never reaches a pane
+        // (`editor_chords_never_fire_in_a_pane`)
+        for key in 'a'..='z' {
             let taken = normalize(&format!("ctrl-{key}")).unwrap();
-            assert!(!eff.iter().any(|(a, k)| *k == taken && context_of(a).is_none()), "ctrl-{key} is readline's");
+            assert!(!eff.iter().any(|(a, k)| *k == taken && context_of(a).is_none()), "ctrl-{key} is the shell's");
         }
         assert_eq!(chord(&eff, "QuickOpen"), normalize("ctrl-alt-p").as_deref());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn linux_right_panel_chords_are_ctrl_alt_beside_its_toggle() {
+        let eff = effective(&user(&[]));
+        for (action, keys) in [
+            ("ToggleReview", "ctrl-alt-b"),
+            ("ShowFiles", "ctrl-alt-e"),
+            ("ShowChanges", "ctrl-alt-g"),
+            ("ShowSearch", "ctrl-alt-f"),
+            ("QuickOpen", "ctrl-alt-p"),
+        ] {
+            assert_eq!(chord(&eff, action), normalize(keys).as_deref(), "{action}");
+        }
+        // Ghostty's own beside them: new tab, split down, close pane, and the sidebar's toggle
+        for (action, keys) in [("NewTab", "ctrl-shift-t"), ("SplitDown", "ctrl-shift-e"), ("ClosePane", "ctrl-shift-w"), ("ToggleSidebar", "ctrl-shift-b")] {
+            assert_eq!(chord(&eff, action), normalize(keys).as_deref(), "{action}");
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn linux_tabs_are_upstreams_alt_digits_and_page_keys() {
+        let eff = effective(&user(&[]));
+        for (i, action) in TAB_ACTIONS.iter().enumerate() {
+            assert_eq!(chord(&eff, action), normalize(&format!("alt-{}", i + 1)).as_deref(), "{action}");
+        }
+        let bound = |action: &str, keys: &str| eff.iter().any(|(a, k)| a == action && Some(k.as_str()) == normalize(keys).as_deref());
+        assert!(bound("NextTab", "ctrl-pagedown") && bound("PreviousTab", "ctrl-pageup"));
     }
 
     fn stack(names: &[&str]) -> Vec<gpui::KeyContext> {
@@ -580,8 +690,12 @@ mod tests {
     fn the_editor_s_chords_win_in_its_text_but_for_the_app_wide_ones() {
         let mut text = text_chords_here();
         // pretend gpui-base took the deliberate app-wide chords too: they must stay the app's
-        let closes = if cfg!(target_os = "macos") { "cmd-w" } else { "ctrl-w" };
+        let closes = if cfg!(target_os = "macos") { "cmd-w" } else { "ctrl-shift-w" };
         text.extend([normalize(closes).unwrap(), normalize("ctrl-tab").unwrap()]);
+        // and an app chord that is not app-wide: the editor's own wins in its text (off macOS none of the defaults
+        // meets gpui-base's text chords, Ctrl+Shift+Left/Right and the Ctrl+letters, so one is made up)
+        #[cfg(not(target_os = "macos"))]
+        text.push(normalize("ctrl-alt-g").unwrap());
         let eff = effective(&user(&[]));
         let mut keymap = gpui::Keymap::new(text.iter().map(|c| KeyBinding::new(c, gpui_base::input::SelectToStart, Some("Input"))).collect());
         keymap.add_bindings(placed(&eff, &text).into_iter().filter_map(|(chord, context, action)| binding(action, chord, context)));
@@ -601,7 +715,10 @@ mod tests {
         }
         assert!(met >= 2, "the defaults meet the editor's chords: {met}");
         #[cfg(target_os = "macos")]
-        assert_eq!(fired("cmd-shift-up", &editor).as_deref(), Some("input::SelectToStart"), "not the previous workspace");
+        {
+            assert_eq!(fired("cmd-up", &editor).as_deref(), Some("input::SelectToStart"), "not the previous workspace");
+            assert_eq!(fired("cmd-up", &pane).as_deref(), Some("shepherd::PreviousWorkspace"));
+        }
     }
 
     #[test]
@@ -678,8 +795,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn macos_workspaces_are_ctrl_digits_off_the_screenshot_chords() {
         let eff = effective(&user(&[]));
-        assert_eq!(chord(&eff, "PreviousWorkspace"), normalize("cmd-shift-up").as_deref());
-        assert_eq!(chord(&eff, "NextWorkspace"), normalize("cmd-shift-down").as_deref());
+        assert_eq!(chord(&eff, "PreviousWorkspace"), normalize("cmd-up").as_deref());
+        assert_eq!(chord(&eff, "NextWorkspace"), normalize("cmd-down").as_deref());
         for (i, action) in WORKSPACE_ACTIONS.iter().enumerate() {
             assert_eq!(chord(&eff, action), normalize(&format!("ctrl-{}", i + 1)).as_deref(), "{action}");
         }
@@ -712,7 +829,9 @@ mod tests {
         let eff = effective(&user(&[]));
         let previous = normalize("cmd-shift-g").unwrap();
         assert!(!eff.iter().any(|(_, k)| *k == previous), "cmd-shift-g is a pane's find previous");
-        assert_eq!(chord(&eff, "ShowChanges"), normalize("ctrl-shift-g").as_deref());
+        assert_eq!(chord(&eff, "ShowChanges"), normalize("cmd-alt-g").as_deref());
+        let bell = normalize("ctrl-shift-g").unwrap();
+        assert!(!eff.iter().any(|(_, k)| *k == bell), "ctrl-shift-g is the pane app's");
         assert_eq!(chord(&eff, "ShowSearch"), normalize("cmd-shift-f").as_deref());
     }
 
@@ -809,84 +928,6 @@ mod tests {
         }
     }
 
-    /// Upstream's defaults as they were before Shepherd's own were added: they must stay as they are.
-    #[cfg(target_os = "macos")]
-    const UPSTREAM: &[(&str, &str)] = &[
-        ("NewTab", "cmd-t"),
-        ("CloseTab", "cmd-shift-w"),
-        ("NewWorkspace", "cmd-shift-n"),
-        ("SplitRight", "cmd-d"),
-        ("SplitDown", "cmd-shift-d"),
-        ("ClosePane", "cmd-w"),
-        ("FocusLeft", "cmd-alt-left"),
-        ("FocusRight", "cmd-alt-right"),
-        ("FocusUp", "cmd-alt-up"),
-        ("FocusDown", "cmd-alt-down"),
-        ("ToggleZoom", "cmd-shift-enter"),
-        ("Tab1", "cmd-1"),
-        ("Tab2", "cmd-2"),
-        ("Tab3", "cmd-3"),
-        ("Tab4", "cmd-4"),
-        ("Tab5", "cmd-5"),
-        ("Tab6", "cmd-6"),
-        ("Tab7", "cmd-7"),
-        ("Tab8", "cmd-8"),
-        ("Tab9", "cmd-9"),
-        ("PreviousTab", "cmd-{"),
-        ("NextTab", "cmd-}"),
-        ("PreviousWorkspace", "cmd-up"),
-        ("NextWorkspace", "cmd-down"),
-        ("ToggleSidebar", "cmd-b"),
-        ("ToggleReview", "cmd-alt-b"),
-        ("FontSizeUp", "cmd-="),
-        ("FontSizeUp", "cmd-+"),
-        ("FontSizeDown", "cmd--"),
-        ("FontSizeReset", "cmd-0"),
-        ("OpenSettings", "cmd-,"),
-        ("CommandPanel", "cmd-k"),
-        ("CommandPanel", "cmd-shift-p"),
-        ("AgentsPanel", "cmd-shift-a"),
-        ("Quit", "cmd-q"),
-    ];
-
-    #[cfg(not(target_os = "macos"))]
-    const UPSTREAM: &[(&str, &str)] = &[
-        ("NewTab", "ctrl-shift-t"),
-        ("CloseTab", "ctrl-alt-w"),
-        ("NewWorkspace", "ctrl-shift-n"),
-        ("SplitRight", "ctrl-shift-o"),
-        ("SplitDown", "ctrl-shift-e"),
-        ("ClosePane", "ctrl-shift-w"),
-        ("FocusLeft", "ctrl-alt-left"),
-        ("FocusRight", "ctrl-alt-right"),
-        ("FocusUp", "ctrl-alt-up"),
-        ("FocusDown", "ctrl-alt-down"),
-        ("ToggleZoom", "ctrl-shift-enter"),
-        ("Tab1", "alt-1"),
-        ("Tab2", "alt-2"),
-        ("Tab3", "alt-3"),
-        ("Tab4", "alt-4"),
-        ("Tab5", "alt-5"),
-        ("Tab6", "alt-6"),
-        ("Tab7", "alt-7"),
-        ("Tab8", "alt-8"),
-        ("Tab9", "alt-9"),
-        ("PreviousTab", "ctrl-pageup"),
-        ("NextTab", "ctrl-pagedown"),
-        ("PreviousWorkspace", "ctrl-shift-pageup"),
-        ("NextWorkspace", "ctrl-shift-pagedown"),
-        ("ToggleSidebar", "ctrl-shift-b"),
-        ("ToggleReview", "ctrl-alt-b"),
-        ("FontSizeUp", "ctrl-="),
-        ("FontSizeUp", "ctrl-+"),
-        ("FontSizeDown", "ctrl--"),
-        ("FontSizeReset", "ctrl-0"),
-        ("OpenSettings", "ctrl-,"),
-        ("CommandPanel", "ctrl-shift-p"),
-        ("AgentsPanel", "ctrl-shift-a"),
-        ("Quit", "ctrl-shift-q"),
-    ];
-
     /// gpui-base's Input bindings near the chords added here, as its input state binds them on each OS.
     #[cfg(target_os = "macos")]
     const INPUT: &[&str] = &["cmd-up", "cmd-down", "cmd-shift-up", "cmd-shift-down", "ctrl-cmd-space", "cmd-left", "cmd-right", "alt-left", "alt-right", "cmd-enter"];
@@ -906,14 +947,6 @@ mod tests {
             assert!(DEFAULTS.contains(&(action, chord)), "{action} {chord}");
             let chord = normalize(chord).unwrap();
             assert!(eff.iter().any(|(a, k)| a == action && *k == chord), "{action} lost {chord}");
-        }
-    }
-
-    #[test]
-    fn no_two_defaults_share_a_chord() {
-        let chords: Vec<String> = DEFAULTS.iter().map(|(_, k)| normalize(k).unwrap()).collect();
-        for (i, k) in chords.iter().enumerate() {
-            assert!(!chords[..i].contains(k), "{k} twice");
         }
     }
 

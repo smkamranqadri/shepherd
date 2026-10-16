@@ -16,7 +16,7 @@ It's written in Rust on [GPUI](https://github.com/zeronsh/zui) and styled after 
 - Dividers between panes snap to the cell grid herdr lays out, and the terminal reflows while you drag.
 - The terminal draws ligatures, Kitty images and box drawing on its own. Scrollback is read from herdr once and scrolled locally. `⌘`-click opens links, files, folders and images.
 - herdr's own `[keys]` work in Shepherd, and its popups float over the panes.
-- `⌥⌘B` opens the review panel: the branch's PR (gh) or MR (glab) with its description, checks or pipeline jobs and their logs. It works for SSH machines too.
+- `⌥⌘B` opens the right panel: the workspace folder's files (to view or edit in a tab), its git changes and diffs, a search in its files, and the branch's PR (gh) or MR (glab) with its description, checks or pipeline jobs and their logs. The PR tab works for SSH machines too.
 - `⌘K` opens a command panel with every action, workspace and tab. `⇧⌘A` opens the agents panel.
 - Hold `⌘` for a moment and each tab shows its shortcut; hold `⌃` and each workspace does (Alt and Ctrl+Shift on Linux). Settings can turn the hints off.
 - The status bar shows the branch, its PR and CI, the current folder, the focused agent and your Claude and Codex plan limits.
@@ -51,22 +51,29 @@ Shepherd needs macOS 14 or later (or Linux) and herdr. It talks to the herdr ser
 
 ## Keys
 
-| Keys | Action |
-|---|---|
-| `⌘T`, `⇧⌘W` | New tab, close tab |
-| `⌘D`, `⇧⌘D` | Split right, split down |
-| `⌘W` | Close pane |
-| `⌥⌘` + arrows | Focus the pane in that direction |
-| `⇧⌘↩` | Zoom the pane |
-| `⌘1` … `⌘9`, `⇧⌘[`, `⇧⌘]`, `⌃⇥`, `⌃⇧⇥` | Go to a tab, previous or next tab (terminal and file tabs) |
-| `⌃1` … `⌃9`, `⌘↑`, `⌘↓` | Go to a workspace (in sidebar order), previous or next workspace |
-| `⌃⌘↑`, `⌃⌘↓` | Previous or next session or machine (`Ctrl+Shift+Alt+PageUp`, `PageDown` on Linux) |
-| `⇧⌘N` | New workspace, in a folder you pick (on a remote machine, the focused pane's) |
-| `⌘B`, `⌥⌘B` | Toggle the sidebar, the review panel |
-| `⌘K`, `⇧⌘A` | Command panel, agents panel |
-| `⌘=`, `⌘-`, `⌘0` | Text size up, down, default |
-| `⌘,` | Settings |
-| `⌘/` | Keyboard shortcuts: every action and its keys, searchable by either (`Ctrl+Shift+/` on Linux) |
+| macOS | Linux | Action |
+|---|---|---|
+| `⌘T`, `⇧⌘W` | `Ctrl+Shift+T`, `Ctrl+Alt+W` | New tab, close tab |
+| `⌘D`, `⇧⌘D` | `Ctrl+Shift+O`, `Ctrl+Shift+E` | Split right, split down |
+| `⌘W` | `Ctrl+Shift+W` | Close the pane, or the file tab |
+| `⌥⌘` + arrows | `Ctrl+Alt` + arrows | Focus the pane in that direction |
+| `⇧⌘↩` | `Ctrl+Shift+Enter` | Zoom the pane |
+| `⌘1` … `⌘9`, `⇧⌘[`, `⇧⌘]` | `Alt+1` … `Alt+9`, `Ctrl+PgUp`, `Ctrl+PgDn` | Go to a tab, previous or next tab (terminal and file tabs) |
+| `⌃1` … `⌃9`, `⌘↑`, `⌘↓` | `Ctrl+Shift+1` … `9`, `Ctrl+Shift+PgUp`, `Ctrl+Shift+PgDn` | Go to a workspace (in sidebar order), previous or next workspace |
+| `⌃⌘↑`, `⌃⌘↓` | `Ctrl+Shift+Alt+PgUp`, `Ctrl+Shift+Alt+PgDn` | Previous or next session or machine |
+| `⇧⌘N` | `Ctrl+Shift+N` | New workspace, in a folder you pick (on a remote machine, the focused pane's) |
+| `⌘B`, `⌥⌘B` | `Ctrl+Shift+B`, `Ctrl+Alt+B` | Toggle the sidebar, the right panel |
+| `⇧⌘E`, `⌥⌘G`, `⇧⌘F`, `⌘P` | `Ctrl+Alt+E`, `Ctrl+Alt+G`, `Ctrl+Alt+F`, `Ctrl+Alt+P` | Files, Changes, Search in files, Go to file |
+| `⌘S`, `⌥⌘S` | `Ctrl+S`, `Ctrl+Alt+S` | Save the file, save all (in a file tab) |
+| `⌘C`, `⌘V`, `⌘F` | `Ctrl+Shift+C`, `Ctrl+Shift+V`, `Ctrl+Shift+F` | Copy, paste, find in a pane |
+| `⌘K`, `⇧⌘A` | `Ctrl+Shift+P`, `Ctrl+Shift+A` | Command panel, agents panel |
+| `⌘=`, `⌘-`, `⌘0` | `Ctrl+=`, `Ctrl+-`, `Ctrl+0` | Text size up, down, default |
+| `⌘,` | `Ctrl+,` | Settings |
+| `⌘/` | `Ctrl+Shift+/` | Keyboard shortcuts: every action and its keys, searchable by either |
+
+On Linux the app's chords follow Ghostty's: Ctrl with a letter stays the shell's, Ctrl+click opens a link, and the
+right panel's chords take Ctrl+Alt beside its toggle. Settings can make Ctrl+C and Ctrl+V copy and paste in the panes
+too (Ctrl+C still sends ^C with nothing selected).
 
 Every binding can be changed in Settings.
 
