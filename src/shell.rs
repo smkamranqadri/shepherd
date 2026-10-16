@@ -468,7 +468,11 @@ impl Shell {
                     crate::ui::side_panel::SidePanelEvent::OpenChange { path, change, preview } => s.open_change(path.clone(), change.clone(), *preview, window, cx),
                     // the badge is in the Shell's tab strip
                     crate::ui::side_panel::SidePanelEvent::ChangesCounted => cx.notify(),
-                    crate::ui::side_panel::SidePanelEvent::ChangesPolled => s.reload_shown_diff(true, cx),
+                    crate::ui::side_panel::SidePanelEvent::ChangesPolled => {
+                        s.reload_shown_diff(true, cx);
+                        // the editors' gutters too (W1's watch on .git calls `files_git_changed` as well)
+                        s.files_git_changed(cx);
+                    }
                 })
                 .detach();
                 let (this, handle) = (cx.entity().downgrade(), window.window_handle());

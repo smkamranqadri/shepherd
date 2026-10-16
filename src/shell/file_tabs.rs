@@ -77,6 +77,12 @@ impl TabView {
         matches!(self, TabView::File(v) if v.read(cx).is_dirty())
     }
 
+    /// Back in view.
+    fn show(&self, cx: &mut App) {
+        if let TabView::File(v) = self {
+            v.update(cx, |v, cx| v.show(cx));
+        }
+    }
 
     pub(super) fn element(&self) -> gpui::AnyElement {
         match self {
@@ -596,6 +602,9 @@ impl Shell {
             if matches!(view, Some(TabView::Diff(_))) {
                 self.reload_shown_diff(false, cx);
             }
+            if let Some(view) = &view {
+                view.show(cx);
+            }
         }
         let hidden_focused = self.tab_views.iter().any(|(id, v)| Some(*id) != drawn && v.focus_handle(cx).contains_focused(window, cx));
         if hidden_focused && self.settings.is_none() {
@@ -991,6 +1000,17 @@ impl Shell {
         let at = self.tab_views.iter().position(|(t, v)| !live.contains(t) && matches!(v, TabView::File(v) if v.read(cx).path() == path)).unwrap_or(at);
         self.tab_views[at].0 = id;
         true
+    }
+
+    /// git's state may have moved (a Changes poll answered; W1's watch on `.git`): the editors' gutters catch up, the
+    /// shown one now and the others when they next show.
+    pub(super) fn files_git_changed(&mut self, cx: &mut Context<Self>) {
+        let shown = self.view_drawn;
+        for (id, view) in &self.tab_views {
+            if let TabView::File(v) = view {
+                v.update(cx, |v, cx| v.git_changed(Some(*id) == shown, cx));
+            }
+        }
     }
 }
 

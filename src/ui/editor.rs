@@ -8,9 +8,15 @@
 //! tab's dot goes when an undo comes back to it. A save (`files::save`, off the main thread) makes the version it
 //! wrote the new baseline, not the buffer as it is when the save ends: typing during a save leaves the tab dirty.
 //! A save that fails says why in a banner under the header; one the file changed under offers Overwrite or Reload.
+//!
+//! The gutter marks the lines changed against git's index, and those staged (HEAD to index) as outlines
+//! (`files::line_changes`): its blobs are fetched when the file opens and when git's state may have moved
+//! (`git_changed`), and the buffer is diffed against them a moment after typing stops.
 use crate::bindings::SaveFile;
 use crate::files::content::{self, FileKind};
 use crate::files::highlight;
+use crate::files::line_changes::{self, Hunk, LineChange, Mark};
+use crate::files::runner::{self, Host, Limits};
 use crate::files::save::{self, Baseline, LineEnding, SaveError, SaveMode};
 use crate::shell::widgets::{tip, titlebar_button};
 use crate::theme::Theme;
@@ -20,7 +26,7 @@ use crate::ui::review::Block;
 use crate::ui::viewer::{FileViewer, ViewerEvent};
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, PromptLevel, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, point,
+    ParentElement, PromptLevel, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, canvas, div, point,
     prelude::*, px,
 };
 use gpui_base::input::{Editor, EditorState, InputEvent, InputHighlighter, Position, Rope, RopeExt, TabSize};
@@ -29,7 +35,7 @@ use futures::future::{BoxFuture, LocalBoxFuture, Shared};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use syntect::parsing::SyntaxReference;
 use tokio::runtime::Handle;
 
@@ -40,6 +46,12 @@ pub const MAX_EDIT_LINES: usize = 200_000;
 pub const MAX_EDIT_LINE: usize = 20_000;
 /// How long a read may take before the editor gives up on it (a hung mount).
 const LOAD_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long after the last keystroke the gutter's bars are worked out again.
+const GUTTER_AFTER: Duration = Duration::from_millis(300);
+/// How long the gutter's diff may take before it settles for fewer, larger stretches.
+const GUTTER_BUDGET: Duration = Duration::from_millis(250);
+/// The padding left of the line numbers: the gutter's bars are drawn in it.
+const GUTTER_PAD: f32 = 8.;
 
 pub enum EditorEvent {
     /// "Open in editor", at a line when there is one: the Shell shows the terminals and opens the file there.
@@ -257,6 +269,15 @@ enum Goto {
     Fragment(String),
 }
 
+/// git's view of the file, for the gutter: the index's blob, and what is staged (HEAD to index, worked out once when
+/// they came, so HEAD's blob is not kept), by their object ids.
+#[derive(Default, Clone)]
+struct Blobs {
+    index: Option<(String, Arc<String>)>,
+    head_id: Option<String>,
+    staged: Arc<Vec<Hunk>>,
+}
+
 /// A save under way, as its callers await it: whether the file was written. Dropping it leaves the save running.
 pub type Saving = Shared<LocalBoxFuture<'static, bool>>;
 
@@ -282,6 +303,16 @@ pub struct FileEditor {
     queued: Option<SaveMode>,
     /// The bytes of the save under way reaching the disk, which quitting waits for (no gpui task to drive it then).
     writing: Option<Shared<BoxFuture<'static, ()>>>,
+    /// The gutter's bars and what they are worked out from.
+    gutter: Arc<Vec<LineChange>>,
+    blobs: Blobs,
+    /// Numbers the gutter's diffs: only the latest one's answer is drawn.
+    gutter_seq: u64,
+    gutter_wait: Option<Task<()>>,
+    gutter_fetch: Option<Task<()>>,
+    gutter_diff: Option<Task<()>>,
+    /// git changed while the tab was out of sight: the blobs are fetched again when it shows.
+    gutter_stale: bool,
     _theme: Subscription,
 }
 
@@ -324,6 +355,13 @@ impl FileEditor {
             saving: None,
             queued: None,
             writing: None,
+            gutter: Arc::default(),
+            blobs: Blobs::default(),
+            gutter_seq: 0,
+            gutter_wait: None,
+            gutter_fetch: None,
+            gutter_diff: None,
+            gutter_stale: false,
             _theme: theme,
         }
     }
@@ -430,6 +468,7 @@ impl FileEditor {
         (self.goto, self.restore, self.banner) = (goto, restore, None);
         (self.saving, self.queued) = (None, None);
         (self.preview, self.preview_scroll) = (true, ScrollHandle::new());
+        (self.gutter, self.blobs, self.gutter_stale) = (Arc::default(), Blobs::default(), false);
         let generation = self.generation;
         let job = self.rt.spawn(async move {
             let read = tokio::task::spawn_blocking(move || read_for_edit(&path, root.as_deref(), force));
@@ -477,7 +516,7 @@ impl FileEditor {
             // ponytail: its find bar is gpui-component's; Shepherd's own comes with E3
             state.set_searchable(false, cx);
             state.set_editor_style(style);
-            state.set_editor_paddings(gpui::Edges { top: px(4.), ..Default::default() });
+            state.set_editor_paddings(gpui::Edges { left: px(GUTTER_PAD), top: px(4.), ..Default::default() });
             state.set_value(text, window, cx);
             if let Some(syntax) = syntax {
                 let factory: gpui_base::input::InputHighlighterFactory =
@@ -505,6 +544,7 @@ impl FileEditor {
                 }
             }
         }
+        self.fetch_blobs(cx);
     }
 
     /// The file in the viewer, read again by it.
@@ -526,11 +566,12 @@ impl FileEditor {
         self.body = Body::View { viewer, note, _events: events };
     }
 
-    /// Lets go of what it holds outside itself: the viewer's image and highlight.
+    /// Lets go of what it holds outside itself: the viewer's image and highlight, the gutter's git and diff.
     pub fn release(&mut self, window: Option<&mut Window>, cx: &mut App) {
         if let Body::View { viewer, .. } = &self.body {
             viewer.update(cx, |v, cx| v.release(window, cx));
         }
+        (self.gutter_wait, self.gutter_fetch, self.gutter_diff) = (None, None, None);
     }
 
     /// Out of sight: the viewer's image leaves gpui's cache.
@@ -540,7 +581,24 @@ impl FileEditor {
         }
     }
 
-    /// The buffer changed: the dot, and the pin of a preview.
+    /// Back in sight: the gutter catches up with git if it moved meanwhile.
+    pub fn show(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.gutter_stale) {
+            self.fetch_blobs(cx);
+        }
+    }
+
+    /// git's state may have moved (a Changes poll, a watch on `.git`): the gutter's blobs are fetched again, now if
+    /// `shown`, else when the tab next shows.
+    pub fn git_changed(&mut self, shown: bool, cx: &mut Context<Self>) {
+        if shown {
+            self.fetch_blobs(cx);
+        } else {
+            self.gutter_stale = true;
+        }
+    }
+
+    /// The buffer changed: the dot, the pin of a preview, and the gutter a moment after typing stops.
     fn changed(&mut self, cx: &mut Context<Self>) {
         let Body::Edit(e) = &mut self.body else { return };
         let text = e.state.read(cx).text();
@@ -548,6 +606,10 @@ impl FileEditor {
             cx.emit(EditorEvent::Dirty(e.tracker.is_dirty()));
             cx.notify();
         }
+        self.gutter_wait = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(GUTTER_AFTER).await;
+            let _ = this.update(cx, |e, cx| e.diff_gutter(cx));
+        }));
     }
 
     fn go_to_line(&mut self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
@@ -814,6 +876,75 @@ impl FileEditor {
         cx.emit(EditorEvent::OpenInEditor { path: self.path.clone(), line });
     }
 
+    /// Fetches the index's and HEAD's blobs of the file in one `git cat-file --batch`, in the file's folder.
+    fn fetch_blobs(&mut self, cx: &mut Context<Self>) {
+        let (Body::Edit(_), Some(dir), Some(name)) = (&self.body, self.path.parent(), self.path.file_name().and_then(|n| n.to_str())) else { return };
+        // the batch protocol is a line per object
+        if name.contains('\n') {
+            return;
+        }
+        let mut cmd = runner::git_cmd(dir, &["cat-file", "--batch"]);
+        cmd.stdin = Some(format!(":./{name}\nHEAD:./{name}\n").into_bytes());
+        let limits = Limits { timeout: Duration::from_secs(5), max_bytes: 2 * MAX_EDIT as usize + 4096 };
+        let job = self.rt.spawn(async move { runner::run(&Host::Local, cmd, limits).await });
+        let generation = self.generation;
+        self.gutter_fetch = Some(cx.spawn(async move |this, cx| {
+            let answers = match job.await {
+                Ok(Ok(out)) if !out.truncated => line_changes::parse_batch(&out.stdout),
+                _ => Vec::new(),
+            };
+            let mut answers = answers.into_iter();
+            let text = |a: Option<Option<(String, Vec<u8>)>>| a.flatten().map(|(id, bytes)| (id, String::from_utf8_lossy(&bytes).into_owned()));
+            let (index, head) = (text(answers.next()), text(answers.next()));
+            let ids = (index.as_ref().map(|(id, _)| id.clone()), head.as_ref().map(|(id, _)| id.clone()));
+            // nothing moved in git: the bars stand
+            let same = this.update(cx, |e, _| (e.blobs.index.as_ref().map(|(id, _)| id.clone()), e.blobs.head_id.clone()) == ids);
+            if same.unwrap_or(true) {
+                return;
+            }
+            let blobs = cx
+                .background_spawn(async move {
+                    let staged = index.as_ref().map(|(_, i)| line_changes::staged(head.as_ref().map(|(_, h)| h.as_str()), i, Instant::now() + GUTTER_BUDGET));
+                    Blobs { index: index.map(|(id, i)| (id, Arc::new(i))), head_id: ids.1, staged: Arc::new(staged.unwrap_or_default()) }
+                })
+                .await;
+            let _ = this.update(cx, |e, cx| {
+                if e.generation == generation {
+                    e.blobs = blobs;
+                    e.diff_gutter(cx);
+                }
+            });
+        }));
+    }
+
+    /// Works the gutter's bars out again on the background executor: the buffer against the blobs.
+    fn diff_gutter(&mut self, cx: &mut Context<Self>) {
+        let Body::Edit(e) = &self.body else { return };
+        let Some(index) = self.blobs.index.as_ref().map(|(_, b)| b.clone()) else {
+            if !self.gutter.is_empty() {
+                self.gutter = Arc::default();
+                cx.notify();
+            }
+            return;
+        };
+        let staged = self.blobs.staged.clone();
+        let rope: Rope = e.state.read(cx).text().clone();
+        self.gutter_seq += 1;
+        let seq = self.gutter_seq;
+        let job = cx.background_spawn(async move {
+            line_changes::line_changes(&staged, Some(&index), &rope_text(&rope), Instant::now() + GUTTER_BUDGET)
+        });
+        self.gutter_diff = Some(cx.spawn(async move |this, cx| {
+            let changes = job.await;
+            let _ = this.update(cx, |e, cx| {
+                if e.gutter_seq == seq && *e.gutter != changes {
+                    e.gutter = Arc::new(changes);
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
     /// Keys while the preview has the keyboard (the editor handles its own): copy and scrolling.
     fn key(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.focus.is_focused(window) || !self.preview_shown() {
@@ -1011,10 +1142,47 @@ impl FileEditor {
         }
     }
 
-    /// The editor, in the terminal's font and size.
+    /// The editor, with the gutter's bars over its padding.
     fn code(&self, e: &Edit, theme: &Theme) -> AnyElement {
         let font = gpui::font(theme.font_terminal.clone());
         let line_h = px((theme.terminal_font_size * theme.terminal_line_height).round());
+        let (state, changes) = (e.state.clone(), self.gutter.clone());
+        let colors = (theme.success, theme.accent, theme.danger);
+        let bars = canvas(
+            |_, _, _| (),
+            move |bounds, _, window, cx| {
+                if changes.is_empty() {
+                    return;
+                }
+                let s = state.read(cx);
+                let (Some(rows), Some(line_h)) = (s.visible_row_range(), s.line_height()) else { return };
+                let first = s.text().line_start_offset(rows.start);
+                let Some(top) = s.range_to_bounds(&(first..first)).map(|b| b.top()) else { return };
+                let x = s.input_bounds().left() - px(GUTTER_PAD) + px(2.);
+                window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                    for change in line_changes::visible(&changes, rows.clone()) {
+                        let color = match change.mark {
+                            Mark::Added => colors.0,
+                            Mark::Modified => colors.1,
+                            Mark::Deleted => colors.2,
+                        };
+                        let y = top + line_h * (change.rows.start as f32 - rows.start as f32);
+                        let bar = match change.mark {
+                            // a notch on the line between, where the lines went
+                            Mark::Deleted => gpui::Bounds::new(point(x, y - px(2.)), gpui::size(px(5.), px(4.))),
+                            _ => gpui::Bounds::new(point(x, y), gpui::size(px(3.), line_h * change.rows.len() as f32)),
+                        };
+                        if change.staged {
+                            window.paint_quad(gpui::outline(bar, color, gpui::BorderStyle::Solid));
+                        } else {
+                            window.paint_quad(gpui::fill(bar, color));
+                        }
+                    }
+                });
+            },
+        )
+        .absolute()
+        .inset_0();
         div()
             .relative()
             .size_full()
@@ -1025,6 +1193,7 @@ impl FileEditor {
             .line_height(line_h)
             .text_color(theme.terminal.foreground)
             .child(Editor::new(&e.state))
+            .child(bars)
             .into_any_element()
     }
 

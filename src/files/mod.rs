@@ -3,6 +3,7 @@ pub mod content;
 pub mod diff;
 pub mod highlight;
 pub mod icons;
+pub mod line_changes;
 pub mod open_files;
 pub mod roots;
 pub mod runner;
