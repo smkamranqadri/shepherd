@@ -540,6 +540,12 @@ pub fn place_items(rows: Vec<PlaceRow>) -> Vec<Item> {
         .collect()
 }
 
+/// The row after the current place's, wrapping; the first when none is current.
+fn place_after_current(items: &[Item], matches: &[usize]) -> usize {
+    let current = matches.iter().position(|&i| items[i].hint.as_deref().is_some_and(|h| h.starts_with("current")));
+    current.map_or(0, |row| (row + 1) % matches.len())
+}
+
 /// How well `query` matches `text`, ignoring case, and which chars of `text` it matched; None if it does not:
 /// `text` starting with it ranks first, then it starting a word, then anywhere, then its letters in order (more
 /// of them on word starts, fewer gaps, higher).
@@ -721,7 +727,11 @@ impl Panel {
         });
         let chord = cx.try_global::<ActiveBindings>().and_then(|b| b.0.iter().find(|(a, _)| a == kind.action()).map(|(_, k)| k.clone()));
         let matches = rank("", &items);
-        Panel { kind, input, items, query: String::new(), matches, selected: 0, chord, scroll: ScrollHandle::new(), _events: events }
+        // the session switcher starts on the place after the current one, so the chord then Enter goes to the next
+        let selected = if kind == Kind::Places { place_after_current(&items, &matches) } else { 0 };
+        let scroll = ScrollHandle::new();
+        scroll.scroll_to_item(selected);
+        Panel { kind, input, items, query: String::new(), matches, selected, chord, scroll, _events: events }
     }
 
     /// Fills a panel opened before its list arrived (the worktrees herdr answers with), keeping what is typed.
@@ -1170,6 +1180,13 @@ mod tests {
         assert_eq!(items[2].run, Run::Place("m".into()));
         assert_eq!(ranked("remote", &items), ["M"], "a machine is found by where it is");
         assert_eq!(ranked("box", &items), ["M"]);
+        // the switcher starts after the current place, wrapping, and on the first when none is current
+        let m = rank("", &items);
+        assert_eq!(place_after_current(&items, &m), 1);
+        let last = place_items(vec![row("a", None, false), row("b", None, false), row("m", None, true)]);
+        assert_eq!(place_after_current(&last, &rank("", &last)), 0);
+        let none = place_items(vec![row("a", None, false), row("b", None, false)]);
+        assert_eq!(place_after_current(&none, &rank("", &none)), 0);
     }
 
     fn shortcut(label: &str, chords: &[&str]) -> Item {

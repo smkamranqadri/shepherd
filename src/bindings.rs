@@ -224,11 +224,13 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("Tab9", "alt-9"),
     ("PreviousTab", "ctrl-pageup"),
     ("NextTab", "ctrl-pagedown"),
-    ("PreviousWorkspace", "ctrl-shift-pageup"),
-    ("NextWorkspace", "ctrl-shift-pagedown"),
-    // the sessions and machines of the sidebar's bar: the workspace chords with Alt
-    ("PreviousSession", "ctrl-shift-alt-pageup"),
-    ("NextSession", "ctrl-shift-alt-pagedown"),
+    // fork-only: upstream has the workspaces on Ctrl+Shift+PageUp/PageDown, which the sessions take here
+    ("PreviousWorkspace", "ctrl-shift-up"),
+    ("NextWorkspace", "ctrl-shift-down"),
+    ("PreviousSession", "ctrl-shift-pageup"),
+    ("NextSession", "ctrl-shift-pagedown"),
+    // the session switcher, with the next session picked
+    ("SwitchSession", "ctrl-shift-s"),
     // Ctrl+Shift+1…9 as GPUI hears them on Linux: xkb gives the shifted symbol (US layout) and GPUI drops the Shift
     // of a key that has no case, so `ctrl-shift-1` would never match (`shifted_digit` shows them as typed).
     ("Workspace1", "ctrl-!"),
@@ -586,6 +588,8 @@ mod tests {
         let ours: Vec<_> = DEFAULTS.iter().filter(|(a, _)| upstream(a)).collect();
         assert_eq!(ours.len(), UPSTREAM.len(), "the same number of upstream chords");
         for (action, chord) in UPSTREAM {
+            // but for the fork's deliberate overrides
+            let chord = FORK_OVERRIDES.iter().find(|(a, _)| a == action).map_or(chord, |(_, c)| c);
             assert!(DEFAULTS.contains(&(*action, *chord)), "{action} keeps {chord}");
         }
         // and every upstream action is still an action
@@ -765,8 +769,8 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     fn linux_workspaces_are_ctrl_shift_digits_as_xkb_types_them() {
         let eff = effective(&user(&[]));
-        assert_eq!(chord(&eff, "PreviousWorkspace"), normalize("ctrl-shift-pageup").as_deref());
-        assert_eq!(chord(&eff, "NextWorkspace"), normalize("ctrl-shift-pagedown").as_deref());
+        assert_eq!(chord(&eff, "PreviousWorkspace"), normalize("ctrl-shift-up").as_deref());
+        assert_eq!(chord(&eff, "NextWorkspace"), normalize("ctrl-shift-down").as_deref());
         for (i, action) in WORKSPACE_ACTIONS.iter().enumerate() {
             let bound = chord(&eff, action).unwrap_or_else(|| panic!("{action} is bound"));
             let key = Keystroke::parse(bound).unwrap().key;
@@ -928,6 +932,12 @@ mod tests {
         }
     }
 
+    /// Upstream defaults this fork deliberately changes (Linux): the workspaces move to Ctrl+Shift+Up/Down.
+    #[cfg(target_os = "macos")]
+    const FORK_OVERRIDES: &[(&str, &str)] = &[];
+    #[cfg(not(target_os = "macos"))]
+    const FORK_OVERRIDES: &[(&str, &str)] = &[("PreviousWorkspace", "ctrl-shift-up"), ("NextWorkspace", "ctrl-shift-down")];
+
     /// gpui-base's Input bindings near the chords added here, as its input state binds them on each OS.
     #[cfg(target_os = "macos")]
     const INPUT: &[&str] = &["cmd-up", "cmd-down", "cmd-shift-up", "cmd-shift-down", "ctrl-cmd-space", "cmd-left", "cmd-right", "alt-left", "alt-right", "cmd-enter"];
@@ -944,6 +954,8 @@ mod tests {
     fn upstream_defaults_stay_as_they_are() {
         let eff = effective(&user(&[]));
         for (action, chord) in UPSTREAM {
+            // fork-only overrides: the one place the defaults depart from upstream's
+            let chord = FORK_OVERRIDES.iter().find(|(a, _)| a == action).map_or(chord, |(_, c)| c);
             assert!(DEFAULTS.contains(&(action, chord)), "{action} {chord}");
             let chord = normalize(chord).unwrap();
             assert!(eff.iter().any(|(a, k)| a == action && *k == chord), "{action} lost {chord}");
@@ -972,11 +984,15 @@ mod tests {
 
     #[test]
     #[cfg(not(target_os = "macos"))]
-    fn sessions_step_on_the_workspace_chords_with_alt() {
+    fn sessions_take_ctrl_shift_page_keys_and_the_switcher_ctrl_shift_s() {
         let eff = effective(&user(&[]));
-        assert_eq!(chord(&eff, "NextSession"), normalize("ctrl-shift-alt-pagedown").as_deref());
-        assert_eq!(chord(&eff, "PreviousSession"), normalize("ctrl-shift-alt-pageup").as_deref());
-        assert_eq!(chord(&eff, "NextWorkspace"), normalize("ctrl-shift-pagedown").as_deref());
+        assert_eq!(chord(&eff, "SwitchSession"), normalize("ctrl-shift-s").as_deref());
+        assert_eq!(chord(&eff, "NextSession"), normalize("ctrl-shift-pagedown").as_deref());
+        assert_eq!(chord(&eff, "PreviousSession"), normalize("ctrl-shift-pageup").as_deref());
+        assert_eq!(chord(&eff, "NextWorkspace"), normalize("ctrl-shift-down").as_deref());
+        assert_eq!(chord(&eff, "PreviousWorkspace"), normalize("ctrl-shift-up").as_deref());
+        // a letter keeps shift on Linux: Ctrl+Shift+S arrives as ctrl-shift-s, and only the switcher fires
+        assert_eq!(fired(&from_xkb("s", true, Some("S"))), ["SwitchSession"]);
     }
 
     #[test]
@@ -1016,6 +1032,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn the_session_switcher_has_no_default_chord() {
         assert_eq!(chord(&effective(&user(&[])), "SwitchSession"), None);
     }

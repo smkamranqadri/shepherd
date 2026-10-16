@@ -59,8 +59,9 @@ Shepherd needs macOS 14 or later (or Linux) and herdr. It talks to the herdr ser
 | `⌥⌘` + arrows | `Ctrl+Alt` + arrows | Focus the pane in that direction |
 | `⇧⌘↩` | `Ctrl+Shift+Enter` | Zoom the pane |
 | `⌘1` … `⌘9`, `⇧⌘[`, `⇧⌘]` | `Alt+1` … `Alt+9`, `Ctrl+PgUp`, `Ctrl+PgDn` | Go to a tab, previous or next tab (terminal and file tabs) |
-| `⌃1` … `⌃9`, `⌘↑`, `⌘↓` | `Ctrl+Shift+1` … `9`, `Ctrl+Shift+PgUp`, `Ctrl+Shift+PgDn` | Go to a workspace (in sidebar order), previous or next workspace |
-| `⌃⌘↑`, `⌃⌘↓` | `Ctrl+Shift+Alt+PgUp`, `Ctrl+Shift+Alt+PgDn` | Previous or next session or machine |
+| `⌃1` … `⌃9`, `⌘↑`, `⌘↓` | `Ctrl+Shift+1` … `9`, `Ctrl+Shift+Up`, `Ctrl+Shift+Down` | Go to a workspace (in sidebar order), previous or next workspace |
+| `⌃⌘↑`, `⌃⌘↓` | `Ctrl+Shift+PgUp`, `Ctrl+Shift+PgDn` | Previous or next session or machine |
+| | `Ctrl+Shift+S` | Switch session or machine (arrows and Enter pick, the next one is preselected) |
 | `⇧⌘N` | `Ctrl+Shift+N` | New workspace, in a folder you pick (on a remote machine, the focused pane's) |
 | `⌘B`, `⌥⌘B` | `Ctrl+Shift+B`, `Ctrl+Alt+B` | Toggle the sidebar, the right panel |
 | `⇧⌘E`, `⌥⌘G`, `⇧⌘F`, `⌘P` | `Ctrl+Alt+E`, `Ctrl+Alt+G`, `Ctrl+Alt+F`, `Ctrl+Alt+P` | Files, Changes, Search in files, Go to file |
