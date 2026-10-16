@@ -10,3 +10,4 @@ pub mod save;
 pub mod status;
 pub mod tabs;
 pub mod tree;
+pub mod watch;

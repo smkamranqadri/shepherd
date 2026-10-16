@@ -38,6 +38,9 @@ two-face = { version = "0.5", default-features = false, features = ["syntect-fan
 # A diff tab's changed words: Myers over a line pair's words, under a deadline (Apache-2.0; no `text` feature, the
 # tab cuts the words itself).
 similar = { version = "2.7", default-features = false }
+# The Files tab and Changes refresh when the disk changes: inotify on Linux, FSEvents on macOS (CC0-1.0; its default
+# features are FSEvents alone).
+notify = "8.2"
 # An image's size from its header, for the viewer's pixel budget (already in the tree, through gpui).
 imagesize = "0.14"
 

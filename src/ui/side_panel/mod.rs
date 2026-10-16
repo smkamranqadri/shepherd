@@ -4,9 +4,12 @@
 mod changes;
 mod files;
 
+use crate::files::watch::{self, Batch, Message};
 use crate::settings::PanelTab;
 use crate::theme::Theme;
+use futures::StreamExt;
 use gpui::{Context, EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Render, SharedString, Styled, Window, div, prelude::*, px};
+use std::path::PathBuf;
 use tokio::runtime::Handle;
 
 /// What the Shell knows that the panel needs: where it is and what the shown workspace's panes look at. Handed over
@@ -53,6 +56,23 @@ pub enum SidePanelEvent {
     ChangesPolled,
 }
 
+/// What live updates are doing (`files::watch`); the polls run at their own pace unless `Live`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WatchState {
+    /// No watch (the panel closed, no local root), or one starting.
+    Off,
+    Live,
+    /// Watching could not start or stopped: "Live updates off: <why>" under the tab.
+    Failed(String),
+}
+
+/// The shown root's watch: its batches carry `generation`, so a watch replaced (A to B and back to A) is not heard.
+struct Watching {
+    root: PathBuf,
+    generation: u64,
+    _watch: watch::Watch,
+}
+
 pub struct SidePanel {
     focus: FocusHandle,
     /// Where processes (`files::runner`) and folder reads run.
@@ -74,6 +94,11 @@ pub struct SidePanel {
     changes_tab_shown: bool,
     /// The Changes tab's folded groups, kept across roots as VS Code keeps them across repositories.
     changes_folded: std::collections::HashSet<crate::files::status::Group>,
+    /// The panel is open (on any tab, the window active or not): its root is watched.
+    panel_shown: bool,
+    watch: Option<Watching>,
+    watch_state: WatchState,
+    next_watch: u64,
 }
 
 impl SidePanel {
@@ -82,7 +107,7 @@ impl SidePanel {
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(files::POLL).await;
             let polled = this.update(cx, |p, cx| {
-                p.poll_files(cx);
+                p.poll_files(true, cx);
                 p.poll_changes(cx);
             });
             if polled.is_err() {
@@ -103,6 +128,10 @@ impl SidePanel {
             changes_live: false,
             changes_tab_shown: false,
             changes_folded: Default::default(),
+            panel_shown: false,
+            watch: None,
+            watch_state: WatchState::Off,
+            next_watch: 0,
         }
     }
 
@@ -112,8 +141,82 @@ impl SidePanel {
             self.context = context;
             self.sync_files(cx);
             self.sync_changes(cx);
+            self.sync_watch(cx);
             cx.notify();
         }
+    }
+
+    /// Watching works: the polls are only a safety net (`watch::SAFETY_POLL`).
+    fn watching(&self) -> bool {
+        self.watch_state == WatchState::Live
+    }
+
+    /// Keeps one watch on the shown root while the panel is open and the root is this computer's; a new root, or
+    /// the panel closing, drops the old one (and its task and watcher with it).
+    fn sync_watch(&mut self, cx: &mut Context<Self>) {
+        let root = self.context.root.as_deref().filter(|_| self.panel_shown && !self.context.remote).map(PathBuf::from);
+        if self.watch.as_ref().map(|w| &w.root) == root.as_ref() {
+            return;
+        }
+        self.watch = None;
+        self.set_watch_state(WatchState::Off, cx);
+        let Some(root) = root else { return };
+        self.next_watch += 1;
+        let generation = self.next_watch;
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let handle = watch::Watch::start(&self.rt, root.clone(), tx);
+        self.watch = Some(Watching { root, generation, _watch: handle });
+        cx.spawn(async move |this, cx| {
+            // ends when the watch is dropped (its task holds the sender)
+            while let Some(message) = rx.next().await {
+                if this.update(cx, |p, cx| p.take_watch(generation, message, cx)).is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn set_watch_state(&mut self, state: WatchState, cx: &mut Context<Self>) {
+        if self.watch_state == state {
+            return;
+        }
+        let was_live = self.watching();
+        self.watch_state = state;
+        if was_live && !self.watching() {
+            // back to the polls' own pace, starting now
+            if let Some(list) = self.changes.as_mut() {
+                list.next_at = None;
+            }
+            if let Some(tree) = self.files.as_mut() {
+                tree.polled_at = None;
+            }
+        }
+        // the note under the tab comes or goes
+        cx.notify();
+    }
+
+    /// A watch's message: its start (what changed before it is caught up on), its failure, or a batch.
+    fn take_watch(&mut self, generation: u64, message: Message, cx: &mut Context<Self>) {
+        if self.watch.as_ref().is_none_or(|w| w.generation != generation) {
+            return;
+        }
+        match message {
+            Message::Live => {
+                self.set_watch_state(WatchState::Live, cx);
+                self.take_batch(Batch::everything(), cx);
+            }
+            Message::Off(why) => self.set_watch_state(WatchState::Failed(why), cx),
+            Message::Batch(batch) => self.take_batch(batch, cx),
+        }
+    }
+
+    /// What changed on disk: the tree's open folders among it read again, git asked again.
+    fn take_batch(&mut self, batch: Batch, cx: &mut Context<Self>) {
+        if batch.status || batch.rescan {
+            self.want_changes(cx);
+        }
+        self.watch_files(batch, cx);
     }
 
     pub fn set_tab(&mut self, tab: PanelTab, cx: &mut Context<Self>) {
@@ -167,6 +270,20 @@ fn notice(theme: &Theme, title: impl Into<SharedString>, hint: impl Into<SharedS
 impl Render for SidePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &Theme::of(cx).clone();
+        // why the tree and the list are polled rather than watched, faint under them
+        let watch_note = match &self.watch_state {
+            WatchState::Failed(why) if matches!(self.tab, PanelTab::Files | PanelTab::Changes) && self.context.root.is_some() && !self.context.remote => Some(
+                div()
+                    .flex_none()
+                    .px(px(12.))
+                    .py(px(4.))
+                    .text_size(px(11.))
+                    .text_color(theme.text_faint)
+                    .truncate()
+                    .child(format!("Live updates off: {why}")),
+            ),
+            _ => None,
+        };
         let body = if self.context.remote {
             notice(theme, "Files on herdr machines aren't supported yet", "Local only for now.").into_any_element()
         } else if self.context.root.is_none() && (self.context.guessing || self.context.workspace_id.is_none()) {
@@ -229,6 +346,9 @@ impl Render for SidePanel {
             .size_full()
             .flex()
             .flex_col()
-            .child(body)
+            .map(|el| match watch_note {
+                Some(note) => el.child(div().flex_1().min_h_0().child(body)).child(note),
+                None => el.child(body),
+            })
     }
 }

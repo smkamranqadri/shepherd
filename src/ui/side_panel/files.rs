@@ -1,12 +1,15 @@
 //! The Files tab: the workspace root's tree, one folder read when it is opened (`files::tree`), what git ignores
-//! asked of `git check-ignore`, and the open folders read again every few seconds while the tab is in view. Every
+//! asked of `git check-ignore`, and the open folders read again when the disk says they changed (`files::watch`),
+//! or every few seconds while the tab is in view when it cannot say (every `watch::SAFETY_POLL` when it can). Every
 //! read runs on the runtime, never on the main thread (a folder on a hung network mount blocks its reader), and
 //! carries the generation its folder had when it started: an answer that a newer read of the folder overtook is
-//! dropped, as is one for a tree since replaced by another root's.
+//! dropped, as is one for a tree since replaced by another root's. One poll or watch read is out at a time; the
+//! changes heard meanwhile are read together when it lands.
 use super::{SidePanel, SidePanelEvent};
 use crate::files::icons::material_icon;
 use crate::files::runner::{self, Host, Limits, RunError};
 use crate::files::tree::{self, Listing, Read, Row};
+use crate::files::watch::{self, Batch, Loads};
 use crate::settings::SettingsGlobal;
 use crate::shell::widgets::{menu_card, menu_choice};
 use crate::theme::Theme;
@@ -18,10 +21,10 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// How often the open folders are read again while the tab is in view and the window active: no file watcher
-/// (thousands of folders' worth of inotify watches, FSEvents' own latency), just the folders on screen.
+/// How often the open folders are read again while the tab is in view and the window active, when the root is not
+/// watched (the watcher did not start, or gave up): just the folders on screen.
 pub(super) const POLL: Duration = Duration::from_secs(3);
 /// A poll reads at most this many open folders: the root, then the open ones in the order they are drawn.
 const MAX_POLLED: usize = 200;
@@ -51,8 +54,11 @@ pub(super) struct FileTree {
     flags: (bool, bool),
     selected: Option<PathBuf>,
     pub(super) scroll: UniformListScrollHandle,
-    /// A poll is out: the next tick waits for it rather than pile up behind a slow disk.
-    polling: bool,
+    /// A poll or a watch's read is out: the next tick waits for it rather than pile up behind a slow disk, and what
+    /// the watch hears meanwhile is read once it lands.
+    loads: Loads,
+    /// When the last poll started: while watching, the next waits `watch::SAFETY_POLL`.
+    pub(super) polled_at: Option<Instant>,
     /// Folders whose last read timed out (a hung mount): polls skip them, an expand or Refresh tries again.
     stalled: HashSet<PathBuf>,
 }
@@ -90,7 +96,8 @@ impl FileTree {
             flags,
             selected: None,
             scroll: UniformListScrollHandle::new(),
-            polling: false,
+            loads: Loads::default(),
+            polled_at: None,
             stalled: HashSet::new(),
         }
     }
@@ -237,7 +244,7 @@ impl SidePanel {
         }
         self.files = Some(FileTree::new(root.clone(), flags(cx)));
         self.file_menu = None;
-        self.read_dirs(vec![root], false, cx);
+        self.read_dirs(vec![root], false, false, cx);
     }
 
     /// The Shell's word on whether the Files tab is on screen and the window active. Coming into view reads the
@@ -251,21 +258,63 @@ impl SidePanel {
         let woke = live && !self.files_live;
         self.files_live = live;
         if woke {
-            self.poll_files(cx);
+            self.poll_files(false, cx);
         }
     }
 
-    /// Every `POLL` while the tab is live: the root and the open folders drawn, read again; only a change lands.
-    pub(super) fn poll_files(&mut self, cx: &mut Context<Self>) {
-        let Some(tree) = self.files.as_ref().filter(|t| self.files_live && !t.polling) else { return };
-        let open = tree.rows.iter().filter_map(|r| match r {
-            Row::Entry { path, expanded: true, .. } => Some(path.clone()),
-            _ => None,
-        });
-        // a folder not read yet has its first read out already
-        let dirs: Vec<PathBuf> = std::iter::once(tree.root.clone()).chain(open).filter(|d| tree.reads.contains_key(d) && !tree.stalled.contains(d)).take(MAX_POLLED).collect();
-        if !dirs.is_empty() {
-            self.read_dirs(dirs, true, cx);
+    /// Every `POLL` while the tab is live (`tick`; every `watch::SAFETY_POLL` while the root is watched), and when it
+    /// comes into view: the root and the open folders drawn, read again; only a change lands.
+    pub(super) fn poll_files(&mut self, tick: bool, cx: &mut Context<Self>) {
+        let (live, watching) = (self.files_live, self.watching());
+        let Some(tree) = self.files.as_mut().filter(|t| live && !t.loads.busy()) else { return };
+        if tick && watching && tree.polled_at.is_some_and(|at| at.elapsed() < watch::SAFETY_POLL) {
+            return;
+        }
+        tree.polled_at = Some(Instant::now());
+        if let Some(batch) = tree.loads.start(Batch::everything()) {
+            self.load_files(batch, cx);
+        }
+    }
+
+    /// What the watch heard: the open folders among it read again (all of them after lost events or a
+    /// `.gitignore` changed, which also asks git again what it ignores), or once the read out lands.
+    pub(super) fn watch_files(&mut self, batch: Batch, cx: &mut Context<Self>) {
+        // a tab out of view reads everything when it comes back
+        let live = self.files_live;
+        let Some(tree) = self.files.as_mut().filter(|_| live) else { return };
+        if batch.dirs.is_empty() && !batch.rescan && !batch.rules {
+            return;
+        }
+        if let Some(batch) = tree.loads.start(batch) {
+            self.load_files(batch, cx);
+        }
+    }
+
+    /// Starts `batch`'s read (a load is out for it: `Loads::start`); with nothing to read, the load ends, and the
+    /// next one waiting starts.
+    fn load_files(&mut self, mut batch: Batch, cx: &mut Context<Self>) {
+        loop {
+            let Some(tree) = self.files.as_mut() else { return };
+            let all = batch.rescan || batch.rules;
+            let open = tree.rows.iter().filter_map(|r| match r {
+                Row::Entry { path, expanded: true, .. } => Some(path.clone()),
+                _ => None,
+            });
+            // a folder not read yet has its first read out already
+            let dirs: Vec<PathBuf> = std::iter::once(tree.root.clone())
+                .chain(open)
+                .filter(|d| tree.reads.contains_key(d) && !tree.stalled.contains(d) && (all || batch.dirs.contains(d)))
+                .take(MAX_POLLED)
+                .collect();
+            if !dirs.is_empty() {
+                // new ignore rules: read afresh, so git is asked again (a poll asks only of folders whose names changed)
+                self.read_dirs(dirs, !batch.rules, true, cx);
+                return;
+            }
+            match tree.loads.finish() {
+                Some(next) => batch = next,
+                None => return,
+            }
         }
     }
 
@@ -278,12 +327,13 @@ impl SidePanel {
             _ => None,
         });
         let dirs: Vec<PathBuf> = std::iter::once(tree.root.clone()).chain(open).take(MAX_POLLED).collect();
-        self.read_dirs(dirs, false, cx);
+        self.read_dirs(dirs, false, false, cx);
     }
 
     /// Reads `dirs` on the runtime. A poll hands over the fingerprints it has and keeps the folders' generations;
-    /// any other read bumps them, so a poll still out cannot land over it.
-    fn read_dirs(&mut self, dirs: Vec<PathBuf>, poll: bool, cx: &mut Context<Self>) {
+    /// any other read bumps them, so a poll still out cannot land over it. `load`: the read is the tree's load out
+    /// (`FileTree::loads`), ended when it lands.
+    fn read_dirs(&mut self, dirs: Vec<PathBuf>, poll: bool, load: bool, cx: &mut Context<Self>) {
         let Some(tree) = self.files.as_mut() else { return };
         let jobs = dirs
             .into_iter()
@@ -299,21 +349,27 @@ impl SidePanel {
                 }
             })
             .collect();
-        tree.polling |= poll;
         let (id, root, git) = (tree.id, tree.root.clone(), tree.git);
         let job = self.rt.spawn(read_dirs(root, jobs, git));
         cx.spawn(async move |this, cx| {
             let answer = job.await.ok();
-            let _ = this.update(cx, |this, cx| this.take_reads(id, poll, answer, cx));
+            let _ = this.update(cx, |this, cx| this.take_reads(id, load, answer, cx));
         })
         .detach();
     }
 
-    fn take_reads(&mut self, id: u64, poll: bool, answer: Option<(Vec<Answer>, Option<bool>)>, cx: &mut Context<Self>) {
+    fn take_reads(&mut self, id: u64, load: bool, answer: Option<(Vec<Answer>, Option<bool>)>, cx: &mut Context<Self>) {
         let Some(tree) = self.files.as_mut().filter(|t| t.id == id) else { return };
-        if poll {
-            tree.polling = false;
+        // what the watch heard while this was out is read next
+        let next = if load { tree.loads.finish() } else { None };
+        self.land_reads(answer, cx);
+        if let Some(next) = next {
+            self.load_files(next, cx);
         }
+    }
+
+    fn land_reads(&mut self, answer: Option<(Vec<Answer>, Option<bool>)>, cx: &mut Context<Self>) {
+        let Some(tree) = self.files.as_mut() else { return };
         let Some((answers, git)) = answer else { return };
         tree.git = git.or(tree.git);
         let mut changed = false;
@@ -357,7 +413,7 @@ impl SidePanel {
         let Some(tree) = self.files.as_mut() else { return };
         if !tree.expanded.remove(&path) {
             tree.expanded.insert(path.clone());
-            self.read_dirs(vec![path], false, cx);
+            self.read_dirs(vec![path], false, false, cx);
         }
         self.rebuild_files(cx);
     }

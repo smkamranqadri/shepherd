@@ -1,11 +1,13 @@
 //! The Changes tab: the root's git changes as VS Code's Source Control lists them (merge conflicts, staged, changes,
-//! untracked, each under a header that folds), the branch over them, and their count on the tab's icon. No file
-//! watcher: `git status` runs while the panel is open in the active window, on whichever tab, so the badge stays true:
-//! every `super::files::POLL` while the Changes tab shows, every `BADGE_POLL` while only its badge does, and never
-//! sooner than five times the last run took (`poll_delay`), so a repository where git takes seconds is not kept busy.
-//! One run at a time, on the runtime, under `files::runner`'s deadline and output cap. An answer lands only on the
-//! list of the root it was asked for (a root changed meanwhile drops it, and the run with it), and only a different
-//! answer redraws.
+//! untracked, each under a header that folds), the branch over them, and their count on the tab's icon. `git status`
+//! runs while the panel is open in the active window, on whichever tab, so the badge stays true: when the root's
+//! watch (`files::watch`) hears the work tree, the index, HEAD or a ref change, and otherwise every
+//! `super::files::POLL` while the Changes tab shows, every `BADGE_POLL` while only its badge does (every
+//! `watch::SAFETY_POLL` while the root is watched), never sooner than five times the last run took (`poll_delay`), so
+//! a repository where git takes seconds is not kept busy. One run at a time, on the runtime, under `files::runner`'s
+//! deadline and output cap; a change heard while it is out asks for one more. An answer lands only on the list of the
+//! root it was asked for (a root changed meanwhile drops it, and the run with it), and only a different answer
+//! redraws.
 use super::{SidePanel, SidePanelEvent};
 use crate::files::icons::material_icon;
 use crate::files::runner::{self, Host, Limits, Output, RunError};
@@ -27,13 +29,35 @@ use tokio::task::AbortHandle;
 /// may lag a little; the list itself, once shown, is asked at once and then every `POLL`.
 const BADGE_POLL: Duration = Duration::from_secs(12);
 
-/// How long after a run that took `took` the next may start: the tab's pace (`POLL` while the Changes tab shows,
-/// `BADGE_POLL` while only its badge does), but never sooner than five times `took`, so git gets at most a fifth of
-/// a core however slow the repository.
-pub(super) fn poll_delay(took: Duration, tab_shown: bool) -> Duration {
-    let pace = if tab_shown { super::files::POLL } else { BADGE_POLL };
-    pace.max(took.saturating_mul(5))
+/// How long after a run that took `took` the next poll may start: the tab's pace (`POLL` while the Changes tab shows,
+/// `BADGE_POLL` while only its badge does, `SAFETY_POLL` either way while the root is `watched`), but never sooner
+/// than `floor(took)`.
+pub(super) fn poll_delay(took: Duration, tab_shown: bool, watched: bool) -> Duration {
+    let pace = match (watched, tab_shown) {
+        (true, _) => crate::files::watch::SAFETY_POLL,
+        (false, true) => super::files::POLL,
+        (false, false) => BADGE_POLL,
+    };
+    pace.max(floor(took))
 }
+
+/// How long after a run that took `took` any next one may start, a change heard or not: five times `took`, so git
+/// gets at most a fifth of a core however slow the repository.
+fn floor(took: Duration) -> Duration {
+    took.saturating_mul(5)
+}
+
+/// How long after a run that took `took` one asked for by a change the watch heard may start: `WATCH_PACE` while the
+/// Changes tab shows, `BADGE_POLL` while only its badge does, never sooner than `floor(took)`. Files git ignores
+/// (a log written line by line, an editor's swap file, `*.pyc`) are heard too; this keeps their churn from running
+/// git back to back.
+fn watch_delay(took: Duration, tab_shown: bool) -> Duration {
+    let pace = if tab_shown { WATCH_PACE } else { BADGE_POLL };
+    pace.max(floor(took))
+}
+
+/// The least time between runs a change heard asks for while the Changes tab shows.
+const WATCH_PACE: Duration = Duration::from_millis(1500);
 
 /// A failure that says nothing about the changes themselves (git slow this once, a lock, a hiccup): the last good
 /// list and badge stay, marked as not refreshed, rather than flap to an error and back.
@@ -82,8 +106,14 @@ pub(super) struct ChangeList {
     rows: Vec<ChangeRow>,
     /// The run out; a tick while it is waits for it rather than pile up behind a slow repository.
     job: Option<AbortHandle>,
-    /// The next run may not start before this (`poll_delay`); `None`: at the next chance.
-    next_at: Option<Instant>,
+    /// The next poll may not start before this (`poll_delay`); `None`: at the next chance.
+    pub(super) next_at: Option<Instant>,
+    /// When the last run ended and how long it took: a run for a change heard waits `watch_delay` after it.
+    ran: Option<(Instant, Duration)>,
+    /// The watch heard a change since the last run started: one more is due once `watch_delay` has passed.
+    wanted: bool,
+    /// A timer is out for that run.
+    armed: bool,
     /// The last run timed out or printed too much (`halts`): no more runs until the tab is shown again.
     halted: bool,
     /// The last run failed in passing (`transient`) while `result` holds a good list, which stays: why it was not
@@ -113,6 +143,9 @@ impl ChangeList {
             rows: Vec::new(),
             job: None,
             next_at: None,
+            ran: None,
+            wanted: false,
+            armed: false,
             halted: false,
             stale: None,
             selected: None,
@@ -255,22 +288,61 @@ impl SidePanel {
             list.halted = false;
             list.next_at = None;
         }
+        if self.panel_shown != panel_shown {
+            self.panel_shown = panel_shown;
+            self.sync_watch(cx);
+        }
         let live = panel_shown && active;
         let woke = live && !self.changes_live;
         self.changes_live = live;
-        if woke || tab_woke {
+        if woke && self.watching() {
+            // what the watch heard while the window was in the background is asked about now, not at the safety net
+            self.want_changes(cx);
+        } else if woke || tab_woke {
             self.poll_changes(cx);
         }
     }
 
-    /// Each tick of the panel's clock while live: git asked again once `poll_delay` has passed, unless the last run
-    /// is still out or polling is halted.
+    /// The watch heard something that may change git's answer: a run once `watch_delay` has passed (one
+    /// more, when a run is out).
+    pub(super) fn want_changes(&mut self, cx: &mut Context<Self>) {
+        if let Some(list) = self.changes.as_mut() {
+            list.wanted = true;
+            self.poll_changes(cx);
+        }
+    }
+
+    /// Each tick of the panel's clock while live, and each change the watch hears: git asked again once
+    /// `poll_delay` has passed, or a change was heard and `watch_delay` has, unless the last run is still out or polling
+    /// is halted.
     pub(super) fn poll_changes(&mut self, cx: &mut Context<Self>) {
         if !self.changes_live {
             return;
         }
         let now = Instant::now();
-        let Some(list) = self.changes.as_mut().filter(|l| l.job.is_none() && !l.halted && l.next_at.is_none_or(|at| at <= now)) else { return };
+        let Some(list) = self.changes.as_mut().filter(|l| l.job.is_none() && !l.halted) else { return };
+        let paced = list.next_at.is_none_or(|at| at <= now);
+        let tab_shown = self.changes_tab_shown;
+        let floor_at = list.ran.map(|(at, took)| at + watch_delay(took, tab_shown)).filter(|&at| at > now);
+        if !paced && !(list.wanted && floor_at.is_none()) {
+            if let Some(at) = floor_at.filter(|_| list.wanted && !list.armed) {
+                // the change heard is asked about as soon as that allows, not at the next tick
+                list.armed = true;
+                let id = list.id;
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(at - now).await;
+                    let _ = this.update(cx, |this, cx| {
+                        if let Some(list) = this.changes.as_mut().filter(|l| l.id == id) {
+                            list.armed = false;
+                            this.poll_changes(cx);
+                        }
+                    });
+                })
+                .detach();
+            }
+            return;
+        }
+        list.wanted = false;
         let (id, root) = (list.id, list.root.clone());
         let task = self.rt.spawn(read_status(root));
         list.job = Some(task.abort_handle());
@@ -283,12 +355,25 @@ impl SidePanel {
     }
 
     fn take_status(&mut self, id: u64, started: Instant, answer: Option<Result<Answer, GitError>>, cx: &mut Context<Self>) {
+        if self.changes.as_ref().is_none_or(|l| l.id != id) {
+            return;
+        }
+        self.land_status(started, answer, cx);
+        // a change heard while the run was out: one more, once `watch_delay` allows
+        if self.changes.as_ref().is_some_and(|l| l.wanted) {
+            self.poll_changes(cx);
+        }
+    }
+
+    fn land_status(&mut self, started: Instant, answer: Option<Result<Answer, GitError>>, cx: &mut Context<Self>) {
         let counted = self.changes_count();
-        let tab_shown = self.changes_tab_shown;
-        let Some(list) = self.changes.as_mut().filter(|l| l.id == id) else { return };
+        let (tab_shown, watched) = (self.changes_tab_shown, self.watching());
+        let Some(list) = self.changes.as_mut() else { return };
         list.job = None;
         let Some(answer) = answer else { return };
-        list.next_at = Some(Instant::now() + poll_delay(started.elapsed(), tab_shown));
+        let (now, took) = (Instant::now(), started.elapsed());
+        list.next_at = Some(now + poll_delay(took, tab_shown, watched));
+        list.ran = Some((now, took));
         if let Err(e) = &answer {
             list.halted |= halts(e);
             if transient(e) && list.answer().is_some() {
@@ -664,12 +749,21 @@ mod tests {
     #[test]
     fn the_next_run_waits_for_the_pace_or_five_times_the_last() {
         let ms = Duration::from_millis;
-        assert_eq!(poll_delay(ms(40), true), ms(3000));
-        assert_eq!(poll_delay(ms(40), false), ms(12_000));
-        assert_eq!(poll_delay(ms(1000), true), ms(5000));
-        assert_eq!(poll_delay(ms(1000), false), ms(12_000));
-        assert_eq!(poll_delay(ms(4000), false), ms(20_000));
-        assert_eq!(poll_delay(Duration::MAX, true), Duration::MAX);
+        assert_eq!(poll_delay(ms(40), true, false), ms(3000));
+        assert_eq!(poll_delay(ms(40), false, false), ms(12_000));
+        assert_eq!(poll_delay(ms(1000), true, false), ms(5000));
+        assert_eq!(poll_delay(ms(1000), false, false), ms(12_000));
+        assert_eq!(poll_delay(ms(4000), false, false), ms(20_000));
+        assert_eq!(poll_delay(Duration::MAX, true, false), Duration::MAX);
+        // watched: the polls are a safety net, the floor still holds for a change heard
+        assert_eq!(poll_delay(ms(40), true, true), ms(30_000));
+        assert_eq!(poll_delay(ms(8000), false, true), ms(40_000));
+        assert_eq!(floor(ms(40)), ms(200));
+        // a change heard: 1.5 s apart while the tab shows, the badge's pace while only it does, and the floor
+        assert_eq!(watch_delay(ms(40), true), ms(1500));
+        assert_eq!(watch_delay(ms(40), false), ms(12_000));
+        assert_eq!(watch_delay(ms(1000), true), ms(5000));
+        assert_eq!(watch_delay(ms(4000), false), ms(20_000));
         assert!(transient(&GitError::Timeout) && transient(&GitError::Failed("index.lock".into())));
         assert!(!transient(&GitError::NotRepo) && !transient(&GitError::TooLarge));
         assert!(halts(&GitError::Timeout) && halts(&GitError::TooLarge) && !halts(&GitError::Failed(String::new())));

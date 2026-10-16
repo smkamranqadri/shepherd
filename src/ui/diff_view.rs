@@ -367,8 +367,13 @@ pub struct DiffView {
     top: Option<PathBuf>,
     /// Bumped by every read started: an older one's answer is dropped when it lands.
     generation: u64,
-    /// The read out; a poll while it is waits for the next.
+    /// The read out; a poll while it is waits for it (`again`).
     job: Option<AbortHandle>,
+    /// A Changes poll came while a read was out or before `poll_due`: one more read once it is due, so the last
+    /// change heard is not left unread.
+    again: bool,
+    /// A timer is out for that read.
+    armed: bool,
     /// Set to stop the highlight of a read no longer wanted.
     cancel: Arc<AtomicBool>,
     /// `None` until the first read answers (and after a hidden tab let go of it).
@@ -416,6 +421,8 @@ impl DiffView {
             top: None,
             generation: 0,
             job: None,
+            again: false,
+            armed: false,
             cancel: Arc::default(),
             result: None,
             split,
@@ -458,7 +465,7 @@ impl DiffView {
     }
 
     /// A Changes poll answered (`poll`), or the tab came into view: reads the diff again, with the change as the
-    /// list has it now. A read still out is waited for, not doubled; a poll waits for `poll_due`.
+    /// list has it now. A read still out is waited for, not doubled; a poll waits for `poll_due` (and is read then).
     pub fn reload(&mut self, change: Option<Change>, entries: Entries, poll: bool, cx: &mut Context<Self>) {
         if let Some(change) = change {
             self.spec.change = change;
@@ -470,7 +477,30 @@ impl DiffView {
             cx.notify();
         } else if self.job.is_none() && (!poll || poll_due(Instant::now(), self.finished, self.took)) {
             self.load(cx);
+        } else if poll {
+            self.again = true;
+            self.arm(cx);
         }
+    }
+
+    /// The read `again` asks for, once no read is out and `poll_due` says so.
+    fn arm(&mut self, cx: &mut Context<Self>) {
+        if self.armed || self.job.is_some() {
+            return;
+        }
+        self.armed = true;
+        let due = self.finished.map_or_else(Instant::now, |at| at + self.took.saturating_mul(5));
+        let wait = due.saturating_duration_since(Instant::now());
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |v, cx| {
+                v.armed = false;
+                if v.again && v.job.is_none() {
+                    v.load(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// The file's entries now: one no longer both staged and changed loses the switch, and goes back to its group's
@@ -503,6 +533,8 @@ impl DiffView {
         if let Some(job) = self.job.take() {
             job.abort();
         }
+        // a read started, or none wanted (hidden, released): the one `again` asked for is not needed
+        self.again = false;
         self.cancel.store(true, Ordering::Relaxed);
     }
 
@@ -541,6 +573,9 @@ impl DiffView {
         self.job = None;
         self.finished = Some(Instant::now());
         self.took = self.started.elapsed();
+        if self.again {
+            self.arm(cx);
+        }
         if top.is_some() {
             self.top = top;
         }
