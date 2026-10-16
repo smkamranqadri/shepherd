@@ -179,9 +179,8 @@ impl Shell {
     }
 
     /// The workspace list's rows for `snapshot`: each workspace with its worktrees folded under it. `Live` rows answer
-    /// clicks, renames and drags and show worktrees being made; another session's (`Other`) switch there on a click; a
-    /// swipe's preview of another place draws the same rows inert, so the list that slides in is the one that stays
-    /// when it lands. `hints` holds the numbered workspaces' chords across the tree.
+    /// clicks, renames and drags and show worktrees being made; another session's (`Other`) switch there on a click.
+    /// `hints` holds the numbered workspaces' chords across the tree.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn workspace_rows(
         &self,
@@ -194,7 +193,6 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         let live = mode == sidebar_tree::RowMode::Live;
-        let other = matches!(mode, sidebar_tree::RowMode::Other(_));
         // folds are kept per session, and ids told apart by session: workspace ids repeat across sessions
         let (session, idx) = self.row_keys(&mode);
         let fold_key = |id: &str| crate::files::roots::root_key(&session, id);
@@ -210,7 +208,7 @@ impl Shell {
             })
             .unwrap_or_default();
         // held Ctrl+Shift (Ctrl on macOS): each of the first nine workspaces' chord, in `go_to_workspace`'s order
-        let hint = hints.filter(|_| live || other);
+        let hint = hints;
         let ws_row = |w: &crate::model::Workspace, nested: bool, chevron: Option<gpui::AnyElement>, folded: Option<usize>, cx: &mut Context<Self>| {
             let chip = hint.and_then(|(opacity, chords)| {
                 let (_, _, chord) = chords.iter().find(|(k, id, _)| k.0 == session && *id == w.workspace_id)?;
@@ -398,8 +396,8 @@ impl Shell {
             let fold = fold_key(&w.workspace_id);
             let open = !self.folded.contains(&fold) || !pending.is_empty();
             let full = (kids.len() + pending.len()) as f32 * (kid_h + 2.);
-            let tween = self.fold_motion.get(&fold).copied().filter(|m| (live || other) && m.animating());
-            let chevron = fold_chevron(theme, &format!("{idx}-{}", w.workspace_id), open, full, tween).when(live || other, |el| {
+            let tween = self.fold_motion.get(&fold).copied().filter(|m| m.animating());
+            let chevron = fold_chevron(theme, &format!("{idx}-{}", w.workspace_id), open, full, tween).map(|el| {
                 el.on_click(cx.listener({
                     let id = fold.clone();
                     move |this, _: &ClickEvent, _, cx| {
@@ -455,34 +453,23 @@ impl Shell {
         if SettingsGlobal::of(cx).settings.attention_agents {
             agents.retain(|(p, _, _)| crate::notify::wants_attention(p.agent_status));
         }
-        let hover_bg = theme.hover;
         let active = window.is_window_active();
 
         let strip = update_strip(theme, cx);
         let (tree, listed) = self.tree_rows(theme, snapshot, shown_ws, active, cx);
         let waiting = self.error.is_none() && self.connecting.is_some_and(|at| crate::ui::loader::due(at, window));
-        let (list_offset, beside) = self.list_offset(window);
-        let list_fade = 1. - (list_offset.abs() / 400.).min(0.5);
-        let beside = beside.map(|(place, at)| {
-            div().absolute().top_0().bottom_0().w(px(self.sidebar_width - 1.)).left(px(at)).child(self.place_preview(&place, theme, window, cx))
-        });
         // Laid out at full width and clipped by its tweened box, so rows never reflow mid slide.
         div()
-            .on_scroll_wheel(cx.listener(|this, e: &gpui::ScrollWheelEvent, _, cx| this.sidebar_scroll(e, cx)))
             .w(px(self.sidebar_width - 1.))
             .h_full()
             .flex_none()
             .flex()
             .flex_col()
             .pt(px(TITLEBAR_HEIGHT))
-            // everything between the titlebar and the place bar goes under a swipe's fingers, then springs home, and
-            // beside it the place it goes to (or comes from)
             .child(
-                div().relative().flex_1().min_h_0().overflow_hidden().children(beside).child(
+                div().relative().flex_1().min_h_0().overflow_hidden().child(
             div()
                 .relative()
-                .left(px(list_offset))
-                .opacity(list_fade)
                 .size_full()
                 .flex()
                 .flex_col()
@@ -515,36 +502,12 @@ impl Shell {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    // a sideways swipe moves between places, not down the list
-                    .map(|mut el| {
-                        el.style().restrict_scroll_to_axis = Some(true);
-                        el
-                    })
                     .px(px(8.))
                     .flex()
                     .flex_col()
                     .gap(px(2.))
                     .children(tree)
             ),
-            )
-            .child(
-                div().flex_none().m(px(8.)).flex().gap(px(4.)).child(
-                div()
-                    .id("new-workspace")
-                    .flex_1()
-                    .h(px(32.))
-                    .px(px(8.))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .rounded(px(8.))
-                    .text_color(theme.text_muted)
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(hover_bg))
-                    .child(div().text_size(px(15.)).child("+"))
-                    .child("New workspace")
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.new_workspace(cx))),
-                ),
             )
             .when(SettingsGlobal::of(cx).settings.show_agents && any_agents, |el| {
                 let seam = theme.accent;
@@ -647,30 +610,15 @@ impl Shell {
             }),
             ))
             .children(strip)
-            .child(self.place_bar(theme, list_offset, window, cx))
+            .child(self.footer(theme, cx))
     }
 
-    /// Arc's space bar: a button for each herdr session and machine, the shown one lit, and + for a new one.
-    /// `offset` is the workspace list's: the lit square under the buttons moves as far toward the next place as the list
-    /// has moved toward it.
-    fn place_bar(&self, theme: &Theme, offset: f32, window: &mut Window, cx: &mut Context<Self>) -> Div {
+    /// Under the sidebar: Settings, a new workspace in the session shown, and + for a new session or SSH machine.
+    fn footer(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let hover_bg = theme.hover;
-        let shown_at = self.places.iter().position(|p| self.places_shown(p));
-        let buttons = self.places.iter().enumerate().map(|(i, place)| {
-            let shown = self.places_shown(place);
-            let (name, icon) = place.look(cx);
-            let letter = || div().text_size(px(12.)).font_weight(gpui::FontWeight::SEMIBOLD).child(name.chars().next().unwrap_or('?').to_uppercase().to_string());
-            let mark = match (icon, place) {
-                (Some(icon), _) => sessions::icon_mark(&icon, 15., if shown { theme.accent } else { theme.text_faint }),
-                (None, sessions::Place::Machine(_)) => {
-                    gpui::svg().path("icons/remote-server.svg").size(px(15.)).text_color(if shown { theme.accent } else { theme.text_faint }).into_any_element()
-                }
-                (None, sessions::Place::Session(_)) => letter().into_any_element(),
-            };
-            let (to, menu) = (place.clone(), place.clone());
+        let button = |id: &'static str, icon: &'static str| {
             div()
-                .id(("place", i))
-                .tooltip(tip(name.clone(), None))
+                .id(id)
                 .size(px(30.))
                 .flex_none()
                 .flex()
@@ -678,52 +626,10 @@ impl Shell {
                 .justify_center()
                 .rounded(px(8.))
                 .cursor_pointer()
-                .relative()
-                .text_color(if shown { theme.accent } else { theme.text_faint })
-                .when(!shown, |el| el.hover(move |s| s.bg(hover_bg)))
-                .child(mark)
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    if !this.places_shown(&to) {
-                        this.switch_to(to.clone(), cx)
-                    }
-                }))
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, e: &MouseDownEvent, _, cx| this.open_place_menu(menu.clone(), e.position, cx)),
-                )
-        });
-        // one button and the gap after it
-        let step = 34.;
-        if let Some((from, to, at)) = self.bar_glide.get() {
-            let t = at.elapsed().as_secs_f32() / FOLD_DURATION.as_secs_f32();
-            let x = if t >= 1. { to } else { from + (to - from) * ease_out(t) };
-            self.places_scroll.set_offset(gpui::point(px(-x), px(0.)));
-            if t >= 1. {
-                self.bar_glide.set(None);
-            } else {
-                window.request_animation_frame();
-            }
-        }
-        let lit = shown_at.map(|at| {
-            let x = (at as f32 - offset / self.sidebar_width).clamp(0., (self.places.len() - 1) as f32) * step;
-            // a moved square glides to the row's middle; one that stays put leaves the row where it was scrolled
-            if x != self.lit_seen.get() {
-                self.lit_seen.set(x);
-                let width = f32::from(self.places_scroll.bounds().size.width);
-                let to = (x + 15. - width / 2.).clamp(0., f32::from(self.places_scroll.max_offset().x));
-                let from = -f32::from(self.places_scroll.offset().x);
-                if (to - from).abs() > 0.5 {
-                    self.bar_glide.set(Some((from, to, Instant::now())));
-                }
-            }
-            div().absolute().top_0().left(px(x)).size(px(30.)).rounded(px(8.)).bg(theme.selected)
-        });
-        if self.bar_glide.get().is_some() {
-            window.request_animation_frame(); // a glide set just now starts on the next frame
-        }
-        let bar_bounds = self.bar_bounds.clone();
+                .hover(move |s| s.bg(hover_bg))
+                .child(gpui::svg().path(icon).size(px(16.)).text_color(theme.text_muted))
+        };
         div()
-            .relative()
             .flex_none()
             // close under the agents list, the window's edge kept below
             .pt(px(2.))
@@ -731,54 +637,40 @@ impl Shell {
             .px(px(8.))
             .flex()
             .items_center()
+            .gap(px(4.))
             .child(
-                gpui::canvas(move |bounds, _, _| bar_bounds.set(Some(bounds)), |_, _, _, _| {})
-                    .absolute()
-                    .size_full(),
-            )
-            .child(
-                div()
-                    .id("open-settings")
+                button("open-settings", "icons/settings.svg")
                     .tooltip(tip("Settings", Some("OpenSettings")))
-                    .size(px(30.))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(8.))
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(hover_bg))
-                    .child(gpui::svg().path("icons/settings.svg").size(px(16.)).text_color(theme.text_muted))
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_settings_here(window, cx))),
             )
-            // centred while they fit, scrolled sideways (faded at the edges) once they don't
-            .child(
-                div().flex_1().min_w_0().mx(px(12.)).child(crate::ui::edge_fade::edge_faded_x(16., 
-                    &self.places_scroll,
-                    div()
-                        .id("places")
-                        .w_full()
-                        .flex()
-                        .overflow_x_scroll()
-                        .track_scroll(&self.places_scroll)
-                        // auto margins centre the row while it fits and fall to 0 once it scrolls
-                        .child(div().flex_none().mx_auto().relative().flex().gap(px(step - 30.)).children(lit).children(buttons)),
-                )),
-            )
             .child(
                 div()
-                    .id("place-new")
-                    .tooltip(tip("New session", None))
-                    .size(px(30.))
-                    .flex_none()
+                    .id("new-workspace")
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(30.))
+                    .px(px(8.))
                     .flex()
                     .items_center()
-                    .justify_center()
+                    .gap(px(8.))
                     .rounded(px(8.))
+                    .text_color(theme.text_muted)
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover_bg))
-                    .child(gpui::svg().path("icons/plus.svg").size(px(16.)).text_color(theme.text_muted))
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open_session_dialog(window, cx))),
+                    .tooltip(tip("New workspace", Some("NewWorkspace")))
+                    .child(div().text_size(px(15.)).child("+"))
+                    .child(div().truncate().child("New workspace"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.new_workspace(cx))),
+            )
+            .child(
+                button("place-new", "icons/plus.svg")
+                    .tooltip(tip("New session or SSH machine", None))
+                    .when(self.tree.add_menu_open(), |el| el.bg(theme.hover))
+                    // capture, like the sidebar's `…`: a press on the open menu's trigger closes it
+                    .capture_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_add_menu(e.position, cx);
+                    })),
             )
     }
 }
@@ -796,7 +688,7 @@ pub(super) fn agent_entries(s: &Snapshot, sort: AgentSort, since: &crate::model:
         .collect()
 }
 
-/// The agents list's rows, `act` making each one do something (the swipe's preview of another place leaves them inert).
+/// The agents list's rows, `act` making each one do something.
 pub(super) fn agent_rows(
     agents: Vec<(crate::model::Pane, String, Option<String>)>,
     sort: AgentSort,

@@ -9,7 +9,7 @@ It's written in Rust on [GPUI](https://github.com/zeronsh/zui) and styled after 
 ## What it does
 
 - The sidebar lists workspaces. A repo's worktrees fold under it with their branch, changes against main and PR state. Right-click creates, opens or removes a worktree.
-- Under the sidebar, herdr sessions and saved SSH machines sit in a bar, as Arc's spaces. A two-finger swipe goes to the next one.
+- The sidebar lists every machine, its herdr sessions and their workspaces in one tree. The sessions not shown are kept fresh in the background, a click on one of their workspaces goes there, and a session's menu starts, stops or restarts it.
 - The agents list at the bottom shows every agent herdr detects in any workspace, with its status (working, blocked, done, idle), the task in its title and how long it has waited. Click one to jump to its pane.
 - When an agent you can't see starts waiting or finishes, macOS shows a notification and the Dock icon counts it until you look at that tab. Approve on the notification answers the agent without opening Shepherd.
 - Tabs show the agent or shell running in them. Drag tabs to reorder them. Drag a pane by its grip onto another pane to split or swap, or onto a tab to move it there.

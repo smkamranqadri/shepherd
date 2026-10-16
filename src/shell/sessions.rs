@@ -1,8 +1,7 @@
-//! herdr sessions and saved SSH machines, Arc's spaces: a bar of them under the sidebar, a two-finger swipe to the
-//! next or last, and the dialogs that make and delete them.
+//! herdr sessions and saved SSH machines, listed in the sidebar's tree (`sidebar_tree`), the keys' way from one to
+//! the next, and the dialogs that make and delete them.
 use super::*;
 use crate::herdr::{Machine, SessionInfo};
-use gpui::{ScrollDelta, ScrollWheelEvent};
 
 /// A session here or a machine elsewhere.
 #[derive(Clone, PartialEq)]
@@ -35,18 +34,6 @@ impl Place {
         }
     }
 }
-
-/// A horizontal two-finger swipe over the sidebar, from its first event to its last.
-#[derive(Default)]
-pub(super) struct Swipe {
-    /// Decided by the gesture's first clear movement: true across, false down (the list scrolls instead).
-    across: Option<bool>,
-    /// How far the fingers have moved across, in px.
-    travel: f32,
-}
-
-/// Past this the list goes to the next place when the fingers lift; short of it, it springs back.
-const SWIPE_COMMIT: f32 = 60.;
 
 /// Edit a place's name and icon.
 pub(super) struct PlaceEdit {
@@ -192,14 +179,6 @@ impl Shell {
         }
     }
 
-    /// Asks the places on either side for their snapshots now, so a swipe shows them beside the list.
-    pub(super) fn prefetch_neighbours(&mut self, _: &mut Context<Self>) {
-        for travel in [-1., 1.] {
-            let Some(place) = self.neighbour(travel) else { continue };
-            self.watchers.poll_now(&watchers::SessionKey::of(&place), Instant::now());
-        }
-    }
-
     pub(super) fn show_place_emoji(&mut self, emoji: bool, cx: &mut Context<Self>) {
         if let Some(edit) = self.place_edit.as_mut() {
             edit.value.emoji = emoji;
@@ -302,7 +281,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// Asks herdr for its sessions and machines off the main thread (5 s at most, one read at a time), for the bar and
+    /// Asks herdr for its sessions and machines off the main thread (5 s at most, one read at a time), for the keys and
     /// the tree, in the tree's order; the watchers follow the list.
     pub(super) fn refresh_places(&mut self, cx: &mut Context<Self>) {
         if !self.watchers.start_listing() {
@@ -321,7 +300,6 @@ impl Shell {
                     let shown = s.shown_key();
                     s.watchers.reconcile(&s.places, shown.as_ref(), Instant::now());
                     if changed {
-                        s.prefetch_neighbours(cx);
                         cx.notify();
                     }
                 }
@@ -340,64 +318,8 @@ impl Shell {
         }
     }
 
-    /// One event of a scroll over the sidebar: a horizontal two-finger swipe drags the workspace list toward the
-    /// neighbouring place and, when the fingers lift far enough, moves there. Momentum after the lift is ignored.
-    pub(super) fn sidebar_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
-        use gpui::TouchPhase;
-        let delta = match event.delta {
-            ScrollDelta::Pixels(d) => (f32::from(d.x), f32::from(d.y)),
-            ScrollDelta::Lines(d) => (d.x * 20., d.y * 20.),
-        };
-        match event.touch_phase {
-            TouchPhase::Started => {
-                if self.bar_bounds.get().is_some_and(|b| b.contains(&event.position)) {
-                    return; // the bar scrolls itself
-                }
-                self.swipe = Some(Swipe::default());
-                self.prefetch_neighbours(cx);
-            }
-            TouchPhase::Moved => {
-                let Some(swipe) = self.swipe.as_mut() else { return };
-                if swipe.across.is_none() && delta.0.hypot(delta.1) > 2. {
-                    swipe.across = Some(delta.0.abs() > delta.1.abs() * 1.5);
-                }
-                if swipe.across == Some(true) {
-                    swipe.travel += delta.0;
-                    self.slide = None;
-                    cx.stop_propagation();
-                    cx.notify();
-                }
-            }
-            TouchPhase::Ended | TouchPhase::Cancelled => {
-                let Some(swipe) = self.swipe.take() else { return };
-                if swipe.across != Some(true) {
-                    return;
-                }
-                let offset = self.swipe_offset(swipe.travel);
-                match self.neighbour(swipe.travel).filter(|_| swipe.travel.abs() > SWIPE_COMMIT) {
-                    Some(place) => {
-                        let left = self.places.iter().find(|p| self.places_shown(p)).cloned();
-                        self.switch_to(place, cx);
-                        // the new list carries on from where it was beside the old one, which goes out the other side
-                        let width = self.sidebar_width;
-                        let from = if swipe.travel < 0. { width + offset } else { offset - width };
-                        self.slide = Some((from, Instant::now(), left));
-                    }
-                    None => self.slide = Some((offset, Instant::now(), None)),
-                }
-                cx.notify();
-            }
-        }
-    }
-
-    /// The place a swipe of `travel` px goes to: fingers to the left bring the next one, as in Arc.
-    fn neighbour(&self, travel: f32) -> Option<Place> {
-        let at = self.places.iter().position(|p| self.places_shown(p));
-        self.places.get(step(at?, self.places.len(), travel < 0., false)?).cloned()
-    }
-
-    /// The next place in the bar (or the last one), round to the first from the end and back: the keyboard's way
-    /// along the bar. Shown from a socket of one's own, it starts at either end.
+    /// The next place in the tree (or the last one), round to the first from the end and back: the keyboard's way
+    /// along the tree. Shown from a socket of one's own, it starts at either end.
     pub(super) fn step_place(&mut self, forward: bool, cx: &mut Context<Self>) {
         let n = self.places.len();
         let to = match self.places.iter().position(|p| self.places_shown(p)) {
@@ -409,18 +331,13 @@ impl Shell {
         }
     }
 
-    /// Shows `place`, the list sliding in from the side a swipe would bring it from: from the right going `forward`.
-    pub(super) fn show_place(&mut self, place: Place, forward: bool, cx: &mut Context<Self>) {
+    /// Shows `place` (a machine out of reach stays where it was, with a toast). The tree lists every place at once,
+    /// so nothing slides: `forward` is the way the keys went.
+    pub(super) fn show_place(&mut self, place: Place, _forward: bool, cx: &mut Context<Self>) {
         if self.places_shown(&place) {
             return;
         }
-        let left = self.places.iter().find(|p| self.places_shown(p)).cloned();
-        self.switch_to(place.clone(), cx);
-        // a machine out of reach stays where it was, with a toast
-        if self.places_shown(&place) {
-            let width = self.sidebar_width;
-            self.slide = Some((if forward { width } else { -width }, Instant::now(), left));
-        }
+        self.switch_to(place, cx);
         cx.notify();
     }
 
@@ -431,92 +348,6 @@ impl Shell {
             (Place::Session(s), None) => crate::herdr::current_session().as_deref() == Some(s.name.as_str()),
             _ => false,
         }
-    }
-
-    /// The list's offset under the fingers: it follows them most of the way to the next place, and past that (or where no place
-    /// is next) against a pull that grows the further they go, as iOS's rubber band: never past a sidebar's width more.
-    fn swipe_offset(&self, travel: f32) -> f32 {
-        let width = self.sidebar_width;
-        let reach = if self.neighbour(travel).is_some() { width * 0.85 } else { 0. };
-        let over = (travel.abs() - reach).max(0.);
-        travel.signum() * (travel.abs().min(reach) + (1. - 1. / (over * 0.4 / width + 1.)) * width)
-    }
-
-    /// The workspace list's offset now (under the fingers, springing home after a swipe, else 0), and the place shown
-    /// beside it with that place's offset: the one a swipe goes to, or the one a finished swipe left.
-    pub(super) fn list_offset(&mut self, window: &mut Window) -> (f32, Option<(Place, f32)>) {
-        let width = self.sidebar_width;
-        if let Some(swipe) = self.swipe.as_ref().filter(|s| s.across == Some(true)) {
-            let offset = self.swipe_offset(swipe.travel);
-            let beside = self.neighbour(swipe.travel).map(|p| (p, if swipe.travel < 0. { offset + width } else { offset - width }));
-            return (offset, beside);
-        }
-        let Some((from, at, left)) = self.slide.clone() else { return (0., None) };
-        let t = at.elapsed().as_secs_f32() / SPRING_DURATION.as_secs_f32();
-        if t >= 1. {
-            self.slide = None;
-            return (0., None);
-        }
-        window.request_animation_frame();
-        let offset = from * (1. - damped_spring(0.85, t));
-        (offset, left.map(|p| (p, if from > 0. { offset - width } else { offset + width })))
-    }
-
-    /// Another place's sidebar as a swipe shows it beside this one's: its name, then its workspaces and agents from its
-    /// last snapshot, or a word on why there is none.
-    pub(super) fn place_preview(&self, place: &Place, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let settings = SettingsGlobal::of(cx).settings.clone();
-        let heading = div().px(px(16.)).pt(px(8.)).pb(px(6.)).text_size(px(11.)).text_color(theme.text_faint).truncate().child(place.look(cx).0);
-        let column = div().size_full().flex().flex_col().child(heading);
-        let Some(snapshot) = self.watchers.snapshot(&watchers::SessionKey::of(place)) else {
-            if let Place::Session(s) = place && !s.running {
-                let why = "Not running: it starts when you get there";
-                return column.child(div().px(px(16.)).pt(px(8.)).text_size(px(11.)).text_color(theme.text_faint).child(why)).into_any_element();
-            }
-            return column.child(div().px(px(16.)).pt(px(12.)).child(crate::ui::loader::spinner(2.5, window))).into_any_element();
-        };
-        // the rows the sidebar draws once the swipe lands, on the tab herdr would show there first
-        let shown_ws = snapshot.pick_tab_in(None, None).map(|t| t.workspace_id.clone());
-        let rows = self.workspace_rows(theme, Some(snapshot), &shown_ws, sidebar_tree::RowMode::Inert, None, window.is_window_active(), cx);
-        let workspaces = div().flex_1().min_h_0().overflow_hidden().px(px(8.)).flex().flex_col().gap(px(2.)).children(rows);
-        let new_workspace = div()
-            .flex_none()
-            .m(px(8.))
-            .h(px(32.))
-            .px(px(8.))
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .text_color(theme.text_muted)
-            .child(div().text_size(px(15.)).child("+"))
-            .child("New workspace");
-        // its waits are not tracked here, so they go without
-        let mut agents = super::sidebar::agent_entries(snapshot, self.agent_sort, &Default::default());
-        let any_agents = !agents.is_empty();
-        if settings.attention_agents {
-            agents.retain(|(p, _, _)| crate::notify::wants_attention(p.agent_status));
-        }
-        let agents = (settings.show_agents && any_agents).then(|| {
-            let heading = div().px(px(16.)).pt(px(12.)).pb(px(4.)).border_t_1().border_color(theme.border).text_size(px(11.)).text_color(theme.text_faint).child("Agents");
-            let list = div()
-                .flex_none()
-                .map(|el| match self.agents_height {
-                    Some(h) => el.max_h(px(h)),
-                    None => el.max_h(gpui::relative(0.4)),
-                })
-                .overflow_hidden()
-                .px(px(8.))
-                .flex()
-                .flex_col()
-                .gap(px(2.))
-                .when(agents.is_empty(), |el| {
-                    el.child(div().px(px(8.)).py(px(6.)).text_size(px(11.)).text_color(theme.text_faint).child("Nothing needs you"))
-                })
-                .children(super::sidebar::agent_rows(agents, self.agent_sort, settings.compact_agents, None, theme, |row, _| row))
-                .child(div().flex_none().h(px(4.)));
-            [heading.into_any_element(), list.into_any_element()]
-        });
-        column.child(workspaces).child(new_workspace).children(agents.into_iter().flatten()).into_any_element()
     }
 
     /// Moves the window to a session on this Mac: its socket goes in the settings, and everything the last server's
@@ -583,7 +414,6 @@ impl Shell {
         self.unseen.clear();
         self.connect(cx);
         self.refresh_places(cx);
-        self.prefetch_neighbours(cx);
         cx.notify();
     }
 
@@ -696,7 +526,7 @@ impl Shell {
 }
 
 /// The index one place on from `at` among `len`, forward or back: past either end none, or with `wrap` the one at
-/// the other end. None where `at` is the only place.
+/// the other end (the keys' way). None where `at` is the only place.
 fn step(at: usize, len: usize, forward: bool, wrap: bool) -> Option<usize> {
     if at >= len || len < 2 {
         return None;
@@ -723,7 +553,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_swipe_stops_at_either_end() {
+    fn without_wrap_a_step_stops_at_either_end() {
         assert_eq!(step(0, 3, true, false), Some(1));
         assert_eq!(step(2, 3, true, false), None);
         assert_eq!(step(0, 3, false, false), None);

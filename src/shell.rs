@@ -265,21 +265,9 @@ pub struct Shell {
     /// Panes `[[keys.command]]` of `type = "pane"` opened, by the command's keys: pressed again in their tab, the
     /// command brings its pane back instead of stacking another (herdr opens one per press).
     command_panes: Vec<(Vec<String>, String)>,
-    /// herdr's sessions and machines, in the bar under the sidebar.
+    /// herdr's sessions and machines, in the sidebar's tree order.
     places: Vec<sessions::Place>,
-    /// A two-finger swipe over the sidebar in progress.
-    swipe: Option<sessions::Swipe>,
-    /// The workspace list springing home from this offset since then, after a swipe, beside the place it left.
-    slide: Option<(f32, Instant, Option<sessions::Place>)>,
-    /// The bar's row of places, when it overflows.
-    places_scroll: gpui::ScrollHandle,
-    /// Where the bar's lit square was last kept in view: it is scrolled to again only when it moves.
-    lit_seen: Cell<f32>,
-    /// The bar's row gliding from one scroll offset to another since then, to keep the lit square in its middle.
-    bar_glide: Cell<Option<(f32, f32, Instant)>>,
-    /// Where the bar was painted: a swipe there scrolls the bar, not to the next place.
-    bar_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
-    /// A place's right-click menu in the bar, and where it was clicked.
+    /// A place's menu in the sidebar's tree, and where it was clicked.
     place_menu: Option<crate::ui::Popup<(sessions::Place, gpui::Point<Pixels>)>>,
     /// The Edit dialog of a place's name and icon.
     place_edit: Option<crate::ui::Popup<sessions::PlaceEdit>>,
@@ -596,12 +584,6 @@ impl Shell {
                     herdr_commands: Vec::new(),
                     command_panes: Vec::new(),
                     places: Vec::new(),
-                    swipe: None,
-                    slide: None,
-                    places_scroll: gpui::ScrollHandle::new(),
-                    bar_bounds: Default::default(),
-                    lit_seen: Cell::new(-1.),
-                    bar_glide: Cell::new(None),
                     place_menu: None,
                     place_edit: None,
                     watchers: watchers::Watchers::new(),

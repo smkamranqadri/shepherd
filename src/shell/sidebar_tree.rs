@@ -70,13 +70,11 @@ pub(super) enum Goal {
     Pane { tab: String, pane: String },
 }
 
-/// How workspace rows behave: the shown session's answer clicks, renames and drags; another session's switch there;
-/// a preview's do nothing.
+/// How workspace rows behave: the shown session's answer clicks, renames and drags; another session's switch there.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum RowMode {
     Live,
     Other(SessionKey),
-    Inert,
 }
 
 /// The workspace hints held up: their opacity, and each numbered row's (session, workspace) and chord.
@@ -89,6 +87,8 @@ pub(super) struct TreeState {
     pending_goal: Option<(SessionKey, Goal, Instant)>,
     /// A machine row's menu: the machine (`LOCAL` or its SSH target) and where it opened.
     pub(super) machine_menu: Option<crate::ui::Popup<(String, gpui::Point<Pixels>)>>,
+    /// The footer's + menu (New session, Add SSH machine), where it opened.
+    add_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
     /// Bare folded ids (an older Shepherd's) were moved under the shown session's key.
     folds_migrated: bool,
 }
@@ -102,7 +102,11 @@ impl TreeState {
     }
 
     pub(super) fn menu_open(&self) -> bool {
-        self.machine_menu.as_ref().is_some_and(|m| m.is_open())
+        self.machine_menu.as_ref().is_some_and(|m| m.is_open()) || self.add_menu_open()
+    }
+
+    pub(super) fn add_menu_open(&self) -> bool {
+        self.add_menu.as_ref().is_some_and(|m| m.is_open())
     }
 }
 
@@ -694,8 +698,55 @@ impl Shell {
         .detach();
     }
 
+    /// The footer's + opens its menu, or closes it when it is open.
+    pub(super) fn toggle_add_menu(&mut self, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        match self.tree.add_menu.as_mut() {
+            Some(menu) if menu.is_open() => menu.close(),
+            _ => self.tree.add_menu = Some(crate::ui::Popup::new(at)),
+        }
+        cx.notify();
+    }
+
+    /// The tree's menus while they are up: a machine row's, and the footer's +.
+    pub(super) fn tree_popups(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        self.machine_popup(theme, cx).into_iter().chain(self.add_popup(theme, cx)).collect()
+    }
+
+    /// The footer's + menu, opening up from the button.
+    fn add_popup(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let menu = self.tree.add_menu.as_ref()?;
+        let at = menu.value;
+        let item = |id: &'static str, label: &'static str| row(theme, false, id).h(px(28.)).rounded(px(6.)).child(label);
+        let close = |this: &mut Shell| {
+            if let Some(m) = this.tree.add_menu.as_mut() {
+                m.close()
+            }
+        };
+        let card = menu_card(theme, "add-menu", 170.)
+            .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                close(this);
+                cx.notify();
+            }))
+            .child(item("add-menu-session", "New session…").on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                close(this);
+                this.open_session_dialog(window, cx);
+            })))
+            .child(item("add-menu-machine", "Add SSH machine…").on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                close(this);
+                this.open_session_dialog(window, cx);
+                this.toggle_session_remote(window, cx);
+            })));
+        Some(
+            gpui::deferred(
+                gpui::anchored().position(at).anchor(gpui::Anchor::BottomLeft).snap_to_window_with_margin(px(8.)).child(crate::ui::menu_motion("add-menu-in", menu, card)),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
     /// The machine row's menu, while it is up.
-    pub(super) fn tree_popups(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    fn machine_popup(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let menu = self.tree.machine_menu.as_ref()?;
         let (target, at) = menu.value.clone();
         let item = |id: &'static str, label: &'static str| row(theme, false, id).h(px(28.)).rounded(px(6.)).child(label);
@@ -753,6 +804,7 @@ impl Shell {
 
     pub(super) fn reap_tree_popups(&mut self, window: &mut Window) {
         crate::ui::reap_popup(&mut self.tree.machine_menu, window);
+        crate::ui::reap_popup(&mut self.tree.add_menu, window);
     }
 
     /// Where a workspace row of `mode` keeps its folder: the shown session's as today (git and gh ask it); another
