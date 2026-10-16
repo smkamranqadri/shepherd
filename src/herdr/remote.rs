@@ -73,7 +73,12 @@ pub fn show_machine(target: Option<String>) {
 /// A directory of the place shown, as the rest of Shepherd keeps it: a machine's path is that machine's, and git
 /// reaches it over SSH.
 pub fn locate(path: &str) -> String {
-    match SHOWN.lock().unwrap().as_deref() {
+    locate_on(SHOWN.lock().unwrap().as_deref(), path)
+}
+
+/// A directory of the machine at `target` (`None` this one), as [`locate`] keeps it, whichever place is shown.
+pub fn locate_on(target: Option<&str>, path: &str) -> String {
+    match target {
         Some(target) => format!("{MARK}{target}{MARK}{path}"),
         None => path.to_string(),
     }
@@ -217,6 +222,14 @@ mod tests {
         let command = bridge_command("agents", "remote-client-bridge");
         assert!(command.contains("--session agents remote-client-bridge"));
         assert!(command.contains("\"$HOME/.local/bin/herdr\""));
+    }
+
+    #[test]
+    fn a_directory_located_on_a_machine_splits_back() {
+        let dir = locate_on(Some("you@workbox"), "/srv/app");
+        assert_eq!(split(&dir), (Some("you@workbox"), "/srv/app"));
+        assert_eq!(locate_on(None, "/srv/app"), "/srv/app");
+        assert_eq!(split(&locate_on(None, "/srv/app")), (None, "/srv/app"));
     }
 
     #[test]

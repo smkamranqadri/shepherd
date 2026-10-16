@@ -171,6 +171,7 @@ impl Shell {
                         .child(row(theme, false, "place-menu-edit").h(px(28.)).rounded(px(6.)).child("Edit…").on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             this.open_place_edit(edit.clone(), window, cx)
                         })))
+                        .children(self.place_menu_extras(&place, theme, cx))
                         .when(place.deletable(), |el| {
                             let label = if matches!(place, sessions::Place::Machine(_)) { "Forget…" } else { "Delete…" };
                             el.child(div().mx(px(-4.)).my(px(4.)).h(px(1.)).bg(theme.border)).child(
@@ -189,6 +190,7 @@ impl Shell {
             )
             .with_priority(1)
         }))
+        .children(self.tree_popups(theme, cx))
         .children(self.place_edit.as_ref().map(|edit| {
             let field = |input: &Entity<InputState>| {
                 div()

@@ -5,7 +5,7 @@ use crate::herdr::{Machine, SessionInfo};
 use gpui::{ScrollDelta, ScrollWheelEvent};
 
 /// A session here or a machine elsewhere.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(super) enum Place {
     Session(SessionInfo),
     Machine(Machine),
@@ -27,13 +27,6 @@ impl Place {
         !matches!(self, Place::Session(s) if s.default)
     }
 
-    /// The socket its snapshot is read from: a session's own, a machine's relay.
-    fn socket(&self, rt: &tokio::runtime::Handle) -> Option<String> {
-        match self {
-            Place::Session(s) => s.running.then(|| s.socket_path.clone()),
-            Place::Machine(m) => crate::herdr::relay(m, rt).ok().map(|p| p.to_string_lossy().into_owned()),
-        }
-    }
     /// Where its last snapshot is kept while another place is shown, and its look in the settings.
     pub(super) fn key(&self) -> String {
         match self {
@@ -199,22 +192,11 @@ impl Shell {
         }
     }
 
-    /// Reads the snapshots of the places on either side, so a swipe shows them beside the list.
-    pub(super) fn prefetch_neighbours(&mut self, cx: &mut Context<Self>) {
+    /// Asks the places on either side for their snapshots now, so a swipe shows them beside the list.
+    pub(super) fn prefetch_neighbours(&mut self, _: &mut Context<Self>) {
         for travel in [-1., 1.] {
             let Some(place) = self.neighbour(travel) else { continue };
-            let Some(socket) = place.socket(&self.rt) else { continue };
-            let (key, client) = (place.key(), Client::at(socket.into()));
-            let call = self.rt.spawn(async move { client.call("session.snapshot", json!({})).await });
-            cx.spawn(async move |this, cx| {
-                let Ok(Ok(result)) = call.await else { return };
-                let Ok(snapshot) = Snapshot::from_result(&result) else { return };
-                let _ = this.update(cx, |s, cx| {
-                    s.snapshots.insert(key, snapshot);
-                    cx.notify();
-                });
-            })
-            .detach();
+            self.watchers.poll_now(&watchers::SessionKey::of(&place), Instant::now());
         }
     }
 
@@ -320,22 +302,32 @@ impl Shell {
         cx.notify();
     }
 
-    /// Asks herdr for its sessions and enabled machines off the main thread, for the bar.
+    /// Asks herdr for its sessions and machines off the main thread (5 s at most, one read at a time), for the bar and
+    /// the tree, in the tree's order; the watchers follow the list.
     pub(super) fn refresh_places(&mut self, cx: &mut Context<Self>) {
-        let list = cx.background_spawn(async {
-            let sessions = crate::herdr::sessions()?;
-            // an older herdr without machines lists none
-            let machines = crate::herdr::machines().unwrap_or_default();
-            anyhow::Ok(
-                sessions.into_iter().map(Place::Session).chain(machines.into_iter().filter(|m| m.enabled).map(Place::Machine)).collect::<Vec<_>>(),
-            )
-        });
+        if !self.watchers.start_listing() {
+            return; // read again when the read under way lands
+        }
+        let list = self.rt.spawn(crate::herdr::lifecycle::list_places(Duration::from_secs(5)));
         cx.spawn(async move |this, cx| {
-            let Ok(places) = list.await else { return };
+            let listed = list.await.map_err(anyhow::Error::from).and_then(|r| r);
             let _ = this.update(cx, |s, cx| {
-                s.places = places;
-                s.prefetch_neighbours(cx);
-                cx.notify();
+                let again = s.watchers.listed(Instant::now());
+                if let Ok((sessions, machines)) = listed {
+                    let (places, disabled) = sidebar_tree::tree_order(sessions, machines);
+                    let changed = places != s.places || disabled != s.watchers.disabled;
+                    s.places = places;
+                    s.watchers.disabled = disabled;
+                    let shown = s.shown_key();
+                    s.watchers.reconcile(&s.places, shown.as_ref(), Instant::now());
+                    if changed {
+                        s.prefetch_neighbours(cx);
+                        cx.notify();
+                    }
+                }
+                if again {
+                    s.refresh_places(cx);
+                }
             });
         })
         .detach();
@@ -476,7 +468,7 @@ impl Shell {
         let settings = SettingsGlobal::of(cx).settings.clone();
         let heading = div().px(px(16.)).pt(px(8.)).pb(px(6.)).text_size(px(11.)).text_color(theme.text_faint).truncate().child(place.look(cx).0);
         let column = div().size_full().flex().flex_col().child(heading);
-        let Some(snapshot) = self.snapshots.get(&place.key()) else {
+        let Some(snapshot) = self.watchers.snapshot(&watchers::SessionKey::of(place)) else {
             if let Place::Session(s) = place && !s.running {
                 let why = "Not running: it starts when you get there";
                 return column.child(div().px(px(16.)).pt(px(8.)).text_size(px(11.)).text_color(theme.text_faint).child(why)).into_any_element();
@@ -485,7 +477,7 @@ impl Shell {
         };
         // the rows the sidebar draws once the swipe lands, on the tab herdr would show there first
         let shown_ws = snapshot.pick_tab_in(None, None).map(|t| t.workspace_id.clone());
-        let rows = self.workspace_rows(theme, Some(snapshot), &shown_ws, false, window.is_window_active(), cx);
+        let rows = self.workspace_rows(theme, Some(snapshot), &shown_ws, sidebar_tree::RowMode::Inert, None, window.is_window_active(), cx);
         let workspaces = div().flex_1().min_h_0().overflow_hidden().px(px(8.)).flex().flex_col().gap(px(2.)).children(rows);
         let new_workspace = div()
             .flex_none()
@@ -548,9 +540,10 @@ impl Shell {
     }
 
     fn move_to(&mut self, socket: Option<String>, machine: Option<String>, cx: &mut Context<Self>) {
-        // the place left keeps its last snapshot, so coming back shows its workspaces before herdr answers
-        if let (Some(left), Some(snapshot)) = (self.places.iter().find(|p| self.places_shown(p)).map(Place::key), self.snapshot.take()) {
-            self.snapshots.insert(left, snapshot);
+        // the place left keeps its last snapshot and its agents' clocks in its watcher, which polls it from now on, so
+        // the tree shows its workspaces and coming back shows them before herdr answers
+        if let Some(left) = self.shown_key() {
+            self.watchers.park(&left, self.snapshot.take(), std::mem::take(&mut self.since), Instant::now());
         }
         save_from_sidebar(cx, |s| {
             s.herdr_socket = socket.clone();
@@ -567,7 +560,13 @@ impl Shell {
                 _ => None,
             }).unwrap_or_default(),
         };
-        self.snapshot = self.snapshots.get(&key).cloned();
+        let key = watchers::SessionKey(key);
+        // a click that switched elsewhere waits no more for the session it named
+        self.tree.switching_to(&key);
+        (self.snapshot, self.since) = self.watchers.unpark(&key);
+        // the new server is told the tab shown, whatever ids the last one gave its tabs
+        self.focused_tab = None;
+        self.own_focus.clear();
         self.error = None;
         self.connecting = Some(Instant::now());
         self.panes.clear();
@@ -582,7 +581,6 @@ impl Shell {
         self.pending_worktrees.clear();
         self.removing.clear();
         self.unseen.clear();
-        self.since = Default::default();
         self.connect(cx);
         self.refresh_places(cx);
         self.prefetch_neighbours(cx);

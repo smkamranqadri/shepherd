@@ -70,7 +70,8 @@ impl Shell {
                 let menu = open(shell.ws_menu.as_ref().map(|m| m.is_open()))
                     || open(shell.view_menu.as_ref().map(|m| m.is_open()))
                     || open(shell.agents_menu.as_ref().map(|m| m.is_open()))
-                    || open(shell.place_menu.as_ref().map(|m| m.is_open()));
+                    || open(shell.place_menu.as_ref().map(|m| m.is_open()))
+                    || shell.tree.menu_open();
                 if !shell.peek_hovered && !menu {
                     shell.set_peek(false, cx);
                 }
@@ -177,18 +178,26 @@ impl Shell {
         cx.notify();
     }
 
-    /// The workspace list's rows for `snapshot`: each workspace with its worktrees folded under it. `live` rows answer
-    /// clicks, renames and drags and show worktrees being made; a swipe's preview of another place draws the same rows
-    /// inert, so the list that slides in is the one that stays when it lands.
+    /// The workspace list's rows for `snapshot`: each workspace with its worktrees folded under it. `Live` rows answer
+    /// clicks, renames and drags and show worktrees being made; another session's (`Other`) switch there on a click; a
+    /// swipe's preview of another place draws the same rows inert, so the list that slides in is the one that stays
+    /// when it lands. `hints` holds the numbered workspaces' chords across the tree.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn workspace_rows(
         &self,
         theme: &Theme,
         snapshot: Option<&Snapshot>,
         shown_ws: &Option<String>,
-        live: bool,
+        mode: sidebar_tree::RowMode,
+        hints: Option<&sidebar_tree::Chords>,
         active: bool,
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
+        let live = mode == sidebar_tree::RowMode::Live;
+        let other = matches!(mode, sidebar_tree::RowMode::Other(_));
+        // folds are kept per session, and ids told apart by session: workspace ids repeat across sessions
+        let (session, idx) = self.row_keys(&mode);
+        let fold_key = |id: &str| crate::files::roots::root_key(&session, id);
         // a workspace row's height, one line; a worktree's, which always has a branch line unless compact
         let (ws_h, kid_h) = if SettingsGlobal::of(cx).settings.compact_workspaces { (26., 26.) } else { (32., WS_TWO_LINES) };
         let groups: Vec<(crate::model::Workspace, Vec<crate::model::Workspace>)> = snapshot
@@ -201,14 +210,10 @@ impl Shell {
             })
             .unwrap_or_default();
         // held Ctrl+Shift (Ctrl on macOS): each of the first nine workspaces' chord, in `go_to_workspace`'s order
-        let hint = self.hints_of(hints::HintMode::Workspaces).filter(|_| live).map(|opacity| {
-            let order: Vec<String> = snapshot.map(|s| s.workspace_tree().into_iter().map(|(w, _)| w.workspace_id.clone()).collect()).unwrap_or_default();
-            let chords: Vec<(String, String)> = order.into_iter().zip(WORKSPACE_ACTIONS).filter_map(|(id, a)| Some((id, chord_of(cx, a)?))).collect();
-            (opacity, chords)
-        });
+        let hint = hints.filter(|_| live || other);
         let ws_row = |w: &crate::model::Workspace, nested: bool, chevron: Option<gpui::AnyElement>, folded: Option<usize>, cx: &mut Context<Self>| {
-            let chip = hint.as_ref().and_then(|(opacity, chords)| {
-                let (_, chord) = chords.iter().find(|(id, _)| *id == w.workspace_id)?;
+            let chip = hint.and_then(|(opacity, chords)| {
+                let (_, _, chord) = chords.iter().find(|(k, id, _)| k.0 == session && *id == w.workspace_id)?;
                 Some(hints::chip(theme, chord, *opacity))
             });
             let show = SettingsGlobal::of(cx).settings.workspace_show;
@@ -223,8 +228,10 @@ impl Shell {
             // a workspace herdr knows no worktree of lives where its panes were opened
             let dir = w.worktree.as_ref().map(|t| t.checkout_path.as_str()).filter(|d| !d.is_empty()).or_else(|| {
                 snapshot.as_ref()?.panes.iter().find(|p| p.workspace_id == w.workspace_id)?.cwd.as_deref()
-            }).map(crate::herdr::locate);
-            let git = dir.as_deref().filter(|_| show.branch).and_then(|d| crate::ui::statusbar::git_of(d, cx));
+            }).and_then(|d| self.row_dir(&mode, d));
+            // another session's rows read their branch from HEAD alone: no status, ahead or behind for them
+            let git = dir.as_deref().filter(|_| show.branch && live).and_then(|d| crate::ui::statusbar::git_of(d, cx));
+            let head = dir.as_deref().filter(|_| show.branch && !live).and_then(|d| Shell::other_branch(d, cx));
             // herdr's commits ahead of and behind the upstream, also on a compact row
             let sync = git.as_ref().filter(|g| g.ahead > 0 || g.behind > 0).map(|g| {
                 div()
@@ -235,10 +242,11 @@ impl Shell {
                     .when(g.ahead > 0, |el| el.child(div().text_color(theme.success.opacity(0.8)).child(format!("↑{}", g.ahead))))
                     .when(g.behind > 0, |el| el.child(div().text_color(theme.danger.opacity(0.8)).child(format!("↓{}", g.behind))))
             });
-            let branch = git.map(|g| g.branch).filter(|_| !compact);
+            let branch = git.map(|g| g.branch).or(head).filter(|_| !compact);
             let (sync, sync_inline) = if compact { (None, sync) } else { (sync, None) };
             // compact rows are the name and its ↑↓ alone: gh and git's diff aren't even asked
-            let (changes, pr) = match dir.as_deref().filter(|_| nested && !compact) {
+            // another session's rows ask neither gh nor its diff
+            let (changes, pr) = match dir.as_deref().filter(|_| nested && !compact && live) {
                 Some(d) => crate::ui::statusbar::changes_of(d, active, cx),
                 None => (None, None),
             };
@@ -280,7 +288,7 @@ impl Shell {
                 Some(field) => field.into_any_element(),
                 None => div().min_w_0().truncate().child(w.label.clone()).into_any_element(),
             };
-            row(theme, selected, SharedString::from(format!("ws-{}", w.workspace_id)))
+            row(theme, selected, SharedString::from(format!("ws-{idx}-{}", w.workspace_id)))
                 .h(px(if two { WS_TWO_LINES } else { ws_h }))
                 .when(live, |el| pane_drag::accept_pane_in_workspace(el, &w.workspace_id, theme.accent.opacity(0.15), cx))
                 .when(nested, |el| el.pl(px(if show.icon { 30. } else { 20. })))
@@ -331,7 +339,7 @@ impl Shell {
                 )
                 .map(|el| {
                     if live && self.removing.contains(&w.workspace_id) {
-                        el.text_color(theme.text_faint).child(spinner(theme, format!("ws-removing-{}", w.workspace_id)))
+                        el.text_color(theme.text_faint).child(spinner(theme, format!("ws-removing-{idx}-{}", w.workspace_id)))
                     } else {
                         el.when(show.status, |el| el.child(status_dot(w.agent_status, theme)))
                     }
@@ -339,6 +347,13 @@ impl Shell {
                 .children(chevron)
                 // over the row's right end (its status and chevron), so nothing in it moves
                 .when_some(chip, |el, chip| el.relative().child(chip))
+                .when_some(match &mode {
+                    sidebar_tree::RowMode::Other(key) => Some(key.clone()),
+                    _ => None,
+                }, |el, key| {
+                    let id = w.workspace_id.clone();
+                    el.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.go_to(key.clone(), sidebar_tree::Goal::Workspace(id.clone()), cx)))
+                })
                 .when(live, |el| {
                     el.on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
                         if e.click_count() == 2 {
@@ -380,12 +395,13 @@ impl Shell {
                 return ws_row(&w, false, None, None, cx).into_any_element();
             }
             // A folded group opens while one of its worktrees is being created.
-            let open = !self.folded.contains(&w.workspace_id) || !pending.is_empty();
+            let fold = fold_key(&w.workspace_id);
+            let open = !self.folded.contains(&fold) || !pending.is_empty();
             let full = (kids.len() + pending.len()) as f32 * (kid_h + 2.);
-            let tween = self.fold_motion.get(&w.workspace_id).copied().filter(|m| live && m.animating());
-            let chevron = fold_chevron(theme, &w.workspace_id, open, full, tween).when(live, |el| {
+            let tween = self.fold_motion.get(&fold).copied().filter(|m| (live || other) && m.animating());
+            let chevron = fold_chevron(theme, &format!("{idx}-{}", w.workspace_id), open, full, tween).when(live || other, |el| {
                 el.on_click(cx.listener({
-                    let id = w.workspace_id.clone();
+                    let id = fold.clone();
                     move |this, _: &ClickEvent, _, cx| {
                         cx.stop_propagation();
                         this.toggle_fold(&id, full, cx);
@@ -409,7 +425,7 @@ impl Shell {
                 // Zeron's disclosure: the height tweens, the rows fade up from 35 % and slide 3 px.
                 Some(m) => body
                     .with_animation(
-                        SharedString::from(format!("fold-{}-{}", w.workspace_id, m.epoch)),
+                        SharedString::from(format!("fold-{idx}-{}-{}", w.workspace_id, m.epoch)),
                         fold_animation(),
                         move |el, t| {
                             let h = m.from + (m.to - m.from) * t;
@@ -443,6 +459,7 @@ impl Shell {
         let active = window.is_window_active();
 
         let strip = update_strip(theme, cx);
+        let (tree, listed) = self.tree_rows(theme, snapshot, shown_ws, active, cx);
         let waiting = self.error.is_none() && self.connecting.is_some_and(|at| crate::ui::loader::due(at, window));
         let (list_offset, beside) = self.list_offset(window);
         let list_fade = 1. - (list_offset.abs() / 400.).min(0.5);
@@ -478,8 +495,8 @@ impl Shell {
                     .items_center()
                     .text_size(px(11.))
                     .text_color(theme.text_faint)
-                    // the herdr session shown, as Arc names the space
-                    .child(div().flex_1().truncate().child(self.place_label(cx)))
+                    // the tree names every session; with one, its name heads the list
+                    .child(div().flex_1().truncate().when(!listed, |el| el.child(self.place_label(cx))))
                     .when(is_dev_build(), |el| el.child(dev_badge(theme)))
                     // the place's own snapshot hasn't come yet: the list is its last, or none
                     .when(waiting, |el| el.child(crate::ui::loader::mini_spinner(2., theme.text_faint, window))),
@@ -507,7 +524,7 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    .children(self.workspace_rows(theme, snapshot.as_ref(), shown_ws, true, active, cx))
+                    .children(tree)
             ),
             )
             .child(

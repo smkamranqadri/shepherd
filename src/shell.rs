@@ -31,6 +31,8 @@ mod review;
 mod right_panel;
 mod sessions;
 mod sidebar;
+mod sidebar_tree;
+mod watchers;
 mod sync;
 mod file_tabs;
 mod hints;
@@ -281,8 +283,10 @@ pub struct Shell {
     place_menu: Option<crate::ui::Popup<(sessions::Place, gpui::Point<Pixels>)>>,
     /// The Edit dialog of a place's name and icon.
     place_edit: Option<crate::ui::Popup<sessions::PlaceEdit>>,
-    /// The places not shown, by key, with their last snapshot.
-    snapshots: HashMap<String, Snapshot>,
+    /// The places not shown, each polled in the background for the sidebar's tree, with its last snapshot.
+    watchers: watchers::Watchers,
+    /// The tree's goal after a switch and its machine menu.
+    tree: sidebar_tree::TreeState,
     /// The New session dialog, open over the window.
     session_dialog: Option<crate::ui::Popup<sessions::SessionDialog>>,
     /// Delete a session, or forget a machine? Asked first.
@@ -366,6 +370,7 @@ impl Shell {
                         s.touched = Instant::now();
                     }
                     s.hint_activation(active, window, cx);
+                    s.watchers.set_active(active, Instant::now());
                     cx.set_global(crate::terminal::pane::Yielded(!active));
                     if active {
                         s.refresh_places(cx); // sessions made or deleted elsewhere
@@ -599,7 +604,8 @@ impl Shell {
                     bar_glide: Cell::new(None),
                     place_menu: None,
                     place_edit: None,
-                    snapshots: HashMap::new(),
+                    watchers: watchers::Watchers::new(),
+                    tree: Default::default(),
                     session_dialog: None,
                     session_delete: None,
                     machine_label: None,
@@ -610,6 +616,7 @@ impl Shell {
                 shell.resume_machine(cx);
                 shell.connect(cx);
                 shell.refresh_places(cx);
+                shell.start_watching(cx);
                 shell.refresh_plugin_actions(cx);
                 shell.load_kept_tabs(cx);
                 // Waiting times move on between snapshots.
@@ -1092,13 +1099,10 @@ impl Shell {
         self.show_herdr_tab(tab, false, cx);
     }
 
-    /// Workspace1–9: the shown place's `index`th workspace in sidebar order (worktrees under their repo, folded or
-    /// not), as it was left, a file tab it showed included.
+    /// Workspace1–9: the `index`th workspace the sidebar's tree shows (worktrees of a folded repo left out), in
+    /// whichever session, as it was left, a file tab it showed included.
     fn go_to_workspace(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(snapshot) = self.snapshot.as_ref() else { return };
-        let Some((w, _)) = snapshot.workspace_tree().into_iter().nth(index) else { return };
-        let tab = w.active_tab_id.clone().or_else(|| snapshot.tabs_of(&w.workspace_id).first().map(|t| t.tab_id.clone()));
-        self.show_herdr_tab(tab, false, cx);
+        self.go_to_tree_workspace(index, cx);
     }
 
     fn new_tab(&mut self, workspace_id: String, cx: &mut Context<Self>) {
@@ -1338,6 +1342,7 @@ impl Render for Shell {
         crate::ui::reap_popup(&mut self.merge_confirm, window);
         crate::ui::reap_popup(&mut self.session_dialog, window);
         crate::ui::reap_popup(&mut self.place_menu, window);
+        self.reap_tree_popups(window);
         crate::ui::reap_popup(&mut self.place_edit, window);
         crate::ui::reap_popup(&mut self.session_delete, window);
         crate::ui::reap_popup(&mut self.command_panel, window);

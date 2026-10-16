@@ -2,6 +2,7 @@ mod client;
 pub mod client_shell;
 pub mod graphics;
 mod config;
+pub mod lifecycle;
 pub mod keys;
 pub mod popup;
 mod remote;
@@ -11,9 +12,9 @@ mod wire;
 pub use wire::Rgb;
 pub use client::{Client, EVENT_TYPES};
 pub use config::{HerdrConfig, config_path};
-pub use session::{Mode, Session, SessionEvent, SessionInfo, current_session, delete_session, new_session, no_server, sessions, valid_session_name, set_binary, set_socket, start_server};
+pub use session::{Mode, Session, SessionEvent, SessionInfo, current_session, delete_session, new_session, no_server, sessions, valid_session_name, set_binary, set_socket, start_server, start_session_server, api_socket};
 pub use wire::PaneInput;
-pub use remote::{Machine, add_machine, git, locate, machines, quote, relay, remove_machine, rename_machine, show_machine, split, ssh};
+pub use remote::{Machine, add_machine, git, locate, locate_on, machines, quote, relay, remove_machine, rename_machine, show_machine, split, ssh};
 
 /// Why herdr's server cannot carry Shepherd's panes, from its `ping`: it speaks another protocol than Shepherd. Set
 /// by the sync loop, shown on every pane that loses its connection.

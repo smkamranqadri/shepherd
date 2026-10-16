@@ -41,7 +41,7 @@ pub(super) fn client_socket() -> PathBuf {
 }
 
 /// herdr's API socket: from settings, else `HERDR_SOCKET_PATH`, else `herdr.sock` in herdr's folder.
-fn api_socket() -> PathBuf {
+pub fn api_socket() -> PathBuf {
     SOCKET.read().unwrap().clone().map(PathBuf::from).or_else(|| std::env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from)).unwrap_or_else(|| {
         super::config::dir().join("herdr.sock")
     })
@@ -93,9 +93,14 @@ pub fn start_server() -> std::io::Result<()> {
     let Some(session) = session_of(&socket, &super::config::dir()) else {
         return Err(std::io::Error::other(format!("{} is not a herdr session's socket, so Shepherd leaves starting it to you", socket.display())));
     };
+    start_session_server(session.as_deref())
+}
+
+/// [`start_server`] for the session `name` (`None` the default one), whichever socket Shepherd shows.
+pub fn start_session_server(name: Option<&str>) -> std::io::Result<()> {
     let mut command = Command::new(binary());
-    if let Some(name) = session {
-        command.args(["--session", &name]);
+    if let Some(name) = name {
+        command.args(["--session", name]);
     }
     command.arg("server").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(unix)]
@@ -132,7 +137,7 @@ pub fn sessions() -> anyhow::Result<Vec<SessionInfo>> {
     parse_sessions(&out.stdout)
 }
 
-fn parse_sessions(json: &[u8]) -> anyhow::Result<Vec<SessionInfo>> {
+pub(super) fn parse_sessions(json: &[u8]) -> anyhow::Result<Vec<SessionInfo>> {
     #[derive(serde::Deserialize)]
     struct List {
         sessions: Vec<SessionInfo>,

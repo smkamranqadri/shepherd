@@ -278,6 +278,7 @@ impl Shell {
             || open(&self.merge_confirm)
             || open(&self.session_dialog)
             || open(&self.place_menu)
+            || self.tree.menu_open()
             || open(&self.place_edit)
             || open(&self.session_delete)
             || open(&self.command_panel)

@@ -80,6 +80,7 @@ pub(super) async fn sync_loop(this: gpui::WeakEntity<Shell>, rt: tokio::runtime:
                         }
                         snapshot.track(&mut s.since, Instant::now());
                         s.snapshot = Some(snapshot);
+                        s.after_snapshot(cx);
                         s.prune_roots(cx);
                         s.prune_file_tabs(cx);
                         s.error = None;

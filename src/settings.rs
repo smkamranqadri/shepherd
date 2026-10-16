@@ -101,8 +101,11 @@ pub struct Settings {
     pub show_shortcut_hints: bool,
     /// The workspaces sidebar is shown; `⌘B` hides it.
     pub sidebar_open: bool,
-    /// Worktree groups folded in the sidebar, by workspace id.
+    /// Worktree groups folded in the sidebar, by their session's key and workspace id (`roots::root_key`); a bare
+    /// workspace id is an older Shepherd's, read as the session shown's.
     pub folded: Vec<String>,
+    /// Sessions whose workspaces the sidebar's tree hides, by key (a socket, `machine:<id>`).
+    pub collapsed_sessions: Vec<String>,
     /// Where the window was last; `None` opens it centered.
     pub window: Option<WindowFrame>,
 }
@@ -324,6 +327,7 @@ impl Default for Settings {
             show_shortcut_hints: true,
             sidebar_open: true,
             folded: Vec::new(),
+            collapsed_sessions: Vec::new(),
             window: None,
         }
     }
