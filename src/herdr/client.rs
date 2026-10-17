@@ -17,6 +17,50 @@ pub const EVENT_TYPES: &[&str] = &[
     "pane.agent_detected", "layout.updated",
 ];
 
+/// What a session not shown is watched for: every change its tree draws (workspaces, worktrees, tabs, panes coming,
+/// going or moving, an agent found), not the focus or the layout, which it does not draw. `pane.updated` comes
+/// several times a second from a busy agent (its title, scroll, tokens): the watcher sorts those out
+/// (`watchers::feeds::relevant`).
+pub const WATCH_TYPES: &[&str] = &[
+    "workspace.created", "workspace.updated", "workspace.closed", "workspace.renamed", "workspace.moved", "workspace.reordered",
+    "worktree.created", "worktree.opened", "worktree.removed",
+    "tab.created", "tab.closed", "tab.moved", "tab.focused",
+    "pane.created", "pane.closed", "pane.updated", "pane.moved", "pane.exited", "pane.agent_detected",
+];
+
+/// herdr answered, with an error: a running server that refused the request (an unknown method or event type on an
+/// older herdr), not one out of reach.
+#[derive(Debug)]
+pub struct ApiError {
+    pub code: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+/// herdr's server answered the request with an error: asking again the same way gets the same answer.
+pub fn refused(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.downcast_ref::<ApiError>().is_some())
+}
+
+/// The next burst of events: waits for one, then for `window()` (made only once the first came, so a timer that
+/// starts when made counts from it), and takes every event come by then. `None` once the subscription ended
+/// (the server went away, or fell behind and said `events_lost`); events that came before the end come first.
+pub async fn burst<F: std::future::Future<Output = ()>>(rx: &mut mpsc::UnboundedReceiver<Value>, window: impl FnOnce() -> F) -> Option<Vec<Value>> {
+    let mut events = vec![rx.recv().await?];
+    window().await;
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    Some(events)
+}
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -87,9 +131,9 @@ impl Client {
 
 fn into_result(mut response: Value) -> anyhow::Result<Value> {
     if let Some(error) = response.get("error") {
-        let code = error["code"].as_str().unwrap_or("error");
-        let message = error["message"].as_str().unwrap_or("");
-        return Err(anyhow!("{code}: {message}"));
+        let code = error["code"].as_str().unwrap_or("error").to_string();
+        let message = error["message"].as_str().unwrap_or("").to_string();
+        return Err(ApiError { code, message }.into());
     }
     Ok(response["result"].take())
 }
