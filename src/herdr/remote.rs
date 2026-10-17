@@ -118,6 +118,8 @@ static RELAYS: Mutex<Option<HashMap<(String, String), PathBuf>>> = Mutex::new(No
 /// The local API socket that reaches `machine`, starting its relay on first use. Its client socket is the
 /// `herdr-client.sock` next to it, where Shepherd looks for one.
 pub fn relay(machine: &Machine, rt: &tokio::runtime::Handle) -> anyhow::Result<PathBuf> {
+    static PRUNED: std::sync::Once = std::sync::Once::new();
+    PRUNED.call_once(|| prune_old_relays(&cache_dir().join("r")));
     let mut relays = RELAYS.lock().unwrap();
     let relays = relays.get_or_insert_with(HashMap::new);
     let key = (machine.id.clone(), machine.session.clone());
@@ -209,16 +211,29 @@ const HERDR_CANDIDATES: [&str; 10] = [
 fn with_herdr(action: &str) -> String {
     format!(
         "for h in {}; do command -v \"$h\" >/dev/null 2>&1 && {action}; done; \
-         echo 'herdr is not installed on this host' >&2; exit 127",
+         echo \"herdr is not installed on this host\" >&2; exit 127",
         HERDR_CANDIDATES.join(" ")
     )
 }
 
-/// The shell command that runs `bridge` for `session` on the host. Its output is the bridge's protocol from the
-/// first byte, so it never prints [`OUTPUT_MARKER`].
-fn bridge_command(session: &str, bridge: &str) -> String {
+/// What SSH asks the host's login shell to run: `script` handed to `sh`, as one single-quoted word. The login shell
+/// may be fish or nushell, which parse the script differently or not at all, but each takes a single-quoted word
+/// with no quote or backslash in it literally: the scripts here never have one (`the_scripts_quote_plainly`).
+/// `sh -s` with the script on stdin would sidestep the login shell too, but a bridge's stdin is its byte stream.
+fn remote_command(script: &str) -> String {
+    format!("sh -c {}", quote(script))
+}
+
+/// The bridge's script: `bridge` for `session`. Its output is the bridge's protocol from the first byte, so it never
+/// prints [`OUTPUT_MARKER`].
+fn bridge_script(session: &str, bridge: &str) -> String {
     // the session's name is herdr's ASCII letters, digits, '.', '_' and '-', so it needs no quoting
     with_herdr(&format!("exec \"$h\" --session {session} {bridge}"))
+}
+
+/// The command that runs `bridge` for `session` on the host.
+fn bridge_command(session: &str, bridge: &str) -> String {
+    remote_command(&bridge_script(session, bridge))
 }
 
 /// Printed on its own line just before herdr runs, so what a login shell prints first (a banner, a motd from
@@ -274,13 +289,14 @@ impl std::fmt::Display for ListError {
 
 impl std::error::Error for ListError {}
 
-/// What a failed `ssh` run says: 127 is the script's own exit when no herdr was found; 255 is SSH's, and its
-/// complaint tells a sign-in it could not make without a prompt (BatchMode) from a host out of reach.
-fn ssh_failure(code: Option<i32>, stderr: &str) -> ListError {
+/// What a failed `ssh` run says: 127 before the marker (`herdr_ran` false) is the script's own exit when no herdr
+/// was found, and after it herdr's or something it ran; 255 is SSH's, and its complaint tells a sign-in it could
+/// not make without a prompt (BatchMode) from a host out of reach.
+fn ssh_failure(code: Option<i32>, stderr: &str, herdr_ran: bool) -> ListError {
     const SIGN_IN: [&str; 3] = ["Permission denied", "Host key verification failed", "REMOTE HOST IDENTIFICATION HAS CHANGED"];
     let said = stderr.trim();
     match code {
-        Some(127) => ListError::NotInstalled,
+        Some(127) if !herdr_ran => ListError::NotInstalled,
         Some(255) if SIGN_IN.iter().any(|s| said.contains(s)) => ListError::SignIn,
         _ if !said.is_empty() => ListError::Failed(said.to_string()),
         Some(code) => ListError::Failed(format!("ssh exited with {code}")),
@@ -303,7 +319,7 @@ async fn sessions_over(ssh: &std::ffi::OsStr, target: &str, timeout: Duration) -
         .args(ssh_options())
         .arg("--")
         .arg(target)
-        .arg(format!("sh -c {}", quote(&list_script())))
+        .arg(remote_command(&list_script()))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -326,6 +342,8 @@ async fn sessions_over(ssh: &std::ffi::OsStr, target: &str, timeout: Duration) -
         let stderr = async {
             let mut v = Vec::new();
             (&mut err).take(64 * 1024).read_to_end(&mut v).await?;
+            // the rest is drained, not left in the pipe: a host that fills it would stall before herdr answers
+            tokio::io::copy(&mut err, &mut tokio::io::sink()).await?;
             Ok(v)
         };
         let (stdout, stderr) = tokio::try_join!(stdout, stderr)?;
@@ -335,10 +353,10 @@ async fn sessions_over(ssh: &std::ffi::OsStr, target: &str, timeout: Duration) -
         Err(_) => return Err(ListError::Failed(format!("no answer from {target} in {} s", timeout.as_secs()))),
         Ok(ran) => ran.map_err(failed)?,
     };
-    if !status.success() {
-        return Err(ssh_failure(status.code(), &String::from_utf8_lossy(&stderr)));
-    }
     let stdout = String::from_utf8_lossy(&stdout);
+    if !status.success() {
+        return Err(ssh_failure(status.code(), &String::from_utf8_lossy(&stderr), after_marker(&stdout).is_some()));
+    }
     let answer = after_marker(&stdout).ok_or_else(|| ListError::Failed("herdr's answer over SSH was not readable".into()))?;
     super::session::parse_sessions(answer.as_bytes()).map_err(|e| ListError::Failed(format!("herdr's session list was not readable: {e}")))
 }
@@ -354,6 +372,38 @@ pub fn unsaved(found: &[super::SessionInfo], saved: &[Machine], target: &str) ->
 }
 
 use crate::settings::cache_dir;
+
+/// A relay folder's name as [`relay_dir`] makes it.
+fn is_relay_dir(name: &str) -> bool {
+    name.len() == 12 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Relay folders under `root` from before their names were hashes (an id's first 12 letters and digits): removed,
+/// once a run and best effort, when all they hold is sockets nothing listens on. Anything else in one, or a socket
+/// that answers (an older Shepherd still running), keeps it.
+#[cfg(unix)]
+fn prune_old_relays(root: &std::path::Path) {
+    use std::os::unix::fs::FileTypeExt;
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        if entry.file_name().to_str().is_some_and(is_relay_dir) || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(inside) = std::fs::read_dir(entry.path()).and_then(|d| d.collect::<std::io::Result<Vec<_>>>()) else { continue };
+        let sockets = inside.iter().all(|f| f.file_type().is_ok_and(|t| t.is_socket()));
+        if !sockets || inside.iter().any(|f| std::os::unix::net::UnixStream::connect(f.path()).is_ok()) {
+            continue;
+        }
+        for socket in &inside {
+            let _ = std::fs::remove_file(socket.path());
+        }
+        // not remove_dir_all: anything that came meanwhile stays, and the folder with it
+        let _ = std::fs::remove_dir(entry.path());
+    }
+}
+
+#[cfg(not(unix))]
+fn prune_old_relays(_root: &std::path::Path) {}
 
 /// A relay's directory name: 12 hex digits of a hash of the machine's id and session, short enough for a socket
 /// path (macOS allows 104 bytes) and distinct where ids share a prefix.
@@ -395,8 +445,43 @@ mod tests {
 
     #[test]
     fn relay_paths_fit_a_socket() {
-        let api = cache_dir().join("r").join(relay_dir("0123456789abcdef-0123", "a-session-with-a-long-name")).join("herdr-client.sock");
+        let dir = relay_dir("0123456789abcdef-0123", "a-session-with-a-long-name");
+        let api = cache_dir().join("r").join(&dir).join("herdr-client.sock");
         assert!(api.as_os_str().len() < 104, "{}", api.display());
+        // macOS's cache for a 32-character user name, the longest its accounts allow
+        let mac = std::path::Path::new("/Users").join("a".repeat(32)).join("Library/Caches/Shepherd/r").join(&dir).join("herdr-client.sock");
+        assert!(mac.as_os_str().len() < 104, "{} is {}", mac.display(), mac.as_os_str().len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn old_relay_folders_go_when_only_dead_sockets_are_left() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = |name: &str| {
+            let p = root.path().join(name);
+            std::fs::create_dir(&p).unwrap();
+            p
+        };
+        // a socket nothing listens on any more: bound, then let go, as a relay leaves it when Shepherd quits
+        let dead = |p: &std::path::Path| drop(std::os::unix::net::UnixListener::bind(p).unwrap());
+        let old = folder("m1a2bworkbox");
+        dead(&old.join("herdr.sock"));
+        dead(&old.join("herdr-client.sock"));
+        let kept_file = folder("m9z8yotherbox");
+        dead(&kept_file.join("herdr.sock"));
+        std::fs::write(kept_file.join("notes"), "").unwrap();
+        let live = folder("m7x6wlivebox");
+        let _listening = std::os::unix::net::UnixListener::bind(live.join("herdr.sock")).unwrap();
+        let new = folder(&relay_dir("m-1a2b", "agents"));
+        dead(&new.join("herdr.sock"));
+        std::fs::write(root.path().join("stray"), "").unwrap();
+        prune_old_relays(root.path());
+        assert!(!old.exists(), "only dead sockets: gone");
+        assert!(kept_file.join("notes").exists() && kept_file.join("herdr.sock").exists(), "something else in it: kept whole");
+        assert!(live.join("herdr.sock").exists(), "a socket that answers: kept");
+        assert!(new.join("herdr.sock").exists(), "a relay folder of today: kept");
+        assert!(root.path().join("stray").exists());
+        prune_old_relays(&root.path().join("missing"));
     }
 
     #[test]
@@ -415,7 +500,17 @@ mod tests {
             let command = bridge_command("default", bridge);
             assert!(!command.contains(OUTPUT_MARKER), "{command}");
             assert!(command.contains(&format!("exec \"$h\" --session default {bridge}; done;")), "{command}");
-            assert!(command.ends_with("exit 127"), "{command}");
+            assert_eq!(command, format!("sh -c '{}'", bridge_script("default", bridge)), "handed to sh, whatever the login shell");
+            assert!(command.ends_with("exit 127'"), "{command}");
+        }
+    }
+
+    /// fish and nushell take a single-quoted word literally only when it holds no quote or backslash.
+    #[test]
+    fn the_scripts_quote_plainly() {
+        for script in [list_script(), bridge_script("agents", "remote-api-bridge"), bridge_script("default", "remote-client-bridge")] {
+            assert!(!script.contains('\'') && !script.contains('\\'), "{script}");
+            assert_eq!(remote_command(&script), format!("sh -c '{script}'"));
         }
     }
 
@@ -446,16 +541,17 @@ mod tests {
 
     #[test]
     fn a_failed_ssh_says_what_to_do() {
-        assert_eq!(ssh_failure(Some(127), "herdr is not installed on this host\n"), ListError::NotInstalled);
-        assert_eq!(ssh_failure(Some(255), "you@workbox: Permission denied (publickey).\r\n"), ListError::SignIn);
-        assert_eq!(ssh_failure(Some(255), "Host key verification failed.\n"), ListError::SignIn);
+        assert_eq!(ssh_failure(Some(127), "herdr is not installed on this host\n", false), ListError::NotInstalled);
+        assert_eq!(ssh_failure(Some(127), "herdr: git: command not found\n", true), ListError::Failed("herdr: git: command not found".into()), "herdr ran");
+        assert_eq!(ssh_failure(Some(255), "you@workbox: Permission denied (publickey).\r\n", false), ListError::SignIn);
+        assert_eq!(ssh_failure(Some(255), "Host key verification failed.\n", false), ListError::SignIn);
         assert_eq!(
-            ssh_failure(Some(255), "ssh: Could not resolve hostname workbox: Name or service not known\n"),
+            ssh_failure(Some(255), "ssh: Could not resolve hostname workbox: Name or service not known\n", false),
             ListError::Failed("ssh: Could not resolve hostname workbox: Name or service not known".into())
         );
-        assert_eq!(ssh_failure(Some(2), "error: unexpected argument '--json' found\n"), ListError::Failed("error: unexpected argument '--json' found".into()), "an old herdr");
-        assert_eq!(ssh_failure(Some(1), ""), ListError::Failed("ssh exited with 1".into()));
-        assert_eq!(ssh_failure(Some(1), "Permission denied"), ListError::Failed("Permission denied".into()), "SSH's own failures are 255");
+        assert_eq!(ssh_failure(Some(2), "error: unexpected argument '--json' found\n", true), ListError::Failed("error: unexpected argument '--json' found".into()), "an old herdr");
+        assert_eq!(ssh_failure(Some(1), "", false), ListError::Failed("ssh exited with 1".into()));
+        assert_eq!(ssh_failure(Some(1), "Permission denied", false), ListError::Failed("Permission denied".into()), "SSH's own failures are 255");
     }
 
     fn info(name: &str, running: bool) -> crate::herdr::SessionInfo {
@@ -483,13 +579,40 @@ mod tests {
         assert_eq!(list.iter().map(|s| (s.name.as_str(), s.running, s.default)).collect::<Vec<_>>(), [("default", true, true), ("agents", false, false)]);
     }
 
-    /// A stand-in for `ssh` that ignores its options and prints what `script` does: the real one is never run.
+    /// An executable `sh` script at `path`.
     #[cfg(unix)]
-    fn fake_ssh(dir: &std::path::Path, script: &str) -> std::path::PathBuf {
+    fn script(path: &std::path::Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
-        let path = dir.join("ssh");
-        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A host for the tests, in a folder of its own: `bin` holds `sh` and, given its body, a stand-in `herdr`, and is
+    /// all its PATH has, so no herdr of this machine's is found by name.
+    #[cfg(unix)]
+    fn host(herdr: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", bin.join("sh")).unwrap();
+        if let Some(body) = herdr {
+            script(&bin.join("herdr"), body);
+        }
+        dir
+    }
+
+    /// A stand-in for `ssh` to `host`: it checks its last words are `-- you@workbox <command>`, runs `login` (a
+    /// banner, a refusal), then hands the command to a shell, as sshd hands it to the login shell. No real host is
+    /// reached.
+    #[cfg(unix)]
+    fn fake_ssh(host: &tempfile::TempDir, login: &str) -> std::path::PathBuf {
+        let path = host.path().join("ssh");
+        let body = r#"n=$#
+eval "dash=\${$((n - 2))} target=\${$((n - 1))} command=\${$n}"
+[ "$dash" = -- ] && [ "$target" = you@workbox ] || { echo "ssh got: $*" >&2; exit 98; }
+LOGIN
+PATH='HOST/bin' HOME='HOST' exec /bin/sh -c "$command""#;
+        script(&path, &body.replace("LOGIN", login).replace("HOST", &host.path().to_string_lossy()));
         path
     }
 
@@ -498,21 +621,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_scripts_run_in_sh() {
-        let dir = tempfile::tempdir().unwrap();
-        let herdr = fake_ssh(dir.path(), "echo \"args: $* session: ${HERDR_SESSION:-none}\"");
-        std::fs::rename(&herdr, dir.path().join("herdr")).unwrap();
-        let run = |script: &str| {
+        let dir = host(Some("echo \"args: $* session: ${HERDR_SESSION:-none}\""));
+        let run = |command: &str| {
             let out = std::process::Command::new("/bin/sh")
                 .arg("-c")
-                .arg(script)
-                .env("PATH", dir.path())
+                .arg(command)
+                .env("PATH", dir.path().join("bin"))
                 .env("HOME", dir.path())
                 .env("HERDR_SESSION", "agents")
                 .output()
                 .unwrap();
             (out.status.code(), String::from_utf8(out.stdout).unwrap())
         };
-        assert_eq!(run(&list_script()), (Some(0), "SHEPHERD_OUT\nargs: session list --json session: none\n".into()));
+        assert_eq!(run(&remote_command(&list_script())), (Some(0), "SHEPHERD_OUT\nargs: session list --json session: none\n".into()));
         let bridge = run(&bridge_command("agents", "remote-api-bridge"));
         assert_eq!(bridge, (Some(0), "args: --session agents remote-api-bridge session: agents\n".into()));
     }
@@ -520,22 +641,36 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_hosts_sessions_come_over_ssh() {
-        let dir = tempfile::tempdir().unwrap();
-        let ok = fake_ssh(dir.path(), r#"printf 'Welcome to workbox
-SHEPHERD_OUT
-{"sessions":[{"name":"default","running":true,"socket_path":"/s","default":true}]}
-'"#);
-        let list = sessions_over(ok.as_os_str(), "you@workbox", Duration::from_secs(5)).await.unwrap();
-        assert_eq!(list.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["default"]);
-        let denied = fake_ssh(dir.path(), "echo 'you@workbox: Permission denied (publickey).' >&2; exit 255");
-        assert_eq!(sessions_over(denied.as_os_str(), "you@workbox", Duration::from_secs(5)).await.unwrap_err(), ListError::SignIn);
-        let slow = fake_ssh(dir.path(), "exec sleep 30");
+        let list = |ssh: std::path::PathBuf, secs| async move { sessions_over(ssh.as_os_str(), "you@workbox", Duration::from_secs(secs)).await };
+        let ok = host(Some(r#"printf '{"sessions":[{"name":"default","running":true,"socket_path":"/s","default":true}]}\n'"#));
+        let found = list(fake_ssh(&ok, "echo 'Welcome to workbox'"), 5).await.unwrap();
+        assert_eq!(found.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["default"], "past the banner");
+
+        let denied = host(None);
+        let refused = list(fake_ssh(&denied, "echo 'you@workbox: Permission denied (publickey).' >&2; exit 255"), 5).await;
+        assert_eq!(refused.unwrap_err(), ListError::SignIn);
+
+        let missing = host(None);
+        let absent = list(fake_ssh(&missing, "echo 'herdr is not installed on this host' >&2; exit 127"), 5).await;
+        assert_eq!(absent.unwrap_err(), ListError::NotInstalled, "127 before the marker");
+        let failing = host(Some("echo 'herdr: git: command not found' >&2; exit 127"));
+        let ran = list(fake_ssh(&failing, ""), 5).await;
+        assert_eq!(ran.unwrap_err(), ListError::Failed("herdr: git: command not found".into()), "127 after it");
+
+        let slow = host(Some("exec /bin/sleep 30"));
         let started = std::time::Instant::now();
-        let late = sessions_over(slow.as_os_str(), "you@workbox", Duration::from_secs(1)).await.unwrap_err();
+        let late = list(fake_ssh(&slow, ""), 1).await.unwrap_err();
         assert_eq!(late, ListError::Failed("no answer from you@workbox in 1 s".into()));
-        assert!(started.elapsed() < Duration::from_secs(5));
-        let flood = fake_ssh(dir.path(), "echo SHEPHERD_OUT; exec head -c 2000000 /dev/zero");
-        let over = sessions_over(flood.as_os_str(), "you@workbox", Duration::from_secs(5)).await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5), "ssh is ended, not waited for");
+
+        let flood = host(Some("exec /bin/dd if=/dev/zero bs=1000 count=2000 2>/dev/null"));
+        let over = list(fake_ssh(&flood, ""), 5).await.unwrap_err();
         assert_eq!(over, ListError::Failed("ssh: herdr's answer was over 1 MB".into()));
+
+        // 200 kB of warnings, past the 64 kB kept and the pipe's own buffer, before the answer
+        let chatty = host(Some("exec 3>&2; /bin/dd if=/dev/zero bs=1000 count=200 2>/dev/null >&3; printf '{\"sessions\":[]}\\n'"));
+        let started = std::time::Instant::now();
+        assert_eq!(list(fake_ssh(&chatty, ""), 5).await, Ok(Vec::new()));
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
     }
 }
