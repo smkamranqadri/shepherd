@@ -545,7 +545,10 @@ impl Shell {
             cx.spawn(async move |this, cx| {
                 let added = task.await;
                 let _ = this.update(cx, |s, cx| match added {
-                    Ok(machine) => s.switch_machine(machine, cx),
+                    Ok(machine) => {
+                        s.switch_machine(machine.clone(), cx);
+                        s.offer_more_sessions(machine, cx);
+                    }
                     Err(e) => crate::ui::toast::error(cx, format!("{e:#}")),
                 });
             })

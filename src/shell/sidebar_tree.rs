@@ -92,6 +92,8 @@ pub(super) struct TreeState {
     pub(super) machine_menu: Option<crate::ui::Popup<(String, gpui::Point<Pixels>)>>,
     /// The footer's + menu (New session, Add SSH machine), where it opened.
     add_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
+    /// Sessions on this host…: an SSH host's sessions not saved as machines, to add one.
+    pub(super) discover: Option<crate::ui::Popup<super::discover::Discover>>,
     /// Bare folded ids (an older Shepherd's) were moved under the shown session's key.
     folds_migrated: bool,
     /// Where a row being dragged would land.
@@ -135,8 +137,13 @@ impl TreeState {
         self.pending_goal.is_some()
     }
 
+    /// A tree menu or the sessions popup is up.
     pub(super) fn menu_open(&self) -> bool {
-        self.machine_menu.as_ref().is_some_and(|m| m.is_open()) || self.add_menu_open()
+        self.machine_menu.as_ref().is_some_and(|m| m.is_open()) || self.add_menu_open() || self.discover_open()
+    }
+
+    pub(super) fn discover_open(&self) -> bool {
+        self.discover.as_ref().is_some_and(|d| d.is_open())
     }
 
     pub(super) fn add_menu_open(&self) -> bool {
@@ -1073,7 +1080,7 @@ impl Shell {
     }
 
     /// A machine's saved sessions, enabled or not.
-    fn machine_records(&self, target: &str) -> Vec<Machine> {
+    pub(super) fn machine_records(&self, target: &str) -> Vec<Machine> {
         let enabled = self.places.iter().filter_map(|p| match p {
             Place::Machine(m) if m.target == target => Some(m.clone()),
             _ => None,
@@ -1191,6 +1198,11 @@ impl Shell {
                     crate::ui::toast::info(cx, format!("Shepherd's SSH never asks for a password: run `{command}` in a terminal, then Retry."), None);
                 })));
             }
+            let host = target.clone();
+            card = card.child(item("machine-menu-sessions", "Sessions on this host…").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                close(this);
+                this.open_discover(host.clone(), cx);
+            })));
             let flip = target.clone();
             card = card.child(item("machine-menu-enable", if enabled { "Disable" } else { "Enable" }).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 close(this);
@@ -1215,6 +1227,7 @@ impl Shell {
     pub(super) fn reap_tree_popups(&mut self, window: &mut Window) {
         crate::ui::reap_popup(&mut self.tree.machine_menu, window);
         crate::ui::reap_popup(&mut self.tree.add_menu, window);
+        self.reap_discover(window);
     }
 
     /// Where a workspace row of `mode` keeps its folder: the shown session's as today (git and gh ask it); another

@@ -312,7 +312,7 @@ pub async fn remote_sessions(target: &str) -> Result<Vec<super::SessionInfo>, Li
 }
 
 /// [`remote_sessions`] with the `ssh` to run, for a test's stand-in.
-async fn sessions_over(ssh: &std::ffi::OsStr, target: &str, timeout: Duration) -> Result<Vec<super::SessionInfo>, ListError> {
+pub(crate) async fn sessions_over(ssh: &std::ffi::OsStr, target: &str, timeout: Duration) -> Result<Vec<super::SessionInfo>, ListError> {
     use tokio::io::AsyncReadExt;
     let failed = |e: std::io::Error| ListError::Failed(format!("ssh: {e}"));
     let mut child = tokio::process::Command::from(crate::process::command(ssh))
@@ -417,9 +417,49 @@ fn relay_dir(id: &str, session: &str) -> String {
     format!("{hash:016x}")[..12].to_string()
 }
 
+/// A stand-in host and `ssh` for tests here and in the sidebar's discovery: no real host is reached.
+#[cfg(all(test, unix))]
+pub(crate) mod fake {
+    /// An executable `sh` script at `path`.
+    pub(crate) fn script(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A host for the tests, in a folder of its own: `bin` holds `sh` and, given its body, a stand-in `herdr`, and is
+    /// all its PATH has, so no herdr of this machine's is found by name.
+    pub(crate) fn host(herdr: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", bin.join("sh")).unwrap();
+        if let Some(body) = herdr {
+            script(&bin.join("herdr"), body);
+        }
+        dir
+    }
+
+    /// A stand-in for `ssh` to `host`: it checks its last words are `-- you@workbox <command>`, runs `login` (a
+    /// banner, a refusal), then hands the command to a shell, as sshd hands it to the login shell. No real host is
+    /// reached.
+    pub(crate) fn fake_ssh(host: &tempfile::TempDir, login: &str) -> std::path::PathBuf {
+        let path = host.path().join("ssh");
+        let body = r#"n=$#
+eval "dash=\${$((n - 2))} target=\${$((n - 1))} command=\${$n}"
+[ "$dash" = -- ] && [ "$target" = you@workbox ] || { echo "ssh got: $*" >&2; exit 98; }
+LOGIN
+PATH='HOST/bin' HOME='HOST' exec /bin/sh -c "$command""#;
+        script(&path, &body.replace("LOGIN", login).replace("HOST", &host.path().to_string_lossy()));
+        path
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use super::fake::{fake_ssh, host};
 
     #[test]
     fn machines_from_herdrs_list() {
@@ -577,43 +617,6 @@ mod tests {
         let json = br#"{"sessions":[{"default":true,"name":"default","running":true,"session_dir":"/home/you/.config/herdr","socket_path":"/home/you/.config/herdr/herdr.sock"},{"default":false,"name":"agents","running":false,"session_dir":"/home/you/.config/herdr/sessions/agents","socket_path":"/home/you/.config/herdr/sessions/agents/herdr.sock"}]}"#;
         let list = crate::herdr::session::parse_sessions(json).unwrap();
         assert_eq!(list.iter().map(|s| (s.name.as_str(), s.running, s.default)).collect::<Vec<_>>(), [("default", true, true), ("agents", false, false)]);
-    }
-
-    /// An executable `sh` script at `path`.
-    #[cfg(unix)]
-    fn script(path: &std::path::Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    /// A host for the tests, in a folder of its own: `bin` holds `sh` and, given its body, a stand-in `herdr`, and is
-    /// all its PATH has, so no herdr of this machine's is found by name.
-    #[cfg(unix)]
-    fn host(herdr: Option<&str>) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        std::os::unix::fs::symlink("/bin/sh", bin.join("sh")).unwrap();
-        if let Some(body) = herdr {
-            script(&bin.join("herdr"), body);
-        }
-        dir
-    }
-
-    /// A stand-in for `ssh` to `host`: it checks its last words are `-- you@workbox <command>`, runs `login` (a
-    /// banner, a refusal), then hands the command to a shell, as sshd hands it to the login shell. No real host is
-    /// reached.
-    #[cfg(unix)]
-    fn fake_ssh(host: &tempfile::TempDir, login: &str) -> std::path::PathBuf {
-        let path = host.path().join("ssh");
-        let body = r#"n=$#
-eval "dash=\${$((n - 2))} target=\${$((n - 1))} command=\${$n}"
-[ "$dash" = -- ] && [ "$target" = you@workbox ] || { echo "ssh got: $*" >&2; exit 98; }
-LOGIN
-PATH='HOST/bin' HOME='HOST' exec /bin/sh -c "$command""#;
-        script(&path, &body.replace("LOGIN", login).replace("HOST", &host.path().to_string_lossy()));
-        path
     }
 
     /// The scripts as a host's `sh` runs them, with a stand-in herdr first on its PATH that prints its arguments

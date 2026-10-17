@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 mod attention;
 mod client_shell;
+mod discover;
 mod divider;
 mod floating;
 mod motion;

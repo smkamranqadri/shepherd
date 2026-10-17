@@ -12,7 +12,9 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let confirming = self.session_delete.as_ref().is_some_and(|c| c.is_open()) || self.remove_confirm.as_ref().is_some_and(|c| c.is_open());
+        let confirming = self.session_delete.as_ref().is_some_and(|c| c.is_open())
+            || self.remove_confirm.as_ref().is_some_and(|c| c.is_open())
+            || self.tree.discover_open();
         if confirming && !self.confirm_focus.is_focused(window) {
             window.focus(&self.confirm_focus, cx);
         }
@@ -191,6 +193,7 @@ impl Shell {
             .with_priority(1)
         }))
         .children(self.tree_popups(theme, cx))
+        .children(self.discover_popup(theme, window, cx))
         .children(self.place_edit.as_ref().map(|edit| {
             let field = |input: &Entity<InputState>| {
                 div()
