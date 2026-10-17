@@ -1,7 +1,8 @@
 //! Next agent that needs you: one key goes to the agent that has waited longest for you, in whichever session, and
 //! the next press to the one after, round again at the end. Blocked agents (asking for an answer) come before done
 //! ones, each kind the oldest wait first, from the Agents section's own list (`session_agents`), so the key never goes
-//! where the section does not show. A session out of reach is left out: going there would only fail.
+//! where the section does not show. A session out of reach is left out: going there would only fail; so is one whose
+//! socket is gone (stopped, and its watcher not told yet), which going to would start again.
 use super::sidebar_tree::{Goal, SessionAgents, cross_agents};
 use super::watchers::{SessionKey, Status};
 use super::*;
@@ -25,34 +26,69 @@ pub(super) fn queue(sessions: &[SessionAgents], unreachable: impl Fn(&SessionKey
     waiting.into_iter().map(|e| Wanted { key: e.key, tab: e.pane.tab_id, pane: e.pane.pane_id }).collect()
 }
 
+/// A session and one of its panes.
+pub(super) type At = (SessionKey, String);
+
+/// A press of the key: the agent it went to, and the pane you were at then.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Visit {
+    pub to: At,
+    pub from: Option<At>,
+}
+
+/// Whether a press goes on from the agent the last one went to rather than from the pane you are at: the focus is
+/// still on its way there (`landing`: a pane's focus asked for, a session's switch waiting to show it), or has not
+/// moved since that press. Else a quick second press would go from the old pane again, to the same agent.
+pub(super) fn from_last(visit: Option<&Visit>, here: &Option<At>, landing: bool) -> bool {
+    visit.is_some_and(|v| landing || v.from == *here)
+}
+
 /// Where the key goes in `queue`: the agent after the one you are at (`here`), else after the one it last went to
-/// (`last`), round to the first after the end; the first when neither is in the queue. `None` when nothing waits.
-pub(super) fn next(queue: &[Wanted], here: Option<(SessionKey, String)>, last: Option<(SessionKey, String)>) -> Option<&Wanted> {
-    let at = |a: Option<(SessionKey, String)>| a.and_then(|(key, pane)| queue.iter().position(|w| w.key == key && w.pane == pane));
-    match at(here).or_else(|| at(last)) {
+/// (`last`), or the other way round when `last_first`; round to the first after the end, and the first when neither
+/// is in the queue. `None` when nothing waits.
+pub(super) fn next(queue: &[Wanted], here: Option<At>, last: Option<At>, last_first: bool) -> Option<&Wanted> {
+    let at = |a: Option<At>| a.and_then(|(key, pane)| queue.iter().position(|w| w.key == key && w.pane == pane));
+    let (first, second) = if last_first { (last, here) } else { (here, last) };
+    match at(first).or_else(|| at(second)) {
         Some(i) => queue.get((i + 1) % queue.len()),
         None => queue.first(),
     }
+}
+
+/// A session on this machine whose socket is not there: its server stopped. Machines' sessions (`machine:<id>`)
+/// are not looked for here, nor anything off Unix, where a socket may be no file.
+pub(super) fn socket_gone(key: &SessionKey, exists: impl Fn(&std::path::Path) -> bool) -> bool {
+    cfg!(unix) && !key.0.starts_with("machine:") && !exists(std::path::Path::new(&key.0))
 }
 
 impl Shell {
     /// The NextNeedsYou key: shows the next agent that needs you (switching session when it is in another), or
     /// says none does.
     pub(super) fn next_needs_you(&mut self, cx: &mut Context<Self>) {
-        let unreachable = |k: &SessionKey| self.watchers.get(k).is_some_and(|w| w.status == Status::Unreachable);
+        let unreachable = |k: &SessionKey| {
+            self.watchers.get(k).is_some_and(|w| w.status == Status::Unreachable) || socket_gone(k, std::path::Path::exists)
+        };
         let queue = queue(&self.session_agents(cx), unreachable, Instant::now());
         let here = self.shown_key().zip(self.focused.clone());
-        let Some(wanted) = next(&queue, here, self.tree.needs_you_last.clone()).cloned() else {
+        let visit = self.tree.needs_you_last.clone();
+        let landing = self.focus_next.is_some() || self.tree.goal_waiting();
+        let last_first = from_last(visit.as_ref(), &here, landing);
+        let Some(wanted) = next(&queue, here.clone(), visit.map(|v| v.to), last_first).cloned() else {
             crate::ui::toast::info(cx, "No agent needs you", None);
             return;
         };
-        self.tree.needs_you_last = Some((wanted.key.clone(), wanted.pane.clone()));
+        // the Settings page covers the panes, and keeps the focus from the agent's
+        if self.settings.is_some() {
+            self.close_settings(cx);
+        }
+        self.tree.needs_you_last = Some(Visit { to: (wanted.key.clone(), wanted.pane.clone()), from: here });
         self.go_to(wanted.key, Goal::Pane { tab: wanted.tab, pane: wanted.pane }, cx);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::sidebar_tree::agent_order;
     use super::*;
     use crate::model::Since;
     use std::time::Duration;
@@ -125,20 +161,60 @@ mod tests {
         let sessions = [SessionAgents { key: key("alpha"), name: "alpha".into(), shown: true, snapshot: &s, since: &none }];
         let q = queue(&sessions, |_| false, Instant::now());
         assert!(q.is_empty());
-        assert_eq!(next(&q, at("alpha", "a1"), None), None);
+        assert_eq!(next(&q, at("alpha", "a1"), None, false), None);
     }
 
     #[test]
     fn the_key_goes_on_from_where_you_are_and_round_at_the_end() {
         let w = |pane: &str| Wanted { key: key(if pane.starts_with('a') { "alpha" } else { "beta" }), tab: format!("t-{pane}"), pane: pane.into() };
         let q = [w("b2"), w("a2"), w("b1")];
-        assert_eq!(next(&q, None, None), Some(&q[0]), "from nowhere: the first");
-        assert_eq!(next(&q, at("beta", "b2"), None), Some(&q[1]));
-        assert_eq!(next(&q, at("beta", "b1"), None), Some(&q[0]), "round from the last");
-        assert_eq!(next(&q, at("alpha", "b2"), None), Some(&q[0]), "a pane id of another session is not here");
-        assert_eq!(next(&q, at("alpha", "a9"), at("alpha", "a2")), Some(&q[2]), "elsewhere: on from the last one gone to");
-        assert_eq!(next(&q, at("alpha", "a2"), at("beta", "b2")), Some(&q[2]), "where you are wins");
-        assert_eq!(next(&q, at("alpha", "a9"), at("beta", "b9")), Some(&q[0]), "neither waits any more: the first");
-        assert_eq!(next(&q[..1], at("beta", "b2"), None), Some(&q[0]), "one alone stays");
+        assert_eq!(next(&q, None, None, false), Some(&q[0]), "from nowhere: the first");
+        assert_eq!(next(&q, at("beta", "b2"), None, false), Some(&q[1]));
+        assert_eq!(next(&q, at("beta", "b1"), None, false), Some(&q[0]), "round from the last");
+        assert_eq!(next(&q, at("alpha", "b2"), None, false), Some(&q[0]), "a pane id of another session is not here");
+        assert_eq!(next(&q, at("alpha", "a9"), at("alpha", "a2"), false), Some(&q[2]), "elsewhere: on from the last one gone to");
+        assert_eq!(next(&q, at("alpha", "a2"), at("beta", "b2"), false), Some(&q[2]), "where you are wins");
+        assert_eq!(next(&q, at("alpha", "a9"), at("beta", "b9"), false), Some(&q[0]), "neither waits any more: the first");
+        assert_eq!(next(&q[..1], at("beta", "b2"), None, false), Some(&q[0]), "one alone stays");
+    }
+
+    #[test]
+    fn a_quick_second_press_goes_on_from_the_agent_the_first_went_to() {
+        let w = |name: &str, pane: &str| Wanted { key: key(name), tab: format!("t-{pane}"), pane: pane.into() };
+        let q = [w("beta", "b2"), w("alpha", "a2"), w("beta", "b1")];
+        // the first press, at a2: on to b1; the focus has not got there by the second
+        let visit = Visit { to: (key("beta"), "b1".into()), from: at("alpha", "a2") };
+        let here = at("alpha", "a2");
+        assert!(from_last(Some(&visit), &here, false), "the focus has not moved since");
+        assert_eq!(next(&q, here.clone(), Some(visit.to.clone()), true), Some(&q[0]), "b1's next, round to b2; not b1 again");
+        assert!(from_last(Some(&visit), &at("beta", "b9"), true), "a focus asked for, or a switch, still landing");
+        // the focus moved on (to b1, or anywhere else) and nothing is landing: from where you are
+        assert!(!from_last(Some(&visit), &at("beta", "b1"), false));
+        assert!(!from_last(Some(&visit), &None, false), "the Settings page closed: focus none, not the pane it was");
+        assert!(!from_last(None, &here, true), "no press yet");
+    }
+
+    #[test]
+    fn a_session_whose_socket_is_gone_is_skipped() {
+        let there = |p: &std::path::Path| p == std::path::Path::new("/tmp/alpha.sock");
+        assert_eq!(socket_gone(&key("beta"), there), cfg!(unix), "stopped");
+        assert!(!socket_gone(&key("alpha"), there));
+        assert!(!socket_gone(&SessionKey("machine:m1".into()), there), "a machine's is not looked for");
+    }
+
+    #[test]
+    fn a_socket_of_ones_own_leads_the_queue_as_its_workspaces_do() {
+        assert_eq!(agent_order(Some(&key("own")), &[key("alpha"), key("beta")]), [key("own"), key("alpha"), key("beta")]);
+        assert_eq!(agent_order(Some(&key("beta")), &[key("alpha"), key("beta")]), [key("alpha"), key("beta")], "a listed one keeps its place");
+        assert_eq!(agent_order(None, &[key("alpha")]), [key("alpha")]);
+        // waits Shepherd did not see start tie, and the sessions' order breaks it
+        let a = snapshot(&[("a1", "blocked")]);
+        let own = snapshot(&[("o1", "blocked")]);
+        let none = Since::new();
+        let sessions = [
+            SessionAgents { key: key("own"), name: "own".into(), shown: true, snapshot: &own, since: &none },
+            SessionAgents { key: key("alpha"), name: "alpha".into(), shown: false, snapshot: &a, since: &none },
+        ];
+        assert_eq!(panes(&queue(&sessions, |_| false, Instant::now())), ["o1", "a1"]);
     }
 }

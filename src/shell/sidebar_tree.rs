@@ -92,9 +92,9 @@ pub(super) struct TreeState {
     add_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
     /// Bare folded ids (an older Shepherd's) were moved under the shown session's key.
     folds_migrated: bool,
-    /// The agent Next agent that needs you last went to (session, pane), so the next press goes on from it while a
-    /// switch to its session is still landing, or after you looked elsewhere.
-    pub(super) needs_you_last: Option<(SessionKey, String)>,
+    /// Where Next agent that needs you last went, and from where, so the next press goes on from it while the
+    /// focus is still landing there, or after you looked elsewhere.
+    pub(super) needs_you_last: Option<super::needs_you::Visit>,
 }
 
 impl TreeState {
@@ -174,6 +174,13 @@ pub(super) fn toggle_in(collapsed: &mut Vec<String>, key: &str) {
 /// under its machine's row, which heads the group already.
 pub(super) fn divider_above(rows: &[TreeRow], i: usize) -> bool {
     i > 0 && matches!(rows[i], TreeRow::Session { .. } | TreeRow::Machine { .. }) && !matches!(rows[i - 1], TreeRow::Machine { .. })
+}
+
+/// The sessions whose agents are read, in order: the shown one first when herdr's list lacks it (a socket of one's
+/// own leads, as its workspaces do), then the list's, in the tree's order.
+pub(super) fn agent_order(shown: Option<&SessionKey>, listed: &[SessionKey]) -> Vec<SessionKey> {
+    let own = shown.filter(|k| !listed.contains(k)).cloned();
+    own.into_iter().chain(listed.iter().cloned()).collect()
 }
 
 /// One session's agents, as the Agents section reads them: the shown session's live snapshot with Shepherd's own
@@ -440,25 +447,20 @@ impl Shell {
     /// left out). One list for both, so the key never goes where the section does not show.
     pub(super) fn session_agents(&self, cx: &App) -> Vec<SessionAgents<'_>> {
         let shown = self.shown_key();
+        let listed: Vec<SessionKey> = self.places.iter().map(SessionKey::of).collect();
         let mut sessions: Vec<SessionAgents> = Vec::new();
-        let listed = |k: &SessionKey| self.places.iter().any(|p| SessionKey::of(p) == *k);
-        if let (Some(key), Some(snapshot)) = (&shown, self.snapshot.as_ref()) {
-            // a socket of one's own, outside herdr's list, leads as its workspaces do
-            if !listed(key) {
-                sessions.push(SessionAgents { key: key.clone(), name: self.place_label(cx), shown: true, snapshot, since: &self.since });
-            }
-        }
-        for place in &self.places {
-            let key = SessionKey::of(place);
-            let name = place.look(cx).0;
+        for key in agent_order(shown.as_ref(), &listed) {
+            let place = self.places.iter().find(|p| SessionKey::of(p) == key);
             if shown.as_ref() == Some(&key) {
                 if let Some(snapshot) = self.snapshot.as_ref() {
+                    let name = place.map_or_else(|| self.place_label(cx), |p| p.look(cx).0);
                     sessions.push(SessionAgents { key, name, shown: true, snapshot, since: &self.since });
                 }
-            } else if let Some(w) = self.watchers.get(&key).filter(|w| w.status != Status::Stopped)
+            } else if let Some(place) = place
+                && let Some(w) = self.watchers.get(&key).filter(|w| w.status != Status::Stopped)
                 && let Some(snapshot) = w.snapshot.as_ref()
             {
-                sessions.push(SessionAgents { key, name, shown: false, snapshot, since: &w.since });
+                sessions.push(SessionAgents { key, name: place.look(cx).0, shown: false, snapshot, since: &w.since });
             }
         }
         sessions
