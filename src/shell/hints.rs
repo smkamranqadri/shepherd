@@ -1,8 +1,8 @@
 //! Shortcut hints (uherdr's `ShortcutHintMonitor`): hold the modifier of the tabs' chords a moment (Cmd on macOS,
-//! Alt elsewhere, as Alt+1…9 go to a tab there) and each tab shows the chord that goes to it; hold the workspaces'
-//! (Ctrl on macOS, Ctrl+Shift elsewhere) and each workspace in the sidebar does. Any key, a click, another modifier,
-//! the window going to the back or a popup opening puts them away until the modifiers are all let go, so Alt+B or
-//! Ctrl+Shift+C in a pane never flashes them, and Ctrl alone off macOS (the shell's) shows nothing.
+//! Ctrl elsewhere, as Ctrl+1…9 go to a tab there) and each tab shows its number; hold the workspaces' (Ctrl on
+//! macOS, Ctrl+Shift elsewhere) and each workspace in the sidebar does. Any key, a click, another modifier, the
+//! window going to the back or a popup opening puts them away until the modifiers are all let go, so a quick Ctrl+C,
+//! Ctrl+R or Ctrl+Shift+C in a pane never flashes them: the key comes well inside the hold.
 //!
 //! `Hints` is the state machine, the clock passed in; the Shell feeds it the window's modifier changes
 //! (`on_modifiers_changed` on the root), every key down (a keystroke interceptor: a key bound to an action is
@@ -27,10 +27,10 @@ const FADE_OUT: Duration = Duration::from_millis(80);
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Held {
     Nothing,
-    /// On the way to a mode (Ctrl or Shift before Ctrl+Shift off macOS): no chips, nothing spent.
+    /// On the way to a mode (Shift before Ctrl+Shift off macOS): no chips, nothing spent.
     Part,
     Mode(HintMode),
-    /// A set no hints answer to (Ctrl+Alt, Shift alone on macOS): spent until everything is let go.
+    /// A set no hints answer to (Ctrl+Alt, Alt alone off macOS, Shift alone on macOS): spent until everything is let go.
     Other,
 }
 
@@ -40,9 +40,10 @@ fn held(m: &Modifiers, mac: bool) -> Held {
         (_, (false, false, false, false, false)) => Held::Nothing,
         (true, (false, false, false, true, false)) => Held::Mode(HintMode::Tabs),
         (true, (true, false, false, false, false)) => Held::Mode(HintMode::Workspaces),
-        (false, (false, true, false, false, false)) => Held::Mode(HintMode::Tabs),
+        (false, (true, false, false, false, false)) => Held::Mode(HintMode::Tabs),
         (false, (true, false, true, false, false)) => Held::Mode(HintMode::Workspaces),
-        (false, (true, false, false, false, false) | (false, false, true, false, false)) => Held::Part,
+        // Shift first, on the way to Ctrl+Shift
+        (false, (false, false, true, false, false)) => Held::Part,
         _ => Held::Other,
     }
 }
@@ -186,9 +187,24 @@ impl Hints {
     }
 }
 
-/// A chip: the chord's keys, over the right end of a tab or a workspace row, at `opacity`.
+/// What a chip reads for `keys`: the digit the chord ends in (Ctrl+Shift+1 too, which Linux hears as `ctrl-!`), as
+/// the modifier held is the one the chips answer to; a chord the user moved off the digits reads in full.
+pub(super) fn chip_text(keys: &str) -> String {
+    let last = keys.split_whitespace().last().and_then(|k| gpui::Keystroke::parse(k).ok());
+    let digit = last.and_then(|k| match k.key.chars().next() {
+        Some(c) if c.is_ascii_digit() && k.key.len() == 1 => Some(c),
+        _ => crate::bindings::shifted_digit(&k.key),
+    });
+    match digit {
+        Some(d) if keys.split_whitespace().count() == 1 => d.to_string(),
+        _ => keys.split_whitespace().map(crate::ui::command_panel::glyphs).collect::<Vec<_>>().join(" "),
+    }
+}
+
+/// A chip: the chord's number (`chip_text`), over the right end of a tab or a workspace row, at `opacity`. Square at
+/// its least, so the single digits line up as one size.
 pub(super) fn chip(theme: &Theme, keys: &str, opacity: f32) -> Div {
-    let text = keys.split_whitespace().map(crate::ui::command_panel::glyphs).collect::<Vec<_>>().join(" ");
+    let text = chip_text(keys);
     div()
         .absolute()
         .top_0()
@@ -200,9 +216,11 @@ pub(super) fn chip(theme: &Theme, keys: &str, opacity: f32) -> Div {
         .child(
             div()
                 .h(px(18.))
+                .min_w(px(18.))
                 .px(px(5.))
                 .flex()
                 .items_center()
+                .justify_center()
                 .rounded(px(5.))
                 .border_1()
                 .border_color(theme.border)
@@ -273,6 +291,7 @@ impl Shell {
             || open(&self.statusbar_menu)
             || open(&self.tab_menu)
             || open(&self.root_menu)
+            || open(&self.files_view_menu)
             || open(&self.worktree_dialog)
             || open(&self.remove_confirm)
             || open(&self.merge_confirm)
@@ -310,6 +329,7 @@ mod tests {
     const NONE: (bool, bool, bool, bool) = (false, false, false, false);
     const CTRL: (bool, bool, bool, bool) = (true, false, false, false);
     const ALT: (bool, bool, bool, bool) = (false, false, true, false);
+    const SHIFT: (bool, bool, bool, bool) = (false, true, false, false);
     const CTRL_SHIFT: (bool, bool, bool, bool) = (true, true, false, false);
 
     fn press(h: &mut Hints, (c, s, a, p): (bool, bool, bool, bool), now: Instant) -> bool {
@@ -321,9 +341,9 @@ mod tests {
     }
 
     #[test]
-    fn holding_alt_shows_the_tabs_after_the_hold() {
+    fn holding_ctrl_shows_the_tabs_after_the_hold() {
         let (mut h, t0) = (linux(), Instant::now());
-        assert!(press(&mut h, ALT, t0));
+        assert!(press(&mut h, CTRL, t0));
         assert_eq!(h.deadline(), Some(t0 + ms(450)));
         assert!(!h.tick(t0 + ms(449)), "not before the hold is up");
         assert_eq!(h.shown(t0 + ms(449)), None);
@@ -338,33 +358,42 @@ mod tests {
     #[test]
     fn ctrl_shift_shows_the_workspaces_and_shift_first_counts() {
         let (mut h, t0) = (linux(), Instant::now());
-        press(&mut h, (false, true, false, false), t0);
+        press(&mut h, SHIFT, t0);
         assert_eq!(h.deadline(), None, "Shift alone is on its way, not spent");
         press(&mut h, CTRL_SHIFT, t0 + ms(10));
         assert!(h.tick(t0 + ms(460)));
         assert_eq!(mode(&h, t0 + ms(500)), Some(HintMode::Workspaces));
-        // Ctrl first, as for Ctrl+Shift+C
+        // Ctrl first: the tabs' wait, then the workspaces' from the Shift on
         press(&mut h, NONE, t0 + ms(600));
         press(&mut h, CTRL, t0 + ms(700));
-        assert_eq!(h.deadline(), None, "Ctrl alone is on its way, not spent");
+        assert_eq!(h.deadline(), Some(t0 + ms(1150)), "Ctrl alone waits for the tabs");
         press(&mut h, CTRL_SHIFT, t0 + ms(710));
+        assert_eq!(h.deadline(), Some(t0 + ms(1160)), "the hold starts anew for the workspaces");
+        assert!(!h.tick(t0 + ms(1150)));
         assert!(h.tick(t0 + ms(1160)));
         assert_eq!(mode(&h, t0 + ms(1200)), Some(HintMode::Workspaces));
+        // Shift let go with Ctrl still down: the tabs' numbers at once
+        press(&mut h, CTRL, t0 + ms(1300));
+        assert_eq!(mode(&h, t0 + ms(1300) + FADE_IN), Some(HintMode::Tabs));
     }
 
     #[test]
-    fn ctrl_alone_never_shows_them() {
+    fn alt_alone_shows_nothing_off_macos() {
         let (mut h, t0) = (linux(), Instant::now());
-        press(&mut h, CTRL, t0);
-        assert_eq!(h.deadline(), None, "Ctrl alone is the shell's");
+        press(&mut h, ALT, t0);
+        assert_eq!(h.deadline(), None, "Alt is no longer the tabs' modifier");
         assert!(!h.tick(t0 + ms(2000)));
         assert_eq!(h.shown(t0 + ms(2000)), None);
+        // nor does Ctrl join it: spent until both are let go
+        press(&mut h, (true, false, true, false), t0 + ms(2100));
+        press(&mut h, CTRL, t0 + ms(2200));
+        assert!(!h.tick(t0 + ms(3000)));
     }
 
     #[test]
-    fn alt_b_and_ctrl_shift_c_never_flash_them() {
+    fn ctrl_c_ctrl_r_and_ctrl_shift_c_never_flash_them() {
         let (mut h, t0) = (linux(), Instant::now());
-        for held in [ALT, CTRL_SHIFT, ALT] {
+        for held in [CTRL, CTRL, CTRL_SHIFT, CTRL] {
             press(&mut h, held, t0);
             assert!(h.cancel(t0 + ms(80)), "the key puts them away");
             assert!(!h.tick(t0 + ms(900)));
@@ -377,7 +406,7 @@ mod tests {
     #[test]
     fn a_key_hides_them_until_the_modifiers_are_let_go() {
         let (mut h, t0) = (linux(), Instant::now());
-        press(&mut h, ALT, t0);
+        press(&mut h, CTRL, t0);
         h.tick(t0 + ms(450));
         assert!(h.cancel(t0 + ms(600)));
         assert!(h.fading(t0 + ms(620)));
@@ -385,52 +414,52 @@ mod tests {
         assert!(!press(&mut h, CTRL_SHIFT, t0 + ms(700)), "still spent");
         assert!(!h.tick(t0 + ms(2000)));
         press(&mut h, NONE, t0 + ms(2100));
-        press(&mut h, ALT, t0 + ms(2200));
+        press(&mut h, CTRL, t0 + ms(2200));
         assert!(h.tick(t0 + ms(2650)), "held again, shown again");
     }
 
     #[test]
     fn another_modifier_spends_them() {
         let (mut h, t0) = (linux(), Instant::now());
-        press(&mut h, ALT, t0);
+        press(&mut h, CTRL, t0);
         press(&mut h, (true, false, true, false), t0 + ms(100));
         assert!(!h.tick(t0 + ms(600)));
-        press(&mut h, ALT, t0 + ms(700)); // Ctrl let go, Alt still down
-        assert!(!h.tick(t0 + ms(1200)), "spent until Alt is let go too");
+        press(&mut h, CTRL, t0 + ms(700)); // Alt let go, Ctrl still down
+        assert!(!h.tick(t0 + ms(1200)), "spent until Ctrl is let go too");
     }
 
     #[test]
     fn switching_modes_while_shown_swaps_the_chips_and_while_waiting_restarts_the_hold() {
         let (mut h, t0) = (linux(), Instant::now());
-        press(&mut h, ALT, t0);
+        press(&mut h, CTRL, t0);
         press(&mut h, CTRL_SHIFT, t0 + ms(300));
         assert_eq!(h.deadline(), Some(t0 + ms(750)));
         h.tick(t0 + ms(750));
         assert_eq!(mode(&h, t0 + ms(800)), Some(HintMode::Workspaces));
-        press(&mut h, ALT, t0 + ms(900));
+        press(&mut h, CTRL, t0 + ms(900));
         assert_eq!(mode(&h, t0 + ms(950)), Some(HintMode::Tabs));
     }
 
     #[test]
     fn blur_and_activation() {
         let (mut h, t0) = (linux(), Instant::now());
-        press(&mut h, ALT, t0);
+        press(&mut h, CTRL, t0);
         h.tick(t0 + ms(450));
         assert!(h.blur(t0 + ms(500)));
         assert_eq!(h.shown(t0 + ms(700)), None);
-        // back with Alt still held: nothing until it is let go
-        h.activate(&mods(false, false, true, false), t0 + ms(800));
-        assert!(!press(&mut h, ALT, t0 + ms(810)));
+        // back with Ctrl still held: nothing until it is let go
+        h.activate(&mods(true, false, false, false), t0 + ms(800));
+        assert!(!press(&mut h, CTRL, t0 + ms(810)));
         assert!(!h.tick(t0 + ms(1500)));
         h.activate(&Modifiers::default(), t0 + ms(1600));
-        press(&mut h, ALT, t0 + ms(1700));
+        press(&mut h, CTRL, t0 + ms(1700));
         assert!(h.tick(t0 + ms(2150)));
     }
 
     #[test]
     fn turned_off_nothing_shows() {
         let (mut h, t0) = (linux(), Instant::now());
-        h.modifiers(&mods(false, false, true, false), false, t0);
+        h.modifiers(&mods(true, false, false, false), false, t0);
         assert_eq!(h.deadline(), None);
         assert!(!h.tick(t0 + ms(1000)));
     }
@@ -455,7 +484,7 @@ mod tests {
     #[test]
     fn letting_go_fades_them_out() {
         let (mut h, t0) = (linux(), Instant::now());
-        press(&mut h, ALT, t0);
+        press(&mut h, CTRL, t0);
         h.tick(t0 + ms(450));
         press(&mut h, NONE, t0 + ms(450) + FADE_IN);
         let mid = h.shown(t0 + ms(450) + FADE_IN + ms(40)).unwrap().1;
@@ -474,12 +503,31 @@ mod tests {
 
     #[test]
     fn the_hint_modifiers_are_the_numbered_chords_own() {
-        // what is held to see the chips is what goes with the digit: Cmd and Ctrl on macOS, Alt and Ctrl+Shift elsewhere
+        // what is held to see the chips is what goes with the digit: Cmd and Ctrl on macOS, Ctrl and Ctrl+Shift elsewhere
         let default = |action: &str| crate::bindings::DEFAULTS.iter().find(|(a, _)| *a == action).unwrap().1;
         let mac = cfg!(target_os = "macos");
         for (actions, mode) in [(crate::bindings::TAB_ACTIONS, HintMode::Tabs), (crate::bindings::WORKSPACE_ACTIONS, HintMode::Workspaces)] {
             for action in actions {
                 assert_eq!(held(&held_by(default(action)), mac), Held::Mode(mode), "{action}");
+            }
+        }
+    }
+
+    #[test]
+    fn chips_read_just_the_number() {
+        assert_eq!(chip_text("ctrl-1"), "1");
+        assert_eq!(chip_text("cmd-9"), "9");
+        assert_eq!(chip_text("alt-4"), "4");
+        // Ctrl+Shift+3 as Linux hears it
+        assert_eq!(chip_text("ctrl-#"), "3");
+        assert_eq!(chip_text("ctrl-("), "9");
+        // a chord the user moved off the digits reads in full
+        assert_ne!(chip_text("ctrl-alt-j"), "j");
+        // every default numbered chord reads as its own number
+        let default = |action: &str| crate::bindings::DEFAULTS.iter().find(|(a, _)| *a == action).unwrap().1;
+        for actions in [crate::bindings::TAB_ACTIONS, crate::bindings::WORKSPACE_ACTIONS] {
+            for (i, action) in actions.iter().enumerate() {
+                assert_eq!(chip_text(default(action)), (i + 1).to_string(), "{action}");
             }
         }
     }

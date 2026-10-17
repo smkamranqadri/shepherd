@@ -18,7 +18,7 @@ It's written in Rust on [GPUI](https://github.com/zeronsh/zui) and styled after 
 - herdr's own `[keys]` work in Shepherd, and its popups float over the panes.
 - `⌥⌘B` opens the right panel: the workspace folder's files (to view or edit in a tab), its git changes and diffs, a search in its files, and the branch's PR (gh) or MR (glab) with its description, checks or pipeline jobs and their logs. The PR tab works for SSH machines too.
 - `⌘K` opens a command panel with every action, workspace and tab. `⇧⌘A` opens the agents panel.
-- Hold `⌘` for a moment and each tab shows its shortcut; hold `⌃` and each workspace does (Alt and Ctrl+Shift on Linux). Settings can turn the hints off.
+- Hold `⌘` for a moment and each tab shows its number; hold `⌃` and each workspace does (Ctrl and Ctrl+Shift on Linux). Settings can turn the hints off.
 - The status bar shows the branch, its PR and CI, the current folder, the focused agent and your Claude and Codex plan limits.
 - Settings cover fonts, themes, key bindings and usage. They also edit herdr's own `config.toml` for notifications and integrations, keeping your comments.
 
@@ -58,7 +58,7 @@ Shepherd needs macOS 14 or later (or Linux) and herdr. It talks to the herdr ser
 | `⌘W` | `Ctrl+Shift+W` | Close the pane, or the file tab |
 | `⌥⌘` + arrows | `Ctrl+Alt` + arrows | Focus the pane in that direction |
 | `⇧⌘↩` | `Ctrl+Shift+Enter` | Zoom the pane |
-| `⌘1` … `⌘9`, `⇧⌘[`, `⇧⌘]` | `Alt+1` … `Alt+9`, `Ctrl+PgUp`, `Ctrl+PgDn` | Go to a tab, previous or next tab (terminal and file tabs) |
+| `⌘1` … `⌘9`, `⇧⌘[`, `⇧⌘]`, `⌃⇥`, `⌃⇧⇥` | `Ctrl+1` … `Ctrl+9`, `Ctrl+PgUp`, `Ctrl+PgDn`, `Ctrl+Tab`, `Ctrl+Shift+Tab` | Go to a tab, previous or next tab (terminal and file tabs, from any view) |
 | `⌃1` … `⌃9`, `⌘↑`, `⌘↓` | `Ctrl+Shift+1` … `9`, `Ctrl+Shift+Up`, `Ctrl+Shift+Down` | Go to a workspace (in sidebar order), previous or next workspace |
 | `⌃⌘↑`, `⌃⌘↓` | `Ctrl+Shift+PgUp`, `Ctrl+Shift+PgDn` | Previous or next session or machine |
 | | `Ctrl+Shift+S` | Switch session or machine (arrows and Enter pick, the next one is preselected) |

@@ -405,26 +405,62 @@ impl Shell {
         Some(gpui::deferred(anchored).with_priority(1).into_any_element())
     }
 
-    /// The Files tab's header buttons: hidden files, git-ignored files (each lit while shown, and saved), and a
-    /// refresh that reads the open folders again and asks git afresh (the poll only asks when names change).
+    /// The Files tab's header buttons: a View menu that shows hidden and git-ignored files (each checked while shown,
+    /// and saved; the button carries an accent dot while either is on), and a refresh that reads the open folders again
+    /// and asks git afresh (the poll only asks when names change).
     fn files_header(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let settings = &SettingsGlobal::of(cx).settings;
-        let (hidden, ignored) = (settings.panel_show_hidden, settings.panel_show_ignored);
-        let toggle = |id: &'static str, icon: &'static str, on: bool, label: &'static str| {
-            titlebar_button(theme, id, icon).when(on, |el| el.bg(theme.selected)).tooltip(tip(label, None))
-        };
+        let filtered = settings.panel_show_hidden || settings.panel_show_ignored;
+        let open = self.files_view_menu.as_ref().is_some_and(|m| m.is_open());
+        let dot = filtered.then(|| div().absolute().top(px(3.)).right(px(3.)).size(px(6.)).rounded_full().bg(theme.accent));
         vec![
-            toggle("files-hidden", "icons/solar/eye.svg", hidden, if hidden { "Hide hidden files" } else { "Show hidden files" })
-                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| save_from_sidebar(cx, |s| s.panel_show_hidden = !hidden)))
-                .into_any_element(),
-            toggle("files-ignored", "icons/solar/eye-closed.svg", ignored, if ignored { "Hide git-ignored files" } else { "Show git-ignored files" })
-                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| save_from_sidebar(cx, |s| s.panel_show_ignored = !ignored)))
+            titlebar_button(theme, "files-view", "icons/solar/filter.svg")
+                .relative()
+                .when(open, |el| el.bg(theme.hover))
+                .children(dot)
+                .tooltip(tip(if filtered { "View: hidden or ignored files are shown" } else { "View: show hidden or ignored files" }, None))
+                // Capture, so a press on the open menu's trigger closes it instead of the menu's click-outside
+                // closing it and the click reopening it (as the root row's menu).
+                .capture_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    match this.files_view_menu.as_mut() {
+                        Some(menu) if menu.is_open() => menu.close(),
+                        _ => this.files_view_menu = Some(crate::ui::Popup::new(e.position)),
+                    }
+                    cx.notify();
+                }))
                 .into_any_element(),
             titlebar_button(theme, "files-refresh", "icons/solar/refresh.svg")
                 .tooltip(tip("Refresh", None))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.side_panel.update(cx, |p, cx| p.refresh_files(cx))))
                 .into_any_element(),
         ]
+    }
+
+    /// The Files header's View menu, while it is up: each choice flips its setting and leaves the menu open, so both
+    /// can be set at once.
+    fn files_view_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.files_view_menu.as_ref()?;
+        let at = menu.value;
+        let settings = &SettingsGlobal::of(cx).settings;
+        let (hidden, ignored) = (settings.panel_show_hidden, settings.panel_show_ignored);
+        let card = menu_card(theme, "files-view-menu", 200.)
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                if let Some(m) = this.files_view_menu.as_mut() {
+                    m.close()
+                }
+                cx.notify();
+            }))
+            .child(
+                menu_choice(theme, "files-view-hidden", "icons/solar/eye.svg", "Show hidden files", hidden)
+                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| save_from_sidebar(cx, |s| s.panel_show_hidden = !hidden))),
+            )
+            .child(
+                menu_choice(theme, "files-view-ignored", "icons/solar/eye-closed.svg", "Show ignored files", ignored)
+                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| save_from_sidebar(cx, |s| s.panel_show_ignored = !ignored))),
+            );
+        let anchored = gpui::anchored().position(at).snap_to_window_with_margin(px(8.)).child(crate::ui::menu_motion("files-view-menu-in", menu, card));
+        Some(gpui::deferred(anchored).with_priority(1).into_any_element())
     }
 
     /// The panel, and its edge: drag to resize, double-click for the default width.
@@ -437,8 +473,13 @@ impl Shell {
             // its row went (the PR tab, a workspace without a root, a machine's): the menu goes with it
             self.root_menu = None;
         }
+        if tab != PanelTab::Files || root.is_none() {
+            // the Files header went, and its View menu with it
+            self.files_view_menu = None;
+        }
         let root_row = root.as_deref().map(|root| self.root_row(theme, root, cx));
         let root_menu = root.as_deref().and_then(|root| self.root_menu(theme, root, context.active_dir.is_some(), cx));
+        let files_view_menu = self.files_view_menu(theme, cx);
         self.side_panel.update(cx, |p, cx| {
             p.set_context(context, cx);
             p.set_tab(tab, cx);
@@ -547,7 +588,8 @@ impl Shell {
             .child(header)
             .child(body)
             .children(footer)
-            .children(root_menu);
+            .children(root_menu)
+            .children(files_view_menu);
         let edge = div()
             .id("panel-resize")
             .on_hover(cx.listener(|this, on: &bool, _, cx| this.hover_seam("panel-resize", *on, cx)))

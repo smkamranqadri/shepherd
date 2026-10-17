@@ -161,6 +161,9 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("Tab9", "cmd-9"),
     ("PreviousTab", "cmd-{"),
     ("NextTab", "cmd-}"),
+    // fork-only: Ctrl+Tab steps the tabs as in a browser, from any view (`GLOBAL_IN_TEXT` keeps it over the editor)
+    ("PreviousTab", "ctrl-shift-tab"),
+    ("NextTab", "ctrl-tab"),
     ("PreviousWorkspace", "cmd-up"),
     ("NextWorkspace", "cmd-down"),
     // the sessions and machines of the sidebar's bar; Cmd+Opt+Up/Down is taken, by focus up and down
@@ -213,17 +216,24 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("FocusUp", "ctrl-alt-up"),
     ("FocusDown", "ctrl-alt-down"),
     ("ToggleZoom", "ctrl-shift-enter"),
-    ("Tab1", "alt-1"),
-    ("Tab2", "alt-2"),
-    ("Tab3", "alt-3"),
-    ("Tab4", "alt-4"),
-    ("Tab5", "alt-5"),
-    ("Tab6", "alt-6"),
-    ("Tab7", "alt-7"),
-    ("Tab8", "alt-8"),
-    ("Tab9", "alt-9"),
+    // fork-only: upstream has the tabs on Alt+1…9; Ctrl+1…9 sit beside the workspaces' Ctrl+Shift+1…9, and holding
+    // Ctrl shows the tabs' numbers (`hints`). A terminal's Ctrl+digit is no key a shell or TUI reads (xterm sends the
+    // plain digit, or a stray control code for 2–8), and gpui-base's text binds no Ctrl+digit.
+    ("Tab1", "ctrl-1"),
+    ("Tab2", "ctrl-2"),
+    ("Tab3", "ctrl-3"),
+    ("Tab4", "ctrl-4"),
+    ("Tab5", "ctrl-5"),
+    ("Tab6", "ctrl-6"),
+    ("Tab7", "ctrl-7"),
+    ("Tab8", "ctrl-8"),
+    ("Tab9", "ctrl-9"),
     ("PreviousTab", "ctrl-pageup"),
     ("NextTab", "ctrl-pagedown"),
+    // fork-only: Ctrl+Tab steps the tabs as in a browser, from a pane, a file, the editor, a diff or a PDF alike
+    // (`GLOBAL_IN_TEXT` keeps it over the editor's text, whose Tab indents)
+    ("PreviousTab", "ctrl-shift-tab"),
+    ("NextTab", "ctrl-tab"),
     // fork-only: upstream has the workspaces on Ctrl+Shift+PageUp/PageDown, which the sessions take here
     ("PreviousWorkspace", "ctrl-shift-up"),
     ("NextWorkspace", "ctrl-shift-down"),
@@ -605,8 +615,11 @@ mod tests {
     #[test]
     fn upstream_actions_keep_upstreams_chords() {
         let upstream = |action: &str| UPSTREAM.iter().any(|(a, _)| *a == action);
-        let ours: Vec<_> = DEFAULTS.iter().filter(|(a, _)| upstream(a)).collect();
+        let ours: Vec<_> = DEFAULTS.iter().filter(|d| upstream(d.0) && !FORK_ADDED.contains(d)).collect();
         assert_eq!(ours.len(), UPSTREAM.len(), "the same number of upstream chords");
+        for added in FORK_ADDED {
+            assert!(DEFAULTS.contains(added), "{added:?}");
+        }
         for (action, chord) in UPSTREAM {
             // but for the fork's deliberate overrides
             let chord = FORK_OVERRIDES.iter().find(|(a, _)| a == action).map_or(chord, |(_, c)| c);
@@ -662,13 +675,67 @@ mod tests {
 
     #[test]
     #[cfg(not(target_os = "macos"))]
-    fn linux_tabs_are_upstreams_alt_digits_and_page_keys() {
+    fn linux_tabs_are_ctrl_digits_and_page_keys_and_ctrl_tab() {
         let eff = effective(&user(&[]));
         for (i, action) in TAB_ACTIONS.iter().enumerate() {
-            assert_eq!(chord(&eff, action), normalize(&format!("alt-{}", i + 1)).as_deref(), "{action}");
+            assert_eq!(chord(&eff, action), normalize(&format!("ctrl-{}", i + 1)).as_deref(), "{action}");
+            // nothing else on the digit: not a workspace, not the text size's Ctrl+0
+            let taken = normalize(&format!("ctrl-{}", i + 1)).unwrap();
+            assert_eq!(eff.iter().filter(|(_, k)| *k == taken).count(), 1, "ctrl-{}", i + 1);
         }
         let bound = |action: &str, keys: &str| eff.iter().any(|(a, k)| a == action && Some(k.as_str()) == normalize(keys).as_deref());
         assert!(bound("NextTab", "ctrl-pagedown") && bound("PreviousTab", "ctrl-pageup"));
+        assert!(bound("NextTab", "ctrl-tab") && bound("PreviousTab", "ctrl-shift-tab"));
+        // Alt+digit is free again (upstream's tabs): nothing binds it
+        for i in 1..=9 {
+            let alt = normalize(&format!("alt-{i}")).unwrap();
+            assert!(!eff.iter().any(|(_, k)| *k == alt), "alt-{i}");
+        }
+        // Ctrl+1 as GPUI's Linux backend reports it fires the first tab, and Ctrl+Shift+1 the first workspace
+        let ctrl_1 = gpui::Keystroke { modifiers: gpui::Modifiers::control(), key: "1".into(), key_char: Some("1".into()) };
+        assert_eq!(fired(&ctrl_1), ["Tab1"]);
+        assert_eq!(fired(&from_xkb("!", true, Some("!"))), ["Workspace1"]);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_tabs_step_on_ctrl_tab_too() {
+        let eff = effective(&user(&[]));
+        let bound = |action: &str, keys: &str| eff.iter().any(|(a, k)| a == action && Some(k.as_str()) == normalize(keys).as_deref());
+        assert!(bound("NextTab", "cmd-}") && bound("PreviousTab", "cmd-{"));
+        assert!(bound("NextTab", "ctrl-tab") && bound("PreviousTab", "ctrl-shift-tab"));
+    }
+
+    /// The tab chords fire in every view a tab can show: a pane, a file viewer, the editor's text, a diff and a PDF.
+    /// A keymap in `apply`'s order, over gpui-base's Input bindings (its Tab and Shift+Tab indent and outdent).
+    #[test]
+    fn the_tab_chords_fire_from_every_view() {
+        let mut text = text_chords_here();
+        text.extend(["tab", "shift-tab"].map(|c| normalize(c).unwrap()));
+        let eff = effective(&user(&[]));
+        let mut keymap = gpui::Keymap::new(text.iter().map(|c| KeyBinding::new(c, gpui_base::input::SelectToStart, Some("Input"))).collect());
+        keymap.add_bindings(placed(&eff, &text).into_iter().filter_map(|(chord, context, action)| binding(action, chord, context)));
+        keymap.add_bindings(pdf_keys());
+        let views = [
+            stack(&["Workspace", "Terminal"]),
+            stack(&["Workspace", "FileEditor", "FileViewer"]),
+            stack(&["Workspace", "FileEditor", "Input"]),
+            stack(&["Workspace", "DiffView"]),
+            stack(&["Workspace", "FileEditor", "FileViewer", PDF_VIEW]),
+        ];
+        let mut chords = vec![("NextTab", "ctrl-tab".to_string()), ("PreviousTab", "ctrl-shift-tab".to_string())];
+        chords.extend(TAB_ACTIONS.iter().map(|a| (*a, chord(&eff, a).unwrap().to_string())));
+        for (action, keys) in chords {
+            let typed = gpui::Keystroke::parse(&keys).unwrap();
+            for at in &views {
+                let fired = keymap.bindings_for_input(std::slice::from_ref(&typed), at).0.first().map(|b| b.action().name().to_string());
+                assert_eq!(fired.as_deref(), Some(format!("shepherd::{action}").as_str()), "{keys} in {at:?}");
+            }
+        }
+        // and the editor's Tab still indents
+        let tab = gpui::Keystroke::parse("tab").unwrap();
+        let fired = keymap.bindings_for_input(&[tab], &views[2]).0.first().map(|b| b.action().name().to_string());
+        assert_eq!(fired.as_deref(), Some("input::SelectToStart"));
     }
 
     fn stack(names: &[&str]) -> Vec<gpui::KeyContext> {
@@ -798,9 +865,14 @@ mod tests {
     fn the_global_chords_still_work_in_the_editor() {
         // bound everywhere, so an editor without a binding of its own for them hears them too
         let text = text_chords_here();
-        for action in ["ClosePane", "CloseTab", "ToggleSidebar", "CommandPanel", "NewTab", "NextTab", "PreviousTab"] {
+        for action in ["ClosePane", "CloseTab", "ToggleSidebar", "CommandPanel", "NewTab", "NextTab", "PreviousTab"].iter().chain(&TAB_ACTIONS) {
             let keys = chord(&effective(&user(&[])), action).unwrap().to_string();
             assert_eq!(contexts(action, &keys, &text), [None], "{action}");
+        }
+        // even were gpui-base to bind the tab chords in its text, they stay app-wide there
+        for (action, keys) in [("NextTab", "ctrl-tab"), ("PreviousTab", "ctrl-shift-tab"), ("Tab1", "ctrl-1"), ("Tab9", "ctrl-9")] {
+            let keys = normalize(keys).unwrap();
+            assert_eq!(contexts(action, &keys, std::slice::from_ref(&keys)), [None], "{action}");
         }
     }
 
@@ -826,9 +898,9 @@ mod tests {
             assert!(fires(typed.clone(), bound), "{action}");
             assert!(!fires(typed, &format!("ctrl-shift-{}", i + 1)), "GPUI never hears ctrl-shift-{} on Linux", i + 1);
         }
-        let alt_1 = gpui::Keystroke { modifiers: gpui::Modifiers::alt(), key: "1".into(), key_char: Some("1".into()) };
-        assert!(fires(alt_1.clone(), chord(&eff, "Tab1").unwrap()));
-        assert!(!fires(alt_1, chord(&eff, "Workspace1").unwrap()), "Alt+1 is a tab, not a workspace");
+        let ctrl_1 = gpui::Keystroke { modifiers: gpui::Modifiers::control(), key: "1".into(), key_char: Some("1".into()) };
+        assert!(fires(ctrl_1.clone(), chord(&eff, "Tab1").unwrap()));
+        assert!(!fires(ctrl_1, chord(&eff, "Workspace1").unwrap()), "Ctrl+1 is a tab, not a workspace");
     }
 
     #[test]
@@ -978,11 +1050,29 @@ mod tests {
         }
     }
 
-    /// Upstream defaults this fork deliberately changes (Linux): the workspaces move to Ctrl+Shift+Up/Down.
+    /// Upstream defaults this fork deliberately changes (Linux): the workspaces move to Ctrl+Shift+Up/Down (the
+    /// sessions take Ctrl+Shift+PageUp/PageDown), and the tabs to Ctrl+1…9, beside the workspaces' Ctrl+Shift+1…9, with
+    /// Ctrl held showing their numbers.
     #[cfg(target_os = "macos")]
     const FORK_OVERRIDES: &[(&str, &str)] = &[];
     #[cfg(not(target_os = "macos"))]
-    const FORK_OVERRIDES: &[(&str, &str)] = &[("PreviousWorkspace", "ctrl-shift-up"), ("NextWorkspace", "ctrl-shift-down")];
+    const FORK_OVERRIDES: &[(&str, &str)] = &[
+        ("PreviousWorkspace", "ctrl-shift-up"),
+        ("NextWorkspace", "ctrl-shift-down"),
+        ("Tab1", "ctrl-1"),
+        ("Tab2", "ctrl-2"),
+        ("Tab3", "ctrl-3"),
+        ("Tab4", "ctrl-4"),
+        ("Tab5", "ctrl-5"),
+        ("Tab6", "ctrl-6"),
+        ("Tab7", "ctrl-7"),
+        ("Tab8", "ctrl-8"),
+        ("Tab9", "ctrl-9"),
+    ];
+
+    /// Chords the fork binds to upstream actions beside upstream's own: Ctrl+Tab and Ctrl+Shift+Tab step the tabs, as
+    /// in a browser, from any view.
+    const FORK_ADDED: &[(&str, &str)] = &[("PreviousTab", "ctrl-shift-tab"), ("NextTab", "ctrl-tab")];
 
     /// gpui-base's Input bindings near the chords added here, as its input state binds them on each OS.
     #[cfg(target_os = "macos")]

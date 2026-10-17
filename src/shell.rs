@@ -163,6 +163,8 @@ pub struct Shell {
     root_guesses: std::collections::BTreeMap<String, bool>,
     /// The panel's root row's `…` menu, at the button.
     root_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
+    /// The Files header's View menu (hidden and ignored files), at the button.
+    files_view_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
     /// The shown branch (its review's key), while its checks run: asked again every `REVIEW_POLL`.
     review_poll: Option<String>,
     /// The shown branch's key at the last render and whether its checks ran: when they stop, CI finished.
@@ -541,6 +543,7 @@ impl Shell {
                     leaving: false,
                     root_guesses: Default::default(),
                     root_menu: None,
+                    files_view_menu: None,
                     review_poll: None,
                     review_last: None,
                     review_acting: Default::default(),
@@ -1330,6 +1333,7 @@ impl Render for Shell {
         crate::ui::reap_popup(&mut self.statusbar_menu, window);
         crate::ui::reap_popup(&mut self.tab_menu, window);
         crate::ui::reap_popup(&mut self.root_menu, window);
+        crate::ui::reap_popup(&mut self.files_view_menu, window);
         crate::ui::reap_popup(&mut self.worktree_dialog, window);
         crate::ui::reap_popup(&mut self.remove_confirm, window);
         crate::ui::reap_popup(&mut self.merge_confirm, window);
