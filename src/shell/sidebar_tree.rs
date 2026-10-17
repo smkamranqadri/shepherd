@@ -178,6 +178,22 @@ pub(super) fn longest_waiting(s: &Snapshot, since: &crate::model::Since) -> Opti
         .map(|p| (p.tab_id.clone(), p.pane_id.clone()))
 }
 
+/// The snapshot the tree reads the session `key` by: the shown one's live (`shown`), another's its watcher's last,
+/// one out of reach included (a stopped one's watcher holds none).
+pub(super) fn tree_snapshot<'a>(w: &'a Watchers, key: &SessionKey, shown: Option<&'a Snapshot>) -> Option<&'a Snapshot> {
+    match w.get(key) {
+        Some(watcher) if watcher.status == Status::Shown => shown,
+        Some(watcher) => watcher.snapshot.as_ref(),
+        None => None,
+    }
+}
+
+/// A session's ●N: its agents waiting or done in the snapshot the tree reads it by. Its row in the tree and the
+/// session switcher count with this one rule.
+pub(super) fn session_waiting(w: &Watchers, key: &SessionKey, shown: Option<&Snapshot>) -> usize {
+    tree_snapshot(w, key, shown).map_or(0, waiting)
+}
+
 /// Folds the session `key` when it is open, opens it when it is folded.
 pub(super) fn toggle_in(collapsed: &mut Vec<String>, key: &str) {
     match collapsed.iter().position(|k| k == key) {
@@ -294,11 +310,10 @@ pub(super) fn tree(places: &[Place], w: &Watchers, collapsed: &HashSet<String>, 
         }
         for (place, status) in list.iter().zip(statuses) {
             let key = SessionKey::of(place);
-            let watcher = w.get(&key);
-            let snapshot = if status == Status::Shown { shown } else { watcher.and_then(|w| w.snapshot.as_ref()) };
+            let snapshot = tree_snapshot(w, &key, shown);
             let folded = show_sessions && collapsed.contains(&key.0);
             if show_sessions {
-                rows.push(TreeRow::Session { key: key.clone(), collapsed: folded, waiting: snapshot.map_or(0, waiting), status });
+                rows.push(TreeRow::Session { key: key.clone(), collapsed: folded, waiting: session_waiting(w, &key, shown), status });
             }
             if folded {
                 continue;
@@ -685,22 +700,10 @@ impl Shell {
         };
         let badge = (waiting > 0).then(|| {
             let goal_key = key.clone();
-            div()
+            waiting_pill(theme, waiting)
                 .id(("tree-waiting", idx))
-                .flex_none()
-                .px(px(5.))
-                .h(px(16.))
-                .flex()
-                .items_center()
-                .gap(px(3.))
-                .rounded(px(8.))
-                .bg(theme.warning.opacity(0.15))
-                .text_size(px(10.))
-                .text_color(theme.warning)
                 .cursor_pointer()
                 .tooltip(tip("Go to the agent that has waited longest", None))
-                .child("●")
-                .child(waiting.to_string())
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     cx.stop_propagation();
                     let found = if this.shown_key().as_ref() == Some(&goal_key) {
@@ -1368,6 +1371,45 @@ mod tests {
             .collect();
         let ws = json!([{"workspace_id": "w1", "label": "web", "number": 1, "active_tab_id": null, "agent_status": "idle", "worktree": null}]);
         Snapshot::from_result(&json!({"snapshot": {"focused_workspace_id": null, "focused_tab_id": null, "focused_pane_id": null, "workspaces": ws, "tabs": [], "panes": panes, "layouts": []}})).unwrap()
+    }
+
+    /// Three sessions, `default` shown: `menqal` with two agents waiting and one at work, the machine `a` out of reach
+    /// with its last snapshot's one waiting agent.
+    fn counted() -> (Vec<Place>, Watchers) {
+        let (places, _) = tree_order(vec![info("default", true), info("menqal", true)], vec![machine("a", "you@box", true)], &[], &[]);
+        let mut w = watched(&places, "default");
+        let now = Instant::now();
+        let m = SessionKey("machine:a".into());
+        w.set_client(&m, Client::at("/tmp/x".into()));
+        w.due(now, super::super::watchers::Activity::Active);
+        w.apply(&key("menqal"), Ok(agents_snapshot(&[("q1", "blocked"), ("q2", "done"), ("q3", "working")])), now);
+        w.apply(&m, Ok(snapshot(&[("w1", None)])), now);
+        w.apply(&m, Err(anyhow::anyhow!("timed out")), now);
+        w.apply(&m, Err(anyhow::anyhow!("timed out")), now);
+        assert_eq!(w.get(&m).unwrap().status, Status::Unreachable);
+        (places, w)
+    }
+
+    #[test]
+    fn a_session_s_count_is_its_tree_row_s_wherever_it_is_read() {
+        let (places, w) = counted();
+        let shown = agents_snapshot(&[("p1", "blocked")]);
+        let m = SessionKey("machine:a".into());
+        assert_eq!(session_waiting(&w, &key("default"), Some(&shown)), 1, "the shown one's live snapshot");
+        assert_eq!(session_waiting(&w, &key("default"), None), 0, "not its watcher's");
+        assert_eq!(session_waiting(&w, &key("menqal"), Some(&shown)), 2, "waiting and done, not working");
+        assert_eq!(session_waiting(&w, &m, Some(&shown)), 1, "out of reach: its last snapshot");
+        assert_eq!(session_waiting(&w, &key("gone"), Some(&shown)), 0);
+        // the tree's rows count the same
+        let rows = tree(&places, &w, &HashSet::new(), Some(&shown));
+        let counts: Vec<(String, usize)> = rows
+            .iter()
+            .filter_map(|r| match r {
+                TreeRow::Session { key, waiting, .. } => Some((key.0.clone(), *waiting)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(counts, [("/tmp/default.sock".to_string(), 1), ("/tmp/menqal.sock".to_string(), 2), ("machine:a".to_string(), 1)]);
     }
 
     #[test]

@@ -801,6 +801,7 @@ impl Shell {
                                 sessions::Place::Session(_) => None,
                             },
                             shown: self.places_shown(place),
+                            waiting: sidebar_tree::session_waiting(&self.watchers, &watchers::SessionKey::of(place), self.snapshot.as_ref()),
                         }
                     })
                     .collect(),

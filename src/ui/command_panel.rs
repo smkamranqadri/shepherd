@@ -80,6 +80,8 @@ pub struct Item {
     pub chords: Vec<String>,
     /// The sidebar's status dot, for agents and for tabs and workspaces with an agent at work.
     pub status: Option<AgentStatus>,
+    /// A session's agents waiting or done, drawn as the tree's ●N after the label when there are any.
+    pub waiting: usize,
     pub run: Run,
 }
 
@@ -302,6 +304,7 @@ pub fn workspace_items(snapshot: Option<&Snapshot>) -> Vec<Item> {
                 hint: None,
                 chords: Vec::new(),
                 status: busy(w.agent_status),
+                waiting: 0,
                 run: Run::Tab(tab),
             })
         })
@@ -322,6 +325,7 @@ pub fn items(snapshot: Option<&Snapshot>, bindings: &[(String, String)], plugin_
             hint: None,
             chords: bindings.iter().find(|(action, _)| action == name).map(|(_, keys)| keys.clone()).into_iter().collect(),
             status: None,
+            waiting: 0,
             run: Run::Action(name),
         })
         .collect();
@@ -334,6 +338,7 @@ pub fn items(snapshot: Option<&Snapshot>, bindings: &[(String, String)], plugin_
         hint: None,
         chords: Vec::new(),
         status: None,
+        waiting: 0,
         run: Run::Herdr(crate::herdr::keys::HerdrCommand { kind: crate::herdr::keys::CommandKind::PluginAction, command: id.clone(), keys: Vec::new() }),
     }));
     let Some(s) = snapshot else { return out };
@@ -349,6 +354,7 @@ pub fn items(snapshot: Option<&Snapshot>, bindings: &[(String, String)], plugin_
                 hint: Some(w.label.clone()),
                 chords: Vec::new(),
                 status: busy(t.agent_status),
+                waiting: 0,
                 run: Run::Tab(t.tab_id.clone()),
             });
         }
@@ -371,6 +377,7 @@ pub fn shortcut_items(bindings: &[(String, String)]) -> Vec<Item> {
             hint: None,
             chords: bindings.iter().filter(|(action, _)| action == name).map(|(_, keys)| keys.clone()).collect(),
             status: None,
+            waiting: 0,
             run: Run::Action(name),
         })
         .collect()
@@ -425,6 +432,7 @@ pub fn agent_items(snapshot: Option<&Snapshot>, sort: AgentSort, since: &Since) 
                 }),
                 chords: Vec::new(),
                 status: Some(p.agent_status),
+                waiting: 0,
                 run: Run::Tab(p.tab_id.clone()),
             }
         })
@@ -446,6 +454,7 @@ pub fn branch_items(refs: &str, current: Option<&str>) -> Vec<Item> {
             hint: (Some(name) == current).then(|| "current".into()),
             chords: Vec::new(),
             status: None,
+            waiting: 0,
             run: Run::Branch(name.to_string()),
         })
         .collect()
@@ -466,6 +475,7 @@ pub fn theme_items(variants: Vec<(String, String)>, dark: bool, current: &str) -
             hint: (id == current).then(|| "current".into()),
             chords: Vec::new(),
             status: None,
+            waiting: 0,
             run: Run::Theme(id),
         })
         .collect()
@@ -498,6 +508,7 @@ pub fn worktree_items(list: &serde_json::Value, repo: &str, home: &str) -> Vec<I
                 }),
                 chords: Vec::new(),
                 status: None,
+                waiting: 0,
                 run: Run::Worktree { repo: repo.to_string(), path, workspace_id },
             })
         })
@@ -516,6 +527,8 @@ pub struct PlaceRow {
     pub remote: Option<String>,
     /// The one shown now.
     pub shown: bool,
+    /// Its agents waiting or done, counted as its row in the tree counts them (`sidebar_tree::session_waiting`).
+    pub waiting: usize,
 }
 
 /// The sidebar bar's sessions and machines, in its order: each with its own icon or a session's or machine's, then
@@ -536,6 +549,7 @@ pub fn place_items(rows: Vec<PlaceRow>) -> Vec<Item> {
                 hint: Some(if row.shown { format!("current · {at}") } else { at }),
                 chords: Vec::new(),
                 status: None,
+                waiting: row.waiting,
                 run: Run::Place(row.key),
             }
         })
@@ -849,6 +863,7 @@ impl Render for Panel {
                             .into_any_element(),
                     })
                     .child(div().flex_1().min_w_0().truncate().child(highlighted(&item.label, &self.query, &theme)))
+                    .when(item.waiting > 0, |el| el.child(crate::shell::widgets::waiting_pill(&theme, item.waiting)))
                     .children(item.hint.clone().map(|hint| div().flex_none().max_w(px(160.)).truncate().text_size(px(12.)).text_color(theme.text_faint).child(hint)))
                     .children(item.status.map(|status| crate::shell::status_dot(status, &theme)))
                     .children(item.chords.iter().map(|chord| div().flex().flex_none().gap(px(4.)).children(chord.split_whitespace().map(|k| kbd(&theme, glyphs(k))))))
@@ -1023,7 +1038,7 @@ mod tests {
 
     fn item(section: Section, label: &str) -> Item {
         let run = if section == Section::Commands { Run::Action("NewTab") } else { Run::Tab("t".into()) };
-        Item { key: label.into(), section, icon: "", mark: None, label: label.into(), hint: None, chords: Vec::new(), status: None, run }
+        Item { key: label.into(), section, icon: "", mark: None, label: label.into(), hint: None, chords: Vec::new(), status: None, waiting: 0, run }
     }
 
     #[test]
@@ -1168,6 +1183,7 @@ mod tests {
             icon: (key == "b").then(|| "🚀".to_string()),
             remote: remote.map(str::to_string),
             shown,
+            waiting: if key == "m" { 3 } else { 0 },
         };
         let items = place_items(vec![row("a", None, true), row("b", None, false), row("m", Some("me@box"), false)]);
         let rows: Vec<_> = items.iter().map(|i| (i.label.as_str(), i.hint.as_deref(), i.icon, i.mark.as_deref())).collect();
@@ -1180,6 +1196,8 @@ mod tests {
             ]
         );
         assert_eq!(items[2].run, Run::Place("m".into()));
+        // each place's ●N as the tree counts it, drawn only when there are any
+        assert_eq!(items.iter().map(|i| i.waiting).collect::<Vec<_>>(), [0, 0, 3]);
         assert_eq!(ranked("remote", &items), ["M"], "a machine is found by where it is");
         assert_eq!(ranked("box", &items), ["M"]);
         // the switcher starts after the current place, wrapping, and on the first when none is current

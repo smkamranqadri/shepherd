@@ -192,6 +192,24 @@ pub(super) fn count_badge(theme: &Theme, count: usize) -> Div {
         .child(count.to_string())
 }
 
+/// A session's agents waiting or done, as ●N in the warning colour: the tree's session rows, the Agents view's
+/// toggle and the session switcher draw the same pill, so the count reads the same everywhere.
+pub(crate) fn waiting_pill(theme: &Theme, n: usize) -> Div {
+    div()
+        .flex_none()
+        .px(px(5.))
+        .h(px(16.))
+        .flex()
+        .items_center()
+        .gap(px(3.))
+        .rounded(px(8.))
+        .bg(theme.warning.opacity(0.15))
+        .text_size(px(10.))
+        .text_color(theme.warning)
+        .child("●")
+        .child(n.to_string())
+}
+
 /// A workspace row with its branch line under the name.
 pub(super) const WS_TWO_LINES: f32 = 46.;
 
