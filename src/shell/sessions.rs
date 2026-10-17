@@ -167,6 +167,7 @@ impl Shell {
         if crate::herdr::relay(&machine, &self.rt).is_ok() {
             crate::herdr::show_machine(Some(machine.target.clone()));
             self.machine_label = Some(machine.label);
+            self.machine_id = Some(machine.id);
         }
     }
 
@@ -364,9 +365,10 @@ impl Shell {
     pub(super) fn switch_machine(&mut self, machine: Machine, cx: &mut Context<Self>) {
         match crate::herdr::relay(&machine, &self.rt) {
             Ok(socket) => {
-                self.move_to(Some(socket.to_string_lossy().into_owned()), Some(machine.id), cx);
+                self.move_to(Some(socket.to_string_lossy().into_owned()), Some(machine.id.clone()), cx);
                 crate::herdr::show_machine(Some(machine.target.clone()));
                 self.machine_label = Some(machine.label);
+                self.machine_id = Some(machine.id);
             }
             Err(e) => crate::ui::toast::error(cx, format!("Couldn't reach {}: {e:#}", machine.label)),
         }
@@ -385,6 +387,7 @@ impl Shell {
         crate::herdr::set_socket(socket.clone()); // also when the settings could not be saved
         crate::herdr::show_machine(None); // a machine's switch names it right after
         self.machine_label = None;
+        self.machine_id = None;
         self.client = socket.map_or_else(Client::local, |p| Client::at(p.into()));
         let key = match &machine {
             Some(id) => format!("machine:{id}"),

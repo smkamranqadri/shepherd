@@ -87,7 +87,8 @@ impl Shell {
         } else {
             let sound = SettingsGlobal::of(cx).settings.notify_sound;
             let key = self.shown_key();
-            crate::notify::show(cx, key.as_ref().map(|k| k.0.as_str()), pane.unwrap_or_default(), title.into(), branch.into(), sound, false);
+            let tag = crate::notify::Tag { key: key.as_ref().map(|k| k.0.as_str()), pane: pane.unwrap_or_default(), state: None };
+            crate::notify::show(cx, &tag, title.into(), branch.into(), sound, false);
         }
     }
 

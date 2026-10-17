@@ -289,6 +289,8 @@ pub struct Shell {
     session_delete: Option<crate::ui::Popup<sessions::Place>>,
     /// The saved machine shown, by its label; `None` for a session on this Mac.
     machine_label: Option<String>,
+    /// And by its id, which keys it (`machine:<id>`) before herdr's list names it.
+    machine_id: Option<String>,
     /// The shortcut hints held up by Ctrl (Cmd on macOS) or Ctrl+Shift (Ctrl on macOS).
     hints: hints::Hints,
     /// The wake-up when the hint modifier has been held long enough.
@@ -404,20 +406,29 @@ impl Shell {
                     let approve = response.action_id.as_deref() == Some(crate::notify::APPROVE);
                     let _ = this.update(cx, |s, cx| {
                         let shown = s.shown_key();
+                        use attention::Route;
                         match attention::route(&response.tag, shown.as_ref(), |k| s.watchers.get(k).is_some()) {
-                            attention::Route::Shown(pane_id) => {
-                                let pane = s.snapshot.as_ref().and_then(|snap| snap.panes.iter().find(|p| p.pane_id == pane_id));
-                                match pane.map(|p| (p.tab_id.clone(), p.pane_id.clone(), p.agent_status)) {
-                                    // only while it still waits: a late press must not type Enter into an agent at work
-                                    Some((_, pane_id, AgentStatus::Blocked)) if approve => s.send(Command::Approve { pane_id }, cx, |_, _, _| {}),
-                                    Some((tab, pane, _)) if !approve => s.show_agent(tab, pane, cx),
-                                    _ => {}
+                            // only the prompt it showed, still waiting: a late press must not type Enter into an agent
+                            // at work, nor into a prompt you have not seen
+                            Route::Shown(target) if approve => {
+                                if s.snapshot.as_ref().is_some_and(|snap| attention::approvable(snap, &target)) {
+                                    s.send(Command::Approve { pane_id: target.pane }, cx, |_, _, _| {});
+                                } else {
+                                    crate::ui::toast::error(cx, "That prompt has changed");
                                 }
                             }
-                            attention::Route::Other(key, pane_id) if approve => s.approve_elsewhere(key, pane_id, cx),
-                            attention::Route::Other(key, pane_id) => s.open_elsewhere(key, pane_id, cx),
-                            attention::Route::Gone if !approve => crate::ui::toast::error(cx, "That session is no longer there"),
-                            attention::Route::Gone => {}
+                            // an Approve whose session the tag does not name answers nothing
+                            Route::Unkeyed(_) if approve => {}
+                            Route::Shown(target) | Route::Unkeyed(target) => {
+                                let pane = s.snapshot.as_ref().and_then(|snap| snap.panes.iter().find(|p| p.pane_id == target.pane));
+                                if let Some((tab, pane)) = pane.map(|p| (p.tab_id.clone(), p.pane_id.clone())) {
+                                    s.show_agent(tab, pane, cx);
+                                }
+                            }
+                            Route::Other(key, target) if approve => s.approve_elsewhere(key, target, cx),
+                            Route::Other(key, target) => s.open_elsewhere(key, target, cx),
+                            Route::Gone if !approve => crate::ui::toast::error(cx, "That session is no longer there"),
+                            Route::Gone => {}
                         }
                     });
                     if !approve {
@@ -618,6 +629,7 @@ impl Shell {
                     session_dialog: None,
                     session_delete: None,
                     machine_label: None,
+                    machine_id: None,
                     hints: Default::default(),
                     hints_wait: None,
                     _hint_keys: hint_keys,
@@ -906,12 +918,12 @@ impl Shell {
         let in_view = self.tab_in_view(cx.active_window().is_some());
         let Some(old) = self.snapshot.as_ref() else { return };
         let told: Vec<_> = attention::alerts(old, next)
-            .filter(|p| in_view.as_deref() != Some(p.tab_id.as_str()))
-            .map(|p| (p.clone(), attention::message(p, next, None)))
+            .filter(|(p, _)| in_view.as_deref() != Some(p.tab_id.as_str()))
+            .map(|(p, worked)| (p.clone(), worked, attention::message(p, next, None)))
             .collect();
         let key = self.shown_key();
-        for (pane, message) in told {
-            self.tell(key.as_ref(), &pane, message, cx);
+        for (pane, worked, message) in told {
+            self.tell(key.as_ref(), &pane, worked, message, cx);
         }
     }
 

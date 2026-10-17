@@ -1,32 +1,46 @@
-//! Agents that need you, in every session: which status changes alert (`alerts`), which of those are told
-//! (`Attention`: an exact repeat never, the same status again only after a while), what the notification says, where
-//! a click on it or its Approve goes (`route`), and the Dock count of every agent waiting anywhere (`badge`).
+//! Agents that need you, in every session: which status changes alert (`alerts`), which of those are posted
+//! (`Attention`: an exact repeat never, the same status again only after a while unless the agent worked in
+//! between), what the notification says, where a click on it or its Approve goes (`route`), and the Dock count of
+//! every agent waiting anywhere (`badge`).
 use super::sidebar_tree::Goal;
 use super::watchers::{Kind, SessionKey};
 use super::*;
 use crate::model::Pane;
+use crate::notify::Tag;
 
 /// An agent across sessions: pane ids repeat from one session to the next.
 pub(super) type AgentKey = (SessionKey, String);
 
-/// The same status from the same agent alerts again only this long after it last did.
+/// The same status from the same agent alerts again only this long after it last did, unless it worked in between.
 pub(super) const COOLDOWN: Duration = Duration::from_secs(10);
 
 /// What was told of an agent is let go this long after, so agents long gone are not kept.
 const FORGET_AFTER: Duration = Duration::from_secs(10 * 60);
 
-/// Panes of `new` whose agent just started waiting, finished, or went from working to idle: herdr reports a finish
-/// as idle, not done, when a client shows the tab, so that is a finish too. Done → idle is the agent being seen, no
-/// news. A pane `old` did not have is no alert, so a reconnect or a new pane never sets off a burst. A wait that came
-/// back between two snapshots (blocked → working → blocked) shows in herdr's growing `state_change_seq`.
-pub(super) fn alerts<'a>(old: &'a Snapshot, new: &'a Snapshot) -> impl Iterator<Item = &'a Pane> {
-    new.panes.iter().filter(|p| {
-        let Some(o) = old.panes.iter().find(|o| o.pane_id == p.pane_id) else { return false };
-        match p.agent_status {
-            s if crate::notify::wants_attention(s) => o.agent_status != s || p.state_change_seq > o.state_change_seq,
-            AgentStatus::Idle => o.agent_status == AgentStatus::Working,
+/// An agent's change worth a notification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Alert {
+    pub pane: String,
+    /// It came out of work (or finished a turn) since the snapshot before: a new prompt, never a flap.
+    pub worked: bool,
+}
+
+/// The agents of `new` that just started waiting or finished. Blocked and done alert as they start, or come back
+/// (blocked → working → blocked between two snapshots shows in herdr's growing `state_change_seq`). Idle alerts only
+/// when its `completion_seq` grew: herdr reports a finish as idle, not done, when a client shows the tab, while an
+/// Esc or a blip at the start turns an agent idle with no finish, and done → idle is it being seen. A pane `old` did
+/// not have is no alert, so a reconnect or a new pane never sets off a burst; a pane with no agent never alerts.
+pub(super) fn alerts<'a>(old: &'a Snapshot, new: &'a Snapshot) -> impl Iterator<Item = (&'a Pane, bool)> {
+    new.panes.iter().filter(|p| p.agent.is_some()).filter_map(|p| {
+        let o = old.panes.iter().find(|o| o.pane_id == p.pane_id)?;
+        let finished = p.completion_seq > o.completion_seq;
+        let again = o.agent_status == p.agent_status && p.state_change_seq > o.state_change_seq;
+        let alert = match p.agent_status {
+            s if crate::notify::wants_attention(s) => o.agent_status != s || again,
+            AgentStatus::Idle => finished,
             _ => false,
-        }
+        };
+        alert.then_some((p, o.agent_status == AgentStatus::Working || finished || again))
     })
 }
 
@@ -45,19 +59,28 @@ pub(super) struct Attention {
 
 impl Attention {
     /// Whether an alert is told, remembered when it is. One change of herdr's (its status and `seq`) is told once,
-    /// however many snapshots bring it; the same status again only once [`COOLDOWN`] is up since it was last told, so
-    /// an agent flipping between working and waiting does not alert on every flip.
-    pub(super) fn tell(&mut self, key: AgentKey, status: AgentStatus, seq: u64, now: Instant) -> bool {
+    /// however many snapshots bring it. The same status again waits out [`COOLDOWN`], so an agent flapping between
+    /// two states does not alert on every flip; one that `worked` in between (a second prompt right after the first
+    /// was answered) is told at once.
+    pub(super) fn tell(&mut self, key: AgentKey, status: AgentStatus, seq: u64, worked: bool, now: Instant) -> bool {
         self.told.retain(|_, t| now.duration_since(t.at) < FORGET_AFTER);
         if let Some(t) = self.told.get(&key)
             && t.status == status
             // an herdr that sends no seq sends 0: then only the cooldown holds repeats back
-            && ((seq != 0 && t.seq == seq) || now.duration_since(t.at) < COOLDOWN)
+            && ((seq != 0 && t.seq == seq) || (!worked && now.duration_since(t.at) < COOLDOWN))
         {
             return false;
         }
         self.told.insert(key, Told { status, seq, at: now });
         true
+    }
+
+    /// Whether to post the alert, and with an Approve button: never while notifications are off (nothing is
+    /// remembered then), nor for a change told already; Approve only for a blocked agent of a session named by its
+    /// key, so a press can never land in whatever session is shown by then.
+    pub(super) fn post(&mut self, enabled: bool, key: Option<&SessionKey>, pane: &Pane, worked: bool, now: Instant) -> Option<bool> {
+        let told = enabled && self.tell((key.cloned().unwrap_or_default(), pane.pane_id.clone()), pane.agent_status, pane.state_change_seq, worked, now);
+        told.then_some(key.is_some() && pane.agent_status == AgentStatus::Blocked)
     }
 
     /// Lets go of the sessions no longer listed.
@@ -89,94 +112,133 @@ pub(super) fn message(pane: &Pane, snapshot: &Snapshot, session: Option<&str>) -
     (title, body)
 }
 
+/// The pane a notification names, and the agent's state (herdr's seq, the pane's terminal) as it was posted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Target {
+    pub pane: String,
+    pub state: Option<(u64, String)>,
+}
+
 /// Where a notification's click or Approve goes.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Route {
-    /// To this pane of the session shown (a tag with no session is one from before keys were in it).
-    Shown(String),
-    /// To this pane of another session.
-    Other(SessionKey, String),
+    /// To a pane of the session shown.
+    Shown(Target),
+    /// To a pane of another session.
+    Other(SessionKey, Target),
+    /// A tag that names no session (from before keys were in it): a click looks in the session shown, an Approve
+    /// does nothing, as it could land in another session than the one posted.
+    Unkeyed(Target),
     /// Its session is no longer there.
     Gone,
 }
 
 /// The notification's session and pane, by its tag; `known` is whether a session is in the tree.
 pub(super) fn route(tag: &str, shown: Option<&SessionKey>, known: impl Fn(&SessionKey) -> bool) -> Route {
-    let (key, pane) = crate::notify::parse_tag(tag);
-    match key.map(|k| SessionKey(k.into())) {
-        None => Route::Shown(pane.into()),
-        Some(k) if shown == Some(&k) => Route::Shown(pane.into()),
-        Some(k) if known(&k) => Route::Other(k, pane.into()),
+    let tag = Tag::parse(tag);
+    let target = Target { pane: tag.pane.into(), state: tag.state.map(|(seq, terminal)| (seq, terminal.into())) };
+    match tag.key.map(|k| SessionKey(k.into())) {
+        None => Route::Unkeyed(target),
+        Some(k) if shown == Some(&k) => Route::Shown(target),
+        Some(k) if known(&k) => Route::Other(k, target),
         Some(_) => Route::Gone,
     }
 }
 
-/// The pane's agent still waits: a late Approve must not type Enter into an agent at work.
-pub(super) fn still_blocked(snapshot: &Snapshot, pane_id: &str) -> bool {
-    snapshot.panes.iter().any(|p| p.pane_id == pane_id && p.agent_status == AgentStatus::Blocked)
+/// The prompt the notification showed still waits: the pane's agent is blocked, at the seq it was posted at, in the
+/// same terminal. An answer in herdr's TUI and a new prompt since, or a restart that reused the pane id, fail it,
+/// so a late Approve never types Enter into a prompt you have not seen.
+pub(super) fn approvable(snapshot: &Snapshot, target: &Target) -> bool {
+    let Some((seq, terminal)) = &target.state else { return false };
+    snapshot.panes.iter().any(|p| {
+        p.pane_id == target.pane && p.agent_status == AgentStatus::Blocked && p.state_change_seq == *seq && &p.terminal_id == terminal
+    })
+}
+
+/// What a click on another session's notification shows.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Open {
+    /// The agent's tab, its pane focused.
+    Pane(String),
+    /// The session, as it was left: none of its snapshot came yet, or the notification names no agent (a CI run's).
+    Session,
+    /// Its snapshot no longer lists the agent.
+    AgentGone,
+}
+
+pub(super) fn open(snapshot: Option<&Snapshot>, pane: &str) -> Open {
+    match snapshot {
+        Some(_) if pane.is_empty() => Open::Session,
+        Some(s) => s.panes.iter().find(|p| p.pane_id == pane).map_or(Open::AgentGone, |p| Open::Pane(p.tab_id.clone())),
+        None => Open::Session,
+    }
 }
 
 impl Shell {
-    /// Posts an alert for the agent of session `key` (none before herdr's list names the session shown), unless it
-    /// was told already or notifications are off.
-    pub(super) fn tell(&mut self, key: Option<&SessionKey>, pane: &Pane, (title, body): (String, String), cx: &mut Context<Self>) {
+    /// Posts an alert for the agent of session `key` (none only before the session shown is known), unless it was
+    /// told already or notifications are off.
+    pub(super) fn tell(&mut self, key: Option<&SessionKey>, pane: &Pane, worked: bool, (title, body): (String, String), cx: &mut Context<Self>) {
         let settings = &SettingsGlobal::of(cx).settings;
         let (notify, sound) = (settings.notify_agents, settings.notify_sound);
-        if !notify || !self.attention.tell((key.cloned().unwrap_or_default(), pane.pane_id.clone()), pane.agent_status, pane.state_change_seq, Instant::now()) {
-            return;
-        }
-        let blocked = pane.agent_status == AgentStatus::Blocked;
-        crate::notify::show(cx, key.map(|k| k.0.as_str()), &pane.pane_id, title, body, sound, blocked);
+        let Some(approve) = self.attention.post(notify, key, pane, worked, Instant::now()) else { return };
+        let tag = Tag { key: key.map(|k| k.0.as_str()), pane: &pane.pane_id, state: Some((pane.state_change_seq, &pane.terminal_id)) };
+        crate::notify::show(cx, &tag, title, body, sound, approve);
     }
 
     /// The alerts a watcher's answer brought: told as from a session not shown.
-    pub(super) fn tell_elsewhere(&mut self, key: &SessionKey, panes: &[String], cx: &mut Context<Self>) {
+    pub(super) fn tell_elsewhere(&mut self, key: &SessionKey, alerts: &[Alert], cx: &mut Context<Self>) {
         let Some(snapshot) = self.watchers.snapshot(key) else { return };
         let session = self.places.iter().find(|p| SessionKey::of(p) == *key).map(|p| p.look(cx).0);
-        let told: Vec<_> = panes
+        let told: Vec<_> = alerts
             .iter()
-            .filter_map(|id| snapshot.panes.iter().find(|p| &p.pane_id == id))
-            .map(|p| (p.clone(), message(p, snapshot, session.as_deref())))
+            .filter_map(|a| Some((snapshot.panes.iter().find(|p| p.pane_id == a.pane)?, a.worked)))
+            .map(|(p, worked)| (p.clone(), worked, message(p, snapshot, session.as_deref())))
             .collect();
-        for (pane, message) in told {
-            self.tell(Some(key), &pane, message, cx);
+        for (pane, worked, message) in told {
+            self.tell(Some(key), &pane, worked, message, cx);
         }
     }
 
     /// A click on another session's notification: that session is shown, its agent's tab up and the pane focused.
-    pub(super) fn open_elsewhere(&mut self, key: SessionKey, pane_id: String, cx: &mut Context<Self>) {
-        let pane = self.watchers.snapshot(&key).and_then(|s| s.panes.iter().find(|p| p.pane_id == pane_id));
-        match pane.map(|p| p.tab_id.clone()) {
-            Some(tab) => self.go_to(key, Goal::Pane { tab, pane: pane_id }, cx),
-            None => crate::ui::toast::error(cx, "That agent is no longer there"),
+    pub(super) fn open_elsewhere(&mut self, key: SessionKey, target: Target, cx: &mut Context<Self>) {
+        match open(self.watchers.snapshot(&key), &target.pane) {
+            Open::Pane(tab) => self.go_to(key, Goal::Pane { tab, pane: target.pane }, cx),
+            Open::AgentGone => crate::ui::toast::error(cx, "That agent is no longer there"),
+            Open::Session => {
+                if let Some(place) = self.places.iter().find(|p| SessionKey::of(p) == key).cloned() {
+                    self.show_place(place, true, cx);
+                }
+            }
         }
     }
 
     /// Approve on another session's notification: Enter in its pane, through that session's own socket, once a fresh
-    /// snapshot says the agent still waits. Shepherd stays where it is.
-    pub(super) fn approve_elsewhere(&mut self, key: SessionKey, pane_id: String, cx: &mut Context<Self>) {
+    /// snapshot says the prompt shown still waits. Shepherd stays where it is.
+    pub(super) fn approve_elsewhere(&mut self, key: SessionKey, target: Target, cx: &mut Context<Self>) {
         let Some(w) = self.watchers.get(&key) else { return };
-        let Some(client) = w.client.clone() else { return };
         let name = w.place.look(cx).0;
+        let Some(client) = w.client.clone() else {
+            return crate::ui::toast::error(cx, format!("Couldn't approve in {name}: not connected to it yet"));
+        };
         let timeout = if w.kind() == Kind::Remote { Duration::from_secs(10) } else { Duration::from_secs(2) };
         let call = self.rt.spawn(async move {
             let ask = async {
                 let snapshot = Snapshot::from_result(&client.call("session.snapshot", json!({})).await?)?;
-                if !still_blocked(&snapshot, &pane_id) {
-                    return Ok(());
+                if !approvable(&snapshot, &target) {
+                    return Ok(false);
                 }
-                let (method, params) = Command::Approve { pane_id }.request();
-                client.call(method, params).await.map(|_| ())
+                let (method, params) = Command::Approve { pane_id: target.pane }.request();
+                client.call(method, params).await.map(|_| true)
             };
             match tokio::time::timeout(timeout, ask).await {
                 Ok(done) => done,
                 Err(_) => Err(anyhow::anyhow!("no answer in {} s", timeout.as_secs())),
             }
         });
-        cx.spawn(async move |_, cx| {
-            if let Err(e) = call.await.map_err(anyhow::Error::from).and_then(|r| r) {
-                cx.update(|cx| crate::ui::toast::error(cx, format!("Couldn't approve in {name}: {e:#}")));
-            }
+        cx.spawn(async move |_, cx| match call.await.map_err(anyhow::Error::from).and_then(|r| r) {
+            Ok(true) => {}
+            Ok(false) => cx.update(|cx| crate::ui::toast::error(cx, format!("That prompt in {name} has changed"))),
+            Err(e) => cx.update(|cx| crate::ui::toast::error(cx, format!("Couldn't approve in {name}: {e:#}"))),
         })
         .detach();
     }
@@ -186,19 +248,27 @@ impl Shell {
 mod tests {
     use super::*;
 
-    /// Panes as (id, status, seq), each a claude agent of workspace w1 ("api").
-    fn snapshot(panes: &[(&str, &str, u64)]) -> Snapshot {
-        let agents: Vec<_> = panes.iter().map(|(id, _, seq)| json!({"pane_id": id, "state_change_seq": seq})).collect();
+    /// Panes as (id, status, seq, completion seq), each a claude agent of workspace w1 ("api") in terminal
+    /// `term-<id>`; an id starting `sh` is a plain shell, no agent.
+    fn snapshot(panes: &[(&str, &str, u64, Option<u64>)]) -> Snapshot {
+        let agents: Vec<_> = panes.iter().map(|(id, _, seq, done)| json!({"pane_id": id, "state_change_seq": seq, "completion_seq": done})).collect();
         let panes: Vec<_> = panes
             .iter()
-            .map(|(id, status, _)| json!({"pane_id": id, "tab_id": format!("t-{id}"), "workspace_id": "w1", "terminal_id": id, "agent_status": status, "agent": "claude"}))
+            .map(|(id, status, _, _)| {
+                let agent = (!id.starts_with("sh")).then_some("claude");
+                json!({"pane_id": id, "tab_id": format!("t-{id}"), "workspace_id": "w1", "terminal_id": format!("term-{id}"), "agent_status": status, "agent": agent})
+            })
             .collect();
         let ws = json!([{"workspace_id": "w1", "label": "api", "number": 1, "active_tab_id": null, "agent_status": "idle", "worktree": null}]);
         Snapshot::from_result(&json!({"snapshot": {"focused_workspace_id": null, "focused_tab_id": null, "focused_pane_id": null, "workspaces": ws, "tabs": [], "panes": panes, "agents": agents, "layouts": []}})).unwrap()
     }
 
     fn ids(old: &Snapshot, new: &Snapshot) -> Vec<String> {
-        alerts(old, new).map(|p| p.pane_id.clone()).collect()
+        alerts(old, new).map(|(p, _)| p.pane_id.clone()).collect()
+    }
+
+    fn worked(old: &Snapshot, new: &Snapshot) -> Vec<bool> {
+        alerts(old, new).map(|(_, w)| w).collect()
     }
 
     fn key(name: &str) -> SessionKey {
@@ -206,87 +276,130 @@ mod tests {
     }
 
     #[test]
+    fn completion_seq_is_read_from_the_agents() {
+        let s = snapshot(&[("p1", "idle", 852, Some(852)), ("p2", "working", 898, None)]);
+        assert_eq!((s.panes[0].completion_seq, s.panes[1].completion_seq), (Some(852), None));
+    }
+
+    #[test]
     fn waiting_and_finishing_alert_and_staying_put_does_not() {
-        let old = snapshot(&[("p1", "working", 1), ("p2", "working", 1), ("p3", "idle", 1)]);
-        let new = snapshot(&[("p1", "blocked", 2), ("p2", "done", 2), ("p3", "working", 2)]);
+        let old = snapshot(&[("p1", "working", 1, None), ("p2", "working", 1, None), ("p3", "idle", 1, None)]);
+        let new = snapshot(&[("p1", "blocked", 2, None), ("p2", "done", 2, Some(2)), ("p3", "working", 2, None)]);
         assert_eq!(ids(&old, &new), ["p1", "p2"]);
+        assert_eq!(worked(&old, &new), [true, true], "both came out of work");
         assert!(ids(&new, &new).is_empty(), "a status that stays is no news");
     }
 
     #[test]
     fn answered_then_done_alerts_again() {
-        assert_eq!(ids(&snapshot(&[("p1", "blocked", 1)]), &snapshot(&[("p1", "done", 3)])), ["p1"]);
+        assert_eq!(ids(&snapshot(&[("p1", "blocked", 1, None)]), &snapshot(&[("p1", "done", 3, Some(3))])), ["p1"]);
     }
 
     #[test]
     fn a_wait_that_came_back_between_snapshots_alerts_by_its_seq() {
-        assert_eq!(ids(&snapshot(&[("p1", "blocked", 4)]), &snapshot(&[("p1", "blocked", 6)])), ["p1"]);
-        assert!(ids(&snapshot(&[("p1", "blocked", 6)]), &snapshot(&[("p1", "blocked", 6)])).is_empty());
+        let (old, new) = (snapshot(&[("p1", "blocked", 4, None)]), snapshot(&[("p1", "blocked", 6, None)]));
+        assert_eq!((ids(&old, &new), worked(&old, &new)), (vec!["p1".to_string()], vec![true]));
+        assert!(ids(&new, &new).is_empty());
     }
 
     #[test]
-    fn working_to_idle_is_a_finish_and_seen_idle_is_not() {
-        assert_eq!(ids(&snapshot(&[("p1", "working", 1)]), &snapshot(&[("p1", "idle", 2)])), ["p1"]);
-        // working → done told the finish; done → idle (seen) and blocked → idle add nothing
-        assert!(ids(&snapshot(&[("p1", "done", 2)]), &snapshot(&[("p1", "idle", 3)])).is_empty());
-        assert!(ids(&snapshot(&[("p1", "blocked", 2)]), &snapshot(&[("p1", "idle", 3)])).is_empty());
-        assert!(ids(&snapshot(&[("p1", "idle", 2)]), &snapshot(&[("p1", "idle", 5)])).is_empty());
-        assert!(ids(&snapshot(&[("p1", "idle", 2)]), &snapshot(&[("p1", "working", 3)])).is_empty());
+    fn idle_is_a_finish_only_when_a_turn_completed() {
+        // a finish herdr reports as idle (a client shows the tab), also when the poll missed the work in between
+        assert_eq!(ids(&snapshot(&[("p1", "working", 1, Some(1))]), &snapshot(&[("p1", "idle", 2, Some(2))])), ["p1"]);
+        assert_eq!(ids(&snapshot(&[("p1", "working", 1, None)]), &snapshot(&[("p1", "idle", 2, Some(2))])), ["p1"]);
+        assert_eq!(ids(&snapshot(&[("p1", "done", 2, Some(2))]), &snapshot(&[("p1", "idle", 5, Some(5))])), ["p1"], "done → working → idle");
+        assert_eq!(ids(&snapshot(&[("p1", "blocked", 2, None)]), &snapshot(&[("p1", "idle", 5, Some(5))])), ["p1"], "blocked → working → idle");
+        // an Esc, a blip at the start, or a done agent seen: idle without a finish
+        assert!(ids(&snapshot(&[("p1", "working", 1, Some(1))]), &snapshot(&[("p1", "idle", 2, Some(1))])).is_empty());
+        assert!(ids(&snapshot(&[("p1", "working", 1, None)]), &snapshot(&[("p1", "idle", 2, None)])).is_empty());
+        assert!(ids(&snapshot(&[("p1", "done", 2, Some(2))]), &snapshot(&[("p1", "idle", 3, Some(2))])).is_empty());
+        assert!(ids(&snapshot(&[("p1", "idle", 2, None)]), &snapshot(&[("p1", "working", 3, None)])).is_empty());
     }
 
     #[test]
-    fn panes_new_to_the_snapshot_do_not_alert() {
-        assert!(ids(&snapshot(&[]), &snapshot(&[("p1", "done", 1), ("p2", "idle", 1)])).is_empty());
+    fn panes_new_to_the_snapshot_or_without_an_agent_do_not_alert() {
+        assert!(ids(&snapshot(&[]), &snapshot(&[("p1", "done", 1, Some(1)), ("p2", "idle", 1, Some(1))])).is_empty());
+        let old = snapshot(&[("sh1", "working", 1, None), ("sh2", "working", 1, Some(1))]);
+        assert!(ids(&old, &snapshot(&[("sh1", "done", 2, Some(2)), ("sh2", "idle", 2, Some(2))])).is_empty());
     }
 
     #[test]
     fn one_change_is_told_once_however_late_it_comes_again() {
         let (mut a, t0) = (Attention::default(), Instant::now());
         let p1 = (key("menqal"), "w1:p1".to_string());
-        assert!(a.tell(p1.clone(), AgentStatus::Blocked, 7, t0));
-        assert!(!a.tell(p1.clone(), AgentStatus::Blocked, 7, t0 + COOLDOWN * 3), "the same seq is the same change");
-        assert!(a.tell(p1, AgentStatus::Blocked, 8, t0 + COOLDOWN * 3), "a new one after the cooldown");
+        assert!(a.tell(p1.clone(), AgentStatus::Blocked, 7, true, t0));
+        assert!(!a.tell(p1.clone(), AgentStatus::Blocked, 7, true, t0 + COOLDOWN * 3), "the same seq is the same change");
+        assert!(a.tell(p1, AgentStatus::Blocked, 8, false, t0 + COOLDOWN * 3), "a new one after the cooldown");
     }
 
     #[test]
-    fn the_same_status_again_waits_out_the_cooldown() {
+    fn the_same_status_flapping_waits_out_the_cooldown() {
         let (mut a, t0) = (Attention::default(), Instant::now());
         let p1 = (key("menqal"), "w1:p1".to_string());
-        assert!(a.tell(p1.clone(), AgentStatus::Done, 1, t0));
-        assert!(!a.tell(p1.clone(), AgentStatus::Done, 3, t0 + COOLDOWN - Duration::from_millis(1)));
-        assert!(a.tell(p1.clone(), AgentStatus::Blocked, 4, t0 + Duration::from_secs(1)), "another status is news at once");
-        assert!(a.tell(p1.clone(), AgentStatus::Blocked, 6, t0 + Duration::from_secs(1) + COOLDOWN), "again once it is up");
+        assert!(a.tell(p1.clone(), AgentStatus::Done, 1, true, t0));
+        assert!(!a.tell(p1.clone(), AgentStatus::Done, 3, false, t0 + COOLDOWN - Duration::from_millis(1)), "no work in between");
+        assert!(a.tell(p1.clone(), AgentStatus::Blocked, 4, false, t0 + Duration::from_secs(1)), "another status is news at once");
+        assert!(a.tell(p1.clone(), AgentStatus::Blocked, 6, false, t0 + Duration::from_secs(1) + COOLDOWN), "again once it is up");
         // an herdr that sends no seq: the cooldown alone holds repeats back
         let p2 = (key("menqal"), "w1:p2".to_string());
-        assert!(a.tell(p2.clone(), AgentStatus::Done, 0, t0));
-        assert!(!a.tell(p2.clone(), AgentStatus::Done, 0, t0 + Duration::from_secs(1)));
-        assert!(a.tell(p2, AgentStatus::Done, 0, t0 + COOLDOWN));
+        assert!(a.tell(p2.clone(), AgentStatus::Done, 0, true, t0));
+        assert!(!a.tell(p2.clone(), AgentStatus::Done, 0, false, t0 + Duration::from_secs(1)));
+        assert!(a.tell(p2, AgentStatus::Done, 0, false, t0 + COOLDOWN));
+    }
+
+    #[test]
+    fn back_to_back_prompts_are_both_told() {
+        // blocked, answered (working), blocked again 3 s on: a second permission prompt, not a flap
+        let (mut a, t0) = (Attention::default(), Instant::now());
+        let p1 = (key("menqal"), "w1:p1".to_string());
+        let first = snapshot(&[("p1", "blocked", 5, None)]);
+        let answered = snapshot(&[("p1", "working", 6, None)]);
+        let second = snapshot(&[("p1", "blocked", 7, None)]);
+        assert!(ids(&first, &answered).is_empty());
+        assert_eq!(worked(&answered, &second), [true]);
+        assert!(a.tell(p1.clone(), AgentStatus::Blocked, 5, true, t0));
+        assert!(a.tell(p1.clone(), AgentStatus::Blocked, 7, true, t0 + Duration::from_secs(3)));
+        // the poll missed the work in between: the seq grew on the same status, still a new prompt
+        assert_eq!(worked(&second, &snapshot(&[("p1", "blocked", 9, None)])), [true]);
+        assert!(a.tell(p1, AgentStatus::Blocked, 9, true, t0 + Duration::from_secs(5)));
     }
 
     #[test]
     fn the_same_pane_id_in_two_sessions_is_two_agents() {
         let (mut a, t0) = (Attention::default(), Instant::now());
-        assert!(a.tell((key("default"), "w1:p1".into()), AgentStatus::Blocked, 3, t0));
-        assert!(a.tell((key("menqal"), "w1:p1".into()), AgentStatus::Blocked, 3, t0));
+        assert!(a.tell((key("default"), "w1:p1".into()), AgentStatus::Blocked, 3, true, t0));
+        assert!(a.tell((key("menqal"), "w1:p1".into()), AgentStatus::Blocked, 3, true, t0));
     }
 
     #[test]
     fn a_session_let_go_and_old_alerts_are_forgotten() {
         let (mut a, t0) = (Attention::default(), Instant::now());
         let p1 = (key("menqal"), "w1:p1".to_string());
-        a.tell(p1.clone(), AgentStatus::Blocked, 3, t0);
-        a.tell((key("default"), "w1:p1".into()), AgentStatus::Blocked, 3, t0);
+        a.tell(p1.clone(), AgentStatus::Blocked, 3, true, t0);
+        a.tell((key("default"), "w1:p1".into()), AgentStatus::Blocked, 3, true, t0);
         a.keep_sessions(|k| *k == key("default"));
         assert_eq!(a.told.len(), 1);
-        assert!(a.tell(p1, AgentStatus::Blocked, 3, t0), "menqal's was let go");
-        a.tell((key("x"), "w1:p1".into()), AgentStatus::Done, 1, t0 + FORGET_AFTER);
+        assert!(a.tell(p1, AgentStatus::Blocked, 3, true, t0), "menqal's was let go");
+        a.tell((key("x"), "w1:p1".into()), AgentStatus::Done, 1, true, t0 + FORGET_AFTER);
         assert_eq!(a.told.len(), 1, "only the one told just now is kept");
     }
 
     #[test]
+    fn nothing_posts_with_notifications_off_and_approve_needs_a_known_session() {
+        let (mut a, t0) = (Attention::default(), Instant::now());
+        let s = snapshot(&[("p1", "blocked", 3, None), ("p2", "done", 3, Some(3))]);
+        assert_eq!(a.post(false, Some(&key("menqal")), &s.panes[0], true, t0), None, "notifications off");
+        assert!(a.told.is_empty(), "nothing is remembered while they are off");
+        assert_eq!(a.post(true, Some(&key("menqal")), &s.panes[0], true, t0), Some(true));
+        assert_eq!(a.post(true, Some(&key("menqal")), &s.panes[0], true, t0), None, "told already");
+        assert_eq!(a.post(true, Some(&key("menqal")), &s.panes[1], true, t0), Some(false), "a finish has nothing to approve");
+        assert_eq!(a.post(true, None, &s.panes[0], true, t0), Some(false), "no key: no Approve");
+    }
+
+    #[test]
     fn the_badge_counts_every_waiting_agent_in_every_session() {
-        let shown = snapshot(&[("p1", "blocked", 1), ("p2", "working", 1), ("p3", "idle", 1)]);
-        let other = snapshot(&[("p1", "done", 1), ("p2", "blocked", 1)]);
+        let shown = snapshot(&[("p1", "blocked", 1, None), ("p2", "working", 1, None), ("p3", "idle", 1, None)]);
+        let other = snapshot(&[("p1", "done", 1, Some(1)), ("p2", "blocked", 1, None)]);
         assert_eq!(badge([&shown, &other]), 3);
         assert_eq!(badge([&other]), 2);
         assert_eq!(badge([]), 0);
@@ -294,7 +407,7 @@ mod tests {
 
     #[test]
     fn the_title_names_the_session_only_when_asked() {
-        let s = snapshot(&[("p1", "blocked", 1), ("p2", "idle", 2)]);
+        let s = snapshot(&[("p1", "blocked", 1, None), ("p2", "idle", 2, Some(2))]);
         assert_eq!(message(&s.panes[0], &s, None), ("claude · api".into(), "Waiting for you".into()));
         assert_eq!(message(&s.panes[1], &s, Some("menqal")), ("claude · api — menqal".into(), "Done".into()));
     }
@@ -303,19 +416,42 @@ mod tests {
     fn a_notification_routes_by_its_session() {
         let (shown, other) = (key("default"), key("menqal"));
         let known = |k: &SessionKey| *k == shown || *k == other;
-        let tag = |k: &SessionKey| crate::notify::tag(Some(&k.0), "w1:p1", 5);
-        assert_eq!(route(&tag(&shown), Some(&shown), known), Route::Shown("w1:p1".into()));
-        assert_eq!(route(&tag(&other), Some(&shown), known), Route::Other(other.clone(), "w1:p1".into()));
+        let tag = |k: &SessionKey| Tag { key: Some(&k.0), pane: "w1:p1", state: Some((5, "term-p1")) }.format(9);
+        let target = Target { pane: "w1:p1".into(), state: Some((5, "term-p1".into())) };
+        assert_eq!(route(&tag(&shown), Some(&shown), known), Route::Shown(target.clone()));
+        assert_eq!(route(&tag(&other), Some(&shown), known), Route::Other(other.clone(), target.clone()));
         assert_eq!(route(&tag(&key("gone")), Some(&shown), known), Route::Gone);
-        assert_eq!(route("w1:p1#5", Some(&shown), known), Route::Shown("w1:p1".into()), "a tag from before keys");
         let machine = SessionKey("machine:box".into());
-        assert_eq!(route(&tag(&machine), None, |k| *k == machine), Route::Other(machine.clone(), "w1:p1".into()));
+        assert_eq!(route(&tag(&machine), None, |k| *k == machine), Route::Other(machine.clone(), target));
     }
 
     #[test]
-    fn approve_needs_the_agent_still_waiting() {
-        let s = snapshot(&[("p1", "blocked", 1), ("p2", "working", 1)]);
-        assert!(still_blocked(&s, "p1"));
-        assert!(!still_blocked(&s, "p2") && !still_blocked(&s, "p9"));
+    fn a_tag_without_a_session_never_routes_into_one() {
+        let shown = key("default");
+        let unkeyed = Route::Unkeyed(Target { pane: "w1:p1".into(), state: None });
+        assert_eq!(route("w1:p1#5", Some(&shown), |_| true), unkeyed, "a tag from before keys");
+        let bare = Tag { key: None, pane: "w1:p1", state: Some((5, "term-p1")) }.format(9);
+        assert_eq!(route(&bare, Some(&shown), |_| true), Route::Unkeyed(Target { pane: "w1:p1".into(), state: Some((5, "term-p1".into())) }));
+    }
+
+    #[test]
+    fn approve_needs_the_same_prompt_still_waiting() {
+        let s = snapshot(&[("p1", "blocked", 5, None), ("p2", "working", 5, None)]);
+        let t = |pane: &str, seq: u64, terminal: &str| Target { pane: pane.into(), state: Some((seq, terminal.into())) };
+        assert!(approvable(&s, &t("p1", 5, "term-p1")));
+        assert!(!approvable(&s, &t("p1", 4, "term-p1")), "answered and blocked anew since");
+        assert!(!approvable(&s, &t("p1", 5, "term-old")), "a restart reused the pane id");
+        assert!(!approvable(&s, &t("p2", 5, "term-p2")), "at work");
+        assert!(!approvable(&s, &t("p9", 5, "term-p9")), "gone");
+        assert!(!approvable(&s, &Target { pane: "p1".into(), state: None }), "a tag without the state approves nothing");
+    }
+
+    #[test]
+    fn a_click_elsewhere_shows_the_pane_else_the_session() {
+        let s = snapshot(&[("p1", "blocked", 5, None)]);
+        assert_eq!(open(Some(&s), "p1"), Open::Pane("t-p1".into()));
+        assert_eq!(open(Some(&s), "p9"), Open::AgentGone);
+        assert_eq!(open(None, "p1"), Open::Session, "connecting, or stopped: no snapshot yet");
+        assert_eq!(open(Some(&s), ""), Open::Session, "a CI run's notification names no agent");
     }
 }

@@ -23,35 +23,53 @@ const KEY_SEP: char = '\u{1f}';
 /// Between the pane and the post's time in a notification's tag.
 const TAG_SEP: char = '#';
 
-/// A notification's tag: the session's key (none for a post that names no session), the pane, and the post's time.
-/// The key is in it because pane ids repeat from one session to the next.
-pub fn tag(key: Option<&str>, pane_id: &str, millis: u128) -> String {
-    match key {
-        Some(key) => format!("{key}{KEY_SEP}{pane_id}{TAG_SEP}{millis}"),
-        None => format!("{pane_id}{TAG_SEP}{millis}"),
-    }
+/// What a notification's tag names: the session's key (none in a tag from before keys were in it), the pane, and
+/// the agent's state as posted, herdr's `state_change_seq` and the pane's terminal, so a late Approve can tell the
+/// prompt is still the one it showed. Pane ids repeat from one session to the next, and a restarted session reuses
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tag<'a> {
+    pub key: Option<&'a str>,
+    pub pane: &'a str,
+    pub state: Option<(u64, &'a str)>,
 }
 
-/// The session's key and the pane a notification's tag names. A tag from before keys were in it names none, which
-/// reads as the session shown.
-pub fn parse_tag(tag: &str) -> (Option<&str>, &str) {
-    let (key, rest) = match tag.rsplit_once(KEY_SEP) {
-        Some((key, rest)) => (Some(key), rest),
-        None => (None, tag),
-    };
-    (key, rest.split(TAG_SEP).next().unwrap_or(rest))
+impl Tag<'_> {
+    /// The tag of a post at `millis`: `key␟pane#seq#terminal#millis`, or `key␟pane#millis` without the state.
+    pub fn format(&self, millis: u128) -> String {
+        let key = self.key.map(|k| format!("{k}{KEY_SEP}")).unwrap_or_default();
+        match self.state {
+            Some((seq, terminal)) => format!("{key}{}{TAG_SEP}{seq}{TAG_SEP}{terminal}{TAG_SEP}{millis}", self.pane),
+            None => format!("{key}{}{TAG_SEP}{millis}", self.pane),
+        }
+    }
+
+    /// A tag read back. The key ends at the last `␟`; after it, the pane, the state when it was posted with one, and
+    /// the time.
+    pub fn parse(tag: &str) -> Tag<'_> {
+        let (key, rest) = match tag.rsplit_once(KEY_SEP) {
+            Some((key, rest)) => (Some(key), rest),
+            None => (None, tag),
+        };
+        let parts: Vec<&str> = rest.split(TAG_SEP).collect();
+        let state = match parts[..] {
+            [_, seq, terminal, _] => seq.parse().ok().map(|seq| (seq, terminal)),
+            _ => None,
+        };
+        Tag { key, pane: parts[0], state }
+    }
 }
 
 /// The id of a waiting agent's Approve button.
 pub const APPROVE: &str = "approve";
 
-/// Posts a notification tagged with the session's key and the pane, so a click can bring that pane up; `approve`
-/// adds a button that answers the agent from the notification.
-pub fn show(cx: &App, key: Option<&str>, pane_id: &str, title: String, body: String, sound: bool, approve: bool) {
+/// Posts a notification tagged with `tag`, so a click can bring that pane up; `approve` adds a button that answers
+/// the agent from the notification.
+pub fn show(cx: &App, tag: &Tag, title: String, body: String, sound: bool, approve: bool) {
     if can_notify() {
         cx.show_system_notification(SystemNotification {
             // macOS replaces a delivered notification with the same tag without a banner: one tag per post
-            tag: tag(key, pane_id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()).into(),
+            tag: tag.format(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()).into(),
             title: title.into(),
             body: body.into(),
             actions: approve.then(|| SystemNotificationAction { id: APPROVE.into(), label: "Approve".into() }).into_iter().collect(),
@@ -236,16 +254,21 @@ mod tests {
     }
 
     #[test]
-    fn a_tag_names_its_session_and_pane() {
+    fn a_tag_names_its_session_pane_and_the_state_it_was_posted_in() {
         let key = "/tmp/herdr #2/api.sock";
-        assert_eq!(parse_tag(&tag(Some(key), "w2:p1", 1791794600123)), (Some(key), "w2:p1"));
-        assert_eq!(parse_tag(&tag(Some("machine:box"), "w1:p3", 5)), (Some("machine:box"), "w1:p3"));
-        assert_eq!(parse_tag(&tag(None, "w2:p1", 5)), (None, "w2:p1"));
+        let t = Tag { key: Some(key), pane: "w2:p1", state: Some((852, "term_65dd")) };
+        assert_eq!(t.format(1791794600123), "/tmp/herdr #2/api.sock\u{1f}w2:p1#852#term_65dd#1791794600123");
+        assert_eq!(Tag::parse(&t.format(1791794600123)), t);
+        let machine = Tag { key: Some("machine:box"), pane: "w1:p3", state: None };
+        assert_eq!(Tag::parse(&machine.format(5)), machine);
+        let bare = Tag { key: None, pane: "", state: None };
+        assert_eq!(Tag::parse(&bare.format(5)), bare, "the CI's notification names no pane");
     }
 
     #[test]
-    fn a_tag_from_before_keys_names_no_session() {
-        assert_eq!(parse_tag("w2:p1#1791794600123"), (None, "w2:p1"));
-        assert_eq!(parse_tag("w2:p1"), (None, "w2:p1"));
+    fn a_tag_from_before_keys_names_no_session_nor_state() {
+        assert_eq!(Tag::parse("w2:p1#1791794600123"), Tag { key: None, pane: "w2:p1", state: None });
+        assert_eq!(Tag::parse("w2:p1"), Tag { key: None, pane: "w2:p1", state: None });
+        assert_eq!(Tag::parse("/s.sock\u{1f}w2:p1#1791794600123"), Tag { key: Some("/s.sock"), pane: "w2:p1", state: None });
     }
 }

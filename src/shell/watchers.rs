@@ -91,6 +91,9 @@ pub(super) struct Watcher {
     /// Started from the tree: until then it is connecting, its missing server is no news, and a second start is
     /// ignored.
     starting_until: Option<Instant>,
+    /// Moves on with each switch to or from the session (`park`, `unpark`): a poll asked for before one is answered
+    /// against a snapshot it never saw, so its answer is dropped.
+    generation: u64,
 }
 
 impl Watcher {
@@ -108,6 +111,7 @@ impl Watcher {
             in_flight: false,
             listed_running: running(&place),
             starting_until: None,
+            generation: 0,
             place,
         }
     }
@@ -148,9 +152,9 @@ pub(super) struct Applied {
     pub changed: bool,
     /// The session turned out stopped: herdr's list is read again.
     pub stopped: bool,
-    /// The panes whose agents just started waiting or finished (`attention::alerts`): only from a session that was
-    /// live with a snapshot before, so its first answer, and one after it was unreachable or stopped, tell nothing.
-    pub alerts: Vec<String>,
+    /// The agents that just started waiting or finished (`attention::alerts`): only from a session that was live
+    /// with a snapshot before, so its first answer, and one after it was unreachable or stopped, tell nothing.
+    pub alerts: Vec<super::attention::Alert>,
 }
 
 /// Every place's watcher, in the tree's order.
@@ -213,9 +217,10 @@ impl Watchers {
         self.order = keys;
     }
 
-    /// The watchers due a poll now, each marked in flight until its answer is applied: its key, its socket and how
-    /// long the call may take. A machine's watcher without its relay yet is skipped (`without_client`).
-    pub(super) fn due(&mut self, now: Instant, activity: Activity) -> Vec<(SessionKey, Client, Duration)> {
+    /// The watchers due a poll now, each marked in flight until its answer is applied: its key, its socket, how long
+    /// the call may take and its generation, which the answer brings back. A machine's watcher without its relay yet
+    /// is skipped (`without_client`).
+    pub(super) fn due(&mut self, now: Instant, activity: Activity) -> Vec<(SessionKey, Client, Duration, u64)> {
         self.activity = activity;
         let mut due = Vec::new();
         for key in &self.order {
@@ -230,9 +235,20 @@ impl Watchers {
             }
             let Some(client) = w.client.clone() else { continue };
             w.in_flight = true;
-            due.push((key.clone(), client, timeout(w.kind(), w.failures, w.fetched.is_none())));
+            due.push((key.clone(), client, timeout(w.kind(), w.failures, w.fetched.is_none()), w.generation));
         }
         due
+    }
+
+    /// A poll's answer, asked for at `generation`: dropped when a switch to or from the session came since.
+    pub(super) fn answer(&mut self, key: &SessionKey, generation: u64, result: anyhow::Result<Snapshot>, now: Instant) -> Applied {
+        match self.map.get_mut(key) {
+            Some(w) if w.generation != generation => {
+                w.in_flight = false;
+                Applied::default()
+            }
+            _ => self.apply(key, result, now),
+        }
     }
 
     /// A poll's answer: a snapshot (`changed` only when its digest or the status moved), no server (stopped), or a
@@ -259,7 +275,9 @@ impl Watchers {
                 snapshot.track(&mut w.since, now);
                 let changed = digest != w.digest || w.status != Status::Live || w.error.is_some() || w.snapshot.is_none();
                 let alerts = match (&w.snapshot, w.status) {
-                    (Some(old), Status::Live) => super::attention::alerts(old, &snapshot).map(|p| p.pane_id.clone()).collect(),
+                    (Some(old), Status::Live) => super::attention::alerts(old, &snapshot)
+                        .map(|(p, worked)| super::attention::Alert { pane: p.pane_id.clone(), worked })
+                        .collect(),
                     _ => Vec::new(),
                 };
                 (w.digest, w.snapshot, w.status, w.error) = (digest, Some(snapshot), Status::Live, None);
@@ -289,6 +307,7 @@ impl Watchers {
     /// The session left keeps its last snapshot and its agents' clocks in its watcher, and is polled from now on.
     pub(super) fn park(&mut self, key: &SessionKey, snapshot: Option<Snapshot>, since: Since, now: Instant) {
         let Some(w) = self.map.get_mut(key) else { return };
+        w.generation += 1;
         w.digest = snapshot.as_ref().map_or(0, digest);
         w.status = if snapshot.is_some() { Status::Live } else { Status::Connecting };
         w.fetched = snapshot.is_some().then_some(now);
@@ -298,6 +317,7 @@ impl Watchers {
     /// The session switched to: its watcher's snapshot and clocks seed the window until the sync loop's own come.
     pub(super) fn unpark(&mut self, key: &SessionKey) -> (Option<Snapshot>, Since) {
         let Some(w) = self.map.get_mut(key) else { return Default::default() };
+        w.generation += 1;
         w.status = Status::Shown;
         w.digest = 0;
         (w.snapshot.take(), std::mem::take(&mut w.since))
@@ -311,9 +331,10 @@ impl Watchers {
         self.map.get(key)?.snapshot.as_ref()
     }
 
-    /// The last snapshot of every session not shown that has one.
+    /// The last snapshot of every session not shown that has one, but for those out of reach: what they last said
+    /// may be long over.
     pub(super) fn snapshots(&self) -> impl Iterator<Item = &Snapshot> {
-        self.map.values().filter(|w| w.status != Status::Shown).filter_map(|w| w.snapshot.as_ref())
+        self.map.values().filter(|w| !matches!(w.status, Status::Shown | Status::Unreachable)).filter_map(|w| w.snapshot.as_ref())
     }
 
     /// The key's place in the tree, for element ids that tell sessions' rows apart.
@@ -506,7 +527,7 @@ impl Shell {
                 }
             }
         }
-        for (key, client, timeout) in self.watchers.due(now, activity) {
+        for (key, client, timeout, generation) in self.watchers.due(now, activity) {
             let call = self.rt.spawn(async move {
                 match tokio::time::timeout(timeout, client.call("session.snapshot", json!({}))).await {
                     Ok(answer) => answer,
@@ -517,7 +538,7 @@ impl Shell {
                 let answer = call.await.map_err(anyhow::Error::from).and_then(|r| r);
                 let parsed = cx.background_executor().spawn(async move { answer.and_then(|r| Snapshot::from_result(&r)) }).await;
                 let _ = this.update(cx, |s, cx| {
-                    let applied = s.watchers.apply(&key, parsed, Instant::now());
+                    let applied = s.watchers.answer(&key, generation, parsed, Instant::now());
                     s.tell_elsewhere(&key, &applied.alerts, cx);
                     if applied.stopped {
                         s.refresh_places(cx);
@@ -531,16 +552,23 @@ impl Shell {
         }
     }
 
-    /// The shown session's key: as herdr's list names it, else (before the list came) this machine's session by the
-    /// socket Shepherd talks to, so folds are kept under the right key from the first frame. A machine waits for the
-    /// list, which holds its id.
+    /// The shown session's key: as herdr's list names it, else (before the list came) a machine's by its id, and this
+    /// machine's session by the socket Shepherd talks to, so folds are kept under the right key from the first frame
+    /// and an alert posted then names its session.
     pub(super) fn shown_key(&self) -> Option<SessionKey> {
-        match self.shown_place() {
-            Some(key) => Some(SessionKey(key)),
-            None if self.machine_label.is_none() => Some(SessionKey(crate::herdr::api_socket().to_string_lossy().into_owned())),
-            None => None,
-        }
+        shown_key_of(self.shown_place(), self.machine_id.as_deref(), &crate::herdr::api_socket())
     }
+}
+
+/// The shown session's key: its place's key once herdr's list has it, else a machine's by its id (its watcher's key,
+/// known before the list comes), else this machine's session by its socket. Keys must match the watchers' and the
+/// tree's ([`SessionKey::of`]): a notification's routing and the alerts already told go by them.
+fn shown_key_of(listed: Option<String>, machine_id: Option<&str>, socket: &std::path::Path) -> Option<SessionKey> {
+    Some(SessionKey(match (listed, machine_id) {
+        (Some(key), _) => key,
+        (None, Some(id)) => format!("machine:{id}"),
+        (None, None) => socket.to_string_lossy().into_owned(),
+    }))
 }
 
 #[cfg(test)]
@@ -596,7 +624,7 @@ mod tests {
         assert_eq!(w.get(&key("default")).unwrap().status, Status::Shown);
         assert_eq!(w.get(&key("menqal")).unwrap().status, Status::Connecting);
         assert_eq!(w.get(&key("old")).unwrap().status, Status::Stopped);
-        let due: Vec<_> = w.due(now, Activity::Active).into_iter().map(|(k, _, _)| k).collect();
+        let due: Vec<_> = w.due(now, Activity::Active).into_iter().map(|(k, _, _, _)| k).collect();
         assert_eq!(due, [key("menqal")], "neither the shown session nor a stopped one");
         assert!(w.due(now, Activity::Active).is_empty(), "one call in flight each");
         w.reconcile(&[session("default", true), machine("box")], Some(&key("default")), now);
@@ -745,6 +773,10 @@ mod tests {
         Snapshot::from_result(&json!({"snapshot": {"focused_workspace_id": null, "focused_tab_id": null, "focused_pane_id": null, "workspaces": [], "tabs": [], "panes": panes, "layouts": []}})).unwrap()
     }
 
+    fn told(applied: Applied) -> Vec<String> {
+        applied.alerts.into_iter().map(|a| a.pane).collect()
+    }
+
     #[test]
     fn alerts_come_only_between_two_live_answers() {
         let now = Instant::now();
@@ -753,11 +785,11 @@ mod tests {
         let k = key("menqal");
         assert!(w.apply(&k, Ok(agents(&[("p1", "blocked")])), now).alerts.is_empty(), "the first answer is a baseline");
         assert!(w.apply(&k, Ok(agents(&[("p1", "working")])), now).alerts.is_empty());
-        assert_eq!(w.apply(&k, Ok(agents(&[("p1", "done")])), now).alerts, ["p1"]);
+        assert_eq!(told(w.apply(&k, Ok(agents(&[("p1", "done")])), now)), ["p1"]);
         // one failure keeps it live; two make it unreachable, and the answer after that is a baseline again
         w.apply(&k, Ok(agents(&[("p1", "working")])), now);
         w.apply(&k, Err(anyhow::anyhow!("no answer in 2 s")), now);
-        assert_eq!(w.apply(&k, Ok(agents(&[("p1", "blocked")])), now).alerts, ["p1"], "still live after one failure");
+        assert_eq!(told(w.apply(&k, Ok(agents(&[("p1", "blocked")])), now)), ["p1"], "still live after one failure");
         w.apply(&k, Ok(agents(&[("p1", "working")])), now);
         w.apply(&k, Err(anyhow::anyhow!("no answer in 2 s")), now);
         w.apply(&k, Err(anyhow::anyhow!("no answer in 2 s")), now);
@@ -774,12 +806,56 @@ mod tests {
         let mut w = Watchers::new();
         w.reconcile(&[session("default", true), session("menqal", true)], Some(&key("default")), now);
         w.park(&key("default"), Some(agents(&[("p1", "working"), ("p2", "working")])), Default::default(), now);
-        assert_eq!(w.apply(&key("default"), Ok(agents(&[("p1", "blocked"), ("p2", "working")])), now).alerts, ["p1"]);
+        assert_eq!(told(w.apply(&key("default"), Ok(agents(&[("p1", "blocked"), ("p2", "working")])), now)), ["p1"]);
         assert_eq!(w.snapshots().count(), 1, "a parked session counts toward the badge");
         // the shown session's answers are the sync loop's: nothing comes of them here
         w.unpark(&key("default"));
         assert_eq!(w.snapshots().count(), 0, "the shown session's snapshot is the window's");
         assert!(w.apply(&key("default"), Ok(agents(&[("p1", "working"), ("p2", "done")])), now).alerts.is_empty());
+    }
+
+    #[test]
+    fn an_answer_asked_for_before_a_switch_is_dropped() {
+        let now = Instant::now();
+        let mut w = Watchers::new();
+        w.reconcile(&[session("default", true), session("menqal", true)], Some(&key("default")), now);
+        let k = key("menqal");
+        w.apply(&k, Ok(agents(&[("p1", "working")])), now);
+        let due = w.due(now + Duration::from_secs(5), Activity::Active);
+        let generation = due.iter().find(|d| d.0 == k).unwrap().3;
+        // switched to menqal and back while the poll was out: parked with a snapshot newer than the poll's
+        w.unpark(&k);
+        w.park(&k, Some(agents(&[("p1", "done")])), Default::default(), now);
+        let stale = w.answer(&k, generation, Ok(agents(&[("p1", "blocked")])), now);
+        assert_eq!(stale, Applied::default(), "nothing drawn, nothing told");
+        assert_eq!(w.snapshot(&k).unwrap().panes[0].agent_status, AgentStatus::Done, "the parked snapshot stays");
+        let fresh = w.due(now + Duration::from_secs(10), Activity::Active).into_iter().find(|d| d.0 == k).unwrap().3;
+        assert_eq!(w.answer(&k, fresh, Ok(agents(&[("p1", "blocked")])), now).alerts.len(), 1, "polled again, answered at its own generation");
+    }
+
+    #[test]
+    fn an_unreachable_session_leaves_the_badge() {
+        let now = Instant::now();
+        let mut w = Watchers::new();
+        w.reconcile(&[session("menqal", true)], None, now);
+        let k = key("menqal");
+        w.apply(&k, Ok(agents(&[("p1", "blocked")])), now);
+        assert_eq!(w.snapshots().count(), 1);
+        w.apply(&k, Err(anyhow::anyhow!("no answer in 2 s")), now);
+        assert_eq!(w.snapshots().count(), 1, "one failure: still live");
+        w.apply(&k, Err(anyhow::anyhow!("no answer in 2 s")), now);
+        assert_eq!(w.snapshots().count(), 0, "unreachable: its last word may be long over");
+    }
+
+    #[test]
+    fn the_shown_key_is_the_one_the_tree_and_the_watchers_use() {
+        let socket = std::path::Path::new("/tmp/default.sock");
+        for place in [session("default", true), session("menqal", true), machine("box")] {
+            assert_eq!(shown_key_of(Some(place.key()), None, socket), Some(SessionKey::of(&place)));
+        }
+        // before herdr's list names it: a machine by its id, a session here by the socket it is reached on
+        assert_eq!(shown_key_of(None, Some("box"), socket), Some(SessionKey::of(&machine("box"))));
+        assert_eq!(shown_key_of(None, None, socket), Some(SessionKey::of(&session("default", true))));
     }
 
     #[test]

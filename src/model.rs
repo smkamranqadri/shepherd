@@ -109,6 +109,10 @@ pub struct Pane {
     /// herdr's counter of agent status changes, higher is more recent; read from the snapshot's `agents`.
     #[serde(default)]
     pub state_change_seq: u64,
+    /// herdr's counter at the agent's last finished turn, none before its first; read from the snapshot's `agents`.
+    /// An Esc that stops the agent, or a blip at its start, turns it idle without moving this.
+    #[serde(default)]
+    pub completion_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -198,11 +202,12 @@ pub struct PaneFrame {
 impl Snapshot {
     pub fn from_result(result: &serde_json::Value) -> anyhow::Result<Self> {
         let mut snapshot = Self::deserialize(&result["snapshot"])?;
-        // herdr puts `state_change_seq` on the snapshot's `agents`, not its panes
+        // herdr puts `state_change_seq` and `completion_seq` on the snapshot's `agents`, not its panes
         for agent in result["snapshot"]["agents"].as_array().into_iter().flatten() {
             let (Some(id), Some(seq)) = (agent["pane_id"].as_str(), agent["state_change_seq"].as_u64()) else { continue };
             if let Some(pane) = snapshot.panes.iter_mut().find(|p| p.pane_id == id) {
                 pane.state_change_seq = seq;
+                pane.completion_seq = agent["completion_seq"].as_u64();
             }
         }
         Ok(snapshot)
