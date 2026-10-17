@@ -296,6 +296,9 @@ pub struct Shell {
     place_edit: Option<crate::ui::Popup<sessions::PlaceEdit>>,
     /// The places not shown, each polled in the background for the sidebar's tree, with its last snapshot.
     watchers: watchers::Watchers,
+    /// herdr's sessions folder is watched (`start_session_watch`), or cannot be: no more tries. False while the
+    /// folder is not there yet, tried again as each read of herdr's list lands.
+    session_watch_settled: bool,
     /// Each live watcher's feed of herdr's events, with the `feed_gen` it was opened at: dropping one hangs it up.
     feeds: HashMap<watchers::SessionKey, (u64, gpui::Task<()>)>,
     /// The tree's goal after a switch and its machine menu.
@@ -650,6 +653,7 @@ impl Shell {
                     place_menu: None,
                     place_edit: None,
                     watchers: watchers::Watchers::new(),
+                    session_watch_settled: false,
                     feeds: HashMap::new(),
                     tree: Default::default(),
                     session_dialog: None,

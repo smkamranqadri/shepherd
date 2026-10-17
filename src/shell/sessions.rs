@@ -293,6 +293,9 @@ impl Shell {
             let listed = list.await.map_err(anyhow::Error::from).and_then(|r| r);
             let _ = this.update(cx, |s, cx| {
                 let again = s.watchers.listed(Instant::now());
+                if !s.session_watch_settled {
+                    s.start_session_watch(cx); // herdr's folder may be there now: its server made it
+                }
                 if let Ok((sessions, machines)) = listed {
                     let machines_known = machines.is_some();
                     let (places, disabled) = sidebar_tree::tree_order(sessions, machines.unwrap_or_default());
@@ -332,17 +335,23 @@ impl Shell {
     /// Reads herdr's list again when a session starts or stops (`session_watch`): a burst of events waits a moment
     /// (`DEBOUNCE`) and is one read, then one more read follows `SETTLE` later, since a server makes its socket
     /// before it listens on it and the first read may still find it not running. The watch lives with this task, as
-    /// long as the window; without one the 15 s read is all there is, as before.
+    /// long as the window; without one the 15 s read is all there is, as before. Before herdr ever ran its folder
+    /// is not there to watch: each read of the list that lands tries again, until it is.
     pub(super) fn start_session_watch(&mut self, cx: &mut Context<Self>) {
-        use crate::herdr::session_watch::{SessionWatch, gather};
+        use crate::herdr::session_watch::{NoWatch, SessionWatch, gather};
         use futures::StreamExt;
         /// Events this close are one read.
         const DEBOUNCE: Duration = Duration::from_millis(250);
         /// The second read after a burst: a socket just made is listened on by then.
         const SETTLE: Duration = Duration::from_millis(1500);
-        let Some((mut watch, mut seen)) = SessionWatch::start() else {
-            return;
+        let (mut watch, mut seen) = match SessionWatch::start() {
+            Ok(watch) => watch,
+            Err(why) => {
+                self.session_watch_settled = why == NoWatch::Failed;
+                return;
+            }
         };
+        self.session_watch_settled = true;
         cx.spawn(async move |this, cx| {
             while let Some(first) = seen.next().await {
                 let mut burst = vec![first];
@@ -351,9 +360,9 @@ impl Shell {
                     while let Ok(more) = seen.try_recv() {
                         burst.push(more);
                     }
-                    // only a change or a new folder is ever sent, so both reads happen; a new folder is watched first
-                    for dir in gather(burst.drain(..)).1 {
-                        watch.add(&dir);
+                    // only a change or a new folder is ever sent, so both reads happen; new folders are watched first
+                    if gather(burst.drain(..)).1 {
+                        watch.catch_up();
                     }
                     if this.update(cx, |s, cx| s.refresh_places(cx)).is_err() {
                         return; // window closed

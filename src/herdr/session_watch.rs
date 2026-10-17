@@ -10,6 +10,10 @@ use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 
+/// Each folder watched by itself (inotify: a watch per folder, from a per-user budget), rather than herdr's folder
+/// whole by one stream (FSEvents on macOS, and Windows), as `files::watch` does: there `add` has nothing to do.
+const PER_FOLDER: bool = cfg!(target_os = "linux");
+
 /// A server's socket: the file whose coming and going is a session starting and stopping.
 const SOCKET: &str = "herdr.sock";
 /// The named sessions' folder in herdr's.
@@ -72,6 +76,12 @@ pub fn seen(event: &Event, root: &Path) -> Vec<Seen> {
     event.paths.iter().map(|p| relevant(&event.kind, p, root)).filter(|s| *s != Seen::Ignore).collect()
 }
 
+/// What the watcher hands over: an event's `seen`, or for an error (the kernel's queue overflowing, a watch lost) a
+/// change, so the list is read to be sure.
+pub fn heard(event: notify::Result<Event>, root: &Path) -> Vec<Seen> {
+    event.map(|e| seen(&e, root)).unwrap_or_else(|_| vec![Seen::Changed])
+}
+
 /// The folders to watch under `root` as it is now: itself, its `sessions/` when there, and each folder in that.
 /// Empty when `root` is not there (herdr never ran): nothing to watch, and the 15 s read covers a first start.
 pub fn folders(root: &Path) -> Vec<PathBuf> {
@@ -89,66 +99,74 @@ pub fn folders(root: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// What a burst of `Seen` asks: whether to read the list, and the new folders to watch.
-pub fn gather(burst: impl IntoIterator<Item = Seen>) -> (bool, Vec<PathBuf>) {
-    let (mut read, mut dirs) = (false, Vec::new());
-    for seen in burst {
-        match seen {
-            Seen::Changed => read = true,
-            Seen::NewDir(dir) => {
-                read = true;
-                if !dirs.contains(&dir) {
-                    dirs.push(dir);
-                }
-            }
-            Seen::Ignore => {}
-        }
-    }
-    (read, dirs)
+/// What a burst of `Seen` asks: whether to read the list, and whether folders came that are to be watched
+/// (`catch_up`).
+pub fn gather(burst: impl IntoIterator<Item = Seen>) -> (bool, bool) {
+    burst.into_iter().fold((false, false), |(read, new), seen| match seen {
+        Seen::Changed => (true, new),
+        Seen::NewDir(_) => (true, true),
+        Seen::Ignore => (read, new),
+    })
+}
+
+/// Why there is no watch.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NoWatch {
+    /// herdr's folder is not there yet (herdr never ran): worth trying again once it may be.
+    NotYet,
+    /// The watcher could not start (the system's limit on watches, say): the 15 s read is all there is.
+    Failed,
 }
 
 /// The live watch: dropping it stops the events.
 pub struct SessionWatch {
     watcher: RecommendedWatcher,
+    root: PathBuf,
 }
 
 impl SessionWatch {
-    /// Watches herdr's folder; its `Seen`s arrive on the receiver. `None` when there is nothing to watch or the
-    /// watcher cannot start: the list is then only read every 15 s, as before.
-    pub fn start() -> Option<(SessionWatch, UnboundedReceiver<Seen>)> {
+    /// Watches herdr's folder; its `Seen`s arrive on the receiver. Without a watch the list is only read every 15 s,
+    /// as before.
+    pub fn start() -> Result<(SessionWatch, UnboundedReceiver<Seen>), NoWatch> {
         Self::start_at(super::config::dir())
     }
 
-    fn start_at(root: PathBuf) -> Option<(SessionWatch, UnboundedReceiver<Seen>)> {
+    fn start_at(root: PathBuf) -> Result<(SessionWatch, UnboundedReceiver<Seen>), NoWatch> {
+        if !root.is_dir() {
+            return Err(NoWatch::NotYet);
+        }
         // FSEvents names paths with links resolved (`/var` is `/private/var`), and a dotfiles setup may link herdr's
         // folder: the events' paths are matched against the folder as resolved
         let root = root.canonicalize().unwrap_or(root);
-        let dirs = folders(&root);
-        if dirs.is_empty() {
-            return None;
-        }
         let (tx, rx): (UnboundedSender<Seen>, _) = unbounded();
+        let events_root = root.clone();
         let watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
-            // an error is the kernel's queue overflowing or a watch lost: read the list to be sure
-            let seen = event.map(|e| seen(&e, &root)).unwrap_or_else(|_| vec![Seen::Changed]);
-            for s in seen {
+            for s in heard(event, &events_root) {
                 let _ = tx.unbounded_send(s);
             }
         })
-        .ok()?;
-        let mut watch = SessionWatch { watcher };
-        // herdr's own folder must be watched; a session folder that went meanwhile is let be
-        watch.watcher.watch(&dirs[0], RecursiveMode::NonRecursive).ok()?;
-        for dir in &dirs[1..] {
-            watch.add(dir);
-        }
-        Some((watch, rx))
+        .map_err(|_| NoWatch::Failed)?;
+        let mut watch = SessionWatch { watcher, root };
+        // herdr's own folder must be watched (the whole of it, where one stream watches a tree)
+        let mode = if PER_FOLDER { RecursiveMode::NonRecursive } else { RecursiveMode::Recursive };
+        watch.watcher.watch(&watch.root, mode).map_err(|_| NoWatch::Failed)?;
+        watch.catch_up();
+        Ok((watch, rx))
     }
 
-    /// Watches a folder that appeared. Not called from the watcher's callback: notify's watch waits on the thread
-    /// that runs it.
-    pub fn add(&mut self, dir: &Path) {
-        let _ = self.watcher.watch(dir, RecursiveMode::NonRecursive);
+    /// Watches every folder there is to watch now (inotify), after folders came: `sessions/` before the folders in
+    /// it are listed, so one made meanwhile is heard of. A burst can make `sessions/` and `sessions/<name>/` before
+    /// the first is watched, so the folders in it are not left to their own events. Watching a folder again does no
+    /// harm, and one that went meanwhile is let be. Not called from the watcher's callback: notify's watch waits on
+    /// the thread that runs it.
+    pub fn catch_up(&mut self) {
+        if !PER_FOLDER {
+            return;
+        }
+        let _ = self.watcher.watch(&self.root.join(SESSIONS), RecursiveMode::NonRecursive);
+        for dir in folders(&self.root).iter().skip(1) {
+            let _ = self.watcher.watch(dir, RecursiveMode::NonRecursive);
+        }
     }
 }
 
@@ -201,42 +219,84 @@ mod tests {
     }
 
     #[test]
-    fn a_burst_reads_once_and_watches_each_new_folder_once() {
+    fn a_burst_reads_once_and_catches_up_on_new_folders() {
         let pets = root().join("sessions/pets");
-        assert_eq!(gather([Seen::Changed, Seen::Changed]), (true, vec![]));
-        assert_eq!(gather([Seen::NewDir(pets.clone()), Seen::Changed, Seen::NewDir(pets.clone())]), (true, vec![pets]));
-        assert_eq!(gather([]), (false, vec![]));
+        assert_eq!(gather([Seen::Changed, Seen::Changed]), (true, false));
+        assert_eq!(gather([Seen::Changed, Seen::NewDir(pets.clone()), Seen::Changed]), (true, true));
+        assert_eq!(gather([Seen::NewDir(pets)]), (true, true), "a new folder alone is a read too");
+        assert_eq!(gather([]), (false, false));
     }
 
-    /// The next `Seen` the watch sends, waiting at most a few seconds (FSEvents batches its events).
-    fn next(rx: &mut UnboundedReceiver<Seen>) -> Option<Seen> {
+    #[test]
+    fn lost_events_and_errors_are_a_change() {
+        let lost = Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        assert_eq!(seen(&lost, &root()), [Seen::Changed], "the kernel's queue overflowed");
+        assert_eq!(heard(Ok(lost), &root()), [Seen::Changed]);
+        assert_eq!(heard(Err(notify::Error::generic("a watch was lost")), &root()), [Seen::Changed]);
+        let log = Event::new(WRITTEN).add_path(root().join("sessions/pets/herdr-server.log"));
+        assert!(heard(Ok(log), &root()).is_empty());
+        let both = Event::new(MADE).add_path(root().join("herdr.sock")).add_path(root().join("herdr-client.sock"));
+        assert_eq!(heard(Ok(both), &root()), [Seen::Changed], "each path judged, the ignored left out");
+    }
+
+    /// Waits a few seconds at most for a `Seen` that `wanted` picks, passing over the others: FSEvents batches its
+    /// events, may merge or repeat them, and can deliver ones from just before the watch began.
+    fn wait_for(rx: &mut UnboundedReceiver<Seen>, wanted: impl Fn(&Seen) -> bool) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if let Ok(seen) = rx.try_recv() {
-                return Some(seen);
+        while std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(seen) if wanted(&seen) => return true,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
             }
-            if std::time::Instant::now() > deadline {
-                return None;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        false
+    }
+
+    fn temp_root() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("herdr");
+        (tmp, root)
     }
 
     #[test]
     fn a_watch_hears_a_session_folder_and_then_its_socket() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap().join("herdr");
+        let (_tmp, root) = temp_root();
         std::fs::create_dir_all(root.join("sessions")).unwrap();
         let (mut watch, mut rx) = SessionWatch::start_at(root.clone()).unwrap();
         let pets = root.join("sessions/pets");
         std::fs::create_dir(&pets).unwrap();
-        assert_eq!(next(&mut rx), Some(Seen::NewDir(pets.clone())));
-        watch.add(&pets);
+        assert!(wait_for(&mut rx, |s| *s == Seen::NewDir(pets.clone())), "the new session's folder");
+        watch.catch_up();
         std::fs::write(pets.join("herdr-server.log"), "started").unwrap();
         std::fs::write(pets.join("herdr.sock"), "").unwrap();
-        assert_eq!(next(&mut rx), Some(Seen::Changed), "the log is not heard, the socket is");
+        assert!(wait_for(&mut rx, |s| *s == Seen::Changed), "its socket made");
         std::fs::remove_file(pets.join("herdr.sock")).unwrap();
-        assert_eq!(next(&mut rx), Some(Seen::Changed));
+        assert!(wait_for(&mut rx, |s| *s == Seen::Changed), "its socket gone");
+    }
+
+    #[test]
+    fn folders_made_before_their_parent_is_watched_are_caught_up_on() {
+        let (_tmp, root) = temp_root();
+        std::fs::create_dir(&root).unwrap();
+        let (mut watch, mut rx) = SessionWatch::start_at(root.clone()).unwrap();
+        // herdr's first named session: sessions/ and sessions/pets back to back, the second before sessions/ is watched
+        let pets = root.join("sessions/pets");
+        std::fs::create_dir_all(&pets).unwrap();
+        assert!(wait_for(&mut rx, |s| *s == Seen::NewDir(root.join("sessions"))));
+        watch.catch_up();
+        // whatever else the burst brought is passed over, so a socket heard now was heard in pets/
+        while rx.try_recv().is_ok() {}
+        std::fs::write(pets.join("herdr.sock"), "").unwrap();
+        assert!(wait_for(&mut rx, |s| *s == Seen::Changed), "pets/ is watched though no event named it");
+    }
+
+    #[test]
+    fn no_herdr_folder_is_no_watch_yet() {
+        let (_tmp, root) = temp_root();
+        assert_eq!(SessionWatch::start_at(root.clone()).err(), Some(NoWatch::NotYet));
+        std::fs::create_dir(&root).unwrap();
+        assert!(SessionWatch::start_at(root).is_ok(), "once herdr made it");
     }
 
     #[test]
