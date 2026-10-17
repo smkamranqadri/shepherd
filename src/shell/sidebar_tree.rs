@@ -188,6 +188,12 @@ pub(super) fn toggle_in(collapsed: &mut Vec<String>, key: &str) {
     }
 }
 
+/// Whether Fold or unfold the session has a session to fold: only one the tree gives a header row. One session
+/// alone, or a socket of one's own outside herdr's list, has none, and folding it would hide its workspaces for good.
+pub(super) fn foldable(rows: &[TreeRow], shown: &SessionKey) -> bool {
+    rows.iter().any(|r| matches!(r, TreeRow::Session { key, .. } if key == shown))
+}
+
 /// Whether a header (a session or machine row) gets a divider over it: every one but the first, and none right
 /// under its machine's row, which heads the group already.
 pub(super) fn divider_above(rows: &[TreeRow], i: usize) -> bool {
@@ -496,6 +502,15 @@ impl Shell {
         let key = key.0.clone();
         save_from_sidebar(cx, move |s| toggle_in(&mut s.collapsed_sessions, &key));
         cx.notify();
+    }
+
+    /// Fold or unfold the session: the shown one's header, as a click on it does, whether the sidebar shows, peeks
+    /// or is hidden (it is not brought out); nothing when the tree gives it no header.
+    pub(super) fn toggle_shown_session(&mut self, cx: &mut Context<Self>) {
+        let (rows, shown) = self.tree_model(cx);
+        if foldable(&rows, &shown) {
+            self.toggle_collapsed(&shown, cx);
+        }
     }
 
     /// The Agents section's entries from every session: the shown one's live snapshot, the others' from their
@@ -1316,6 +1331,25 @@ mod tests {
         assert_eq!(collapsed, ["/tmp/b.sock"]);
         toggle_in(&mut collapsed, "/tmp/b.sock");
         assert!(collapsed.is_empty());
+    }
+
+    #[test]
+    fn only_a_session_with_a_header_folds() {
+        let places = [Place::Session(info("default", true)), Place::Session(info("menqal", true))];
+        let w = watched(&places, "default");
+        let shown = snapshot(&[("w1", None)]);
+        let rows = tree(&places, &w, &HashSet::new(), Some(&shown));
+        assert!(foldable(&rows, &key("default")), "the shown session's header");
+        // folded, its header stays, so the key opens it again
+        let folded: HashSet<String> = ["/tmp/default.sock".to_string()].into();
+        assert!(foldable(&tree(&places, &w, &folded, Some(&shown)), &key("default")));
+        // one session alone: no header to fold
+        let one = [Place::Session(info("default", true))];
+        assert!(!foldable(&tree(&one, &watched(&one, "default"), &HashSet::new(), Some(&shown)), &key("default")));
+        // a socket of one's own, outside herdr's list: its workspaces lead without a header
+        let mut own = rows.clone();
+        own.insert(0, TreeRow::Workspaces { key: key("mine") });
+        assert!(!foldable(&own, &key("mine")));
     }
 
     #[test]

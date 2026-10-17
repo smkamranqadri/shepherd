@@ -46,6 +46,7 @@ app_actions! {
     PreviousSession: "Previous session",
     NextSession: "Next session",
     SwitchSession: "Switch session",
+    ToggleSessionCollapsed: "Fold or unfold the session",
     Workspace1: "Go to workspace 1",
     Workspace2: "Go to workspace 2",
     Workspace3: "Go to workspace 3",
@@ -170,6 +171,8 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // the sessions and machines of the sidebar's bar; Cmd+Opt+Up/Down is taken, by focus up and down
     ("PreviousSession", "ctrl-cmd-up"),
     ("NextSession", "ctrl-cmd-down"),
+    // fork-only: folds the shown session's workspaces in the sidebar's tree, as a click on its header does
+    ("ToggleSessionCollapsed", "cmd-shift-h"),
     // Ctrl, not Cmd+Shift: Cmd+Shift+3, 4 and 5 are macOS's screenshots
     ("Workspace1", "ctrl-1"),
     ("Workspace2", "ctrl-2"),
@@ -244,6 +247,9 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("NextSession", "ctrl-shift-pagedown"),
     // the session switcher, with the next session picked
     ("SwitchSession", "ctrl-shift-s"),
+    // fork-only: folds the shown session's workspaces in the sidebar's tree, as a click on its header does. Ctrl+H
+    // stays the shell's backspace
+    ("ToggleSessionCollapsed", "ctrl-shift-h"),
     // Ctrl+Shift+1…9 as GPUI hears them on Linux: xkb gives the shifted symbol (US layout) and GPUI drops the Shift
     // of a key that has no case, so `ctrl-shift-1` would never match (`shifted_digit` shows them as typed).
     ("Workspace1", "ctrl-!"),
@@ -439,6 +445,7 @@ fn menus(secure_input: bool) -> Vec<gpui::Menu> {
             I::action("Previous Session", PreviousSession),
             I::action("Next Session", NextSession),
             I::action("Switch Session…", SwitchSession),
+            I::action("Fold Session", ToggleSessionCollapsed),
             I::action("Next Agent That Needs You", NextNeedsYou),
             I::submenu(Menu::new("Go to Workspace").items([
                 I::action("Workspace 1", Workspace1),
@@ -1144,6 +1151,20 @@ mod tests {
         assert_eq!(chord(&effective(&user(&[])), "NextNeedsYou"), normalize("ctrl-shift-j").as_deref());
         assert_eq!(fired(&from_xkb("j", true, Some("J"))), ["NextNeedsYou"]);
         assert!(fired(&from_xkb("j", false, None)).is_empty(), "Ctrl+J is a newline to the pane");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn ctrl_shift_h_folds_the_session_and_ctrl_h_stays_the_shells() {
+        assert_eq!(chord(&effective(&user(&[])), "ToggleSessionCollapsed"), normalize("ctrl-shift-h").as_deref());
+        assert_eq!(fired(&from_xkb("h", true, Some("H"))), ["ToggleSessionCollapsed"]);
+        assert!(fired(&from_xkb("h", false, None)).is_empty(), "Ctrl+H is a backspace to the pane");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_session_folds_on_shift_cmd_h() {
+        assert_eq!(chord(&effective(&user(&[])), "ToggleSessionCollapsed"), normalize("cmd-shift-h").as_deref());
     }
 
     #[test]

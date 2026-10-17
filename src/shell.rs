@@ -1784,6 +1784,7 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &PreviousSession, _, cx| this.step_place(false, cx)))
             .on_action(cx.listener(|this, _: &NextSession, _, cx| this.step_place(true, cx)))
             .on_action(cx.listener(|this, _: &SwitchSession, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Places, w, cx)))
+            .on_action(cx.listener(|this, _: &ToggleSessionCollapsed, _, cx| this.toggle_shown_session(cx)))
             .on_action(cx.listener(|this, _: &Workspace1, _, cx| this.go_to_workspace(0, cx)))
             .on_action(cx.listener(|this, _: &Workspace2, _, cx| this.go_to_workspace(1, cx)))
             .on_action(cx.listener(|this, _: &Workspace3, _, cx| this.go_to_workspace(2, cx)))
