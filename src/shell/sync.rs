@@ -9,11 +9,7 @@ pub(super) async fn sync_loop(this: gpui::WeakEntity<Shell>, rt: tokio::runtime:
     // the panes whose agent status the subscription follows: herdr only sends that per pane
     let mut watched: Vec<String> = Vec::new();
     loop {
-        let sub = {
-            let (c, panes) = (client.clone(), watched.clone());
-            rt.spawn(async move { c.subscribe(EVENT_TYPES, &panes).await })
-        };
-        let mut rx = match sub.await.expect("tokio") {
+        let mut rx = match subscribe(&rt, &client, &mut watched).await {
             Ok(rx) => {
                 check_protocol(&this, &rt, &client, cx).await;
                 rx
@@ -104,9 +100,9 @@ pub(super) async fn sync_loop(this: gpui::WeakEntity<Shell>, rt: tokio::runtime:
                 break; // server gone or events_lost: resubscribe
             };
             cx.background_executor().timer(Duration::from_millis(30)).await;
-            let mut focused = event["event"] == "pane.focused";
+            let mut focused = crate::herdr::event_is(&event, "pane.focused");
             while let Ok(event) = rx.try_recv() {
-                focused |= event["event"] == "pane.focused";
+                focused |= crate::herdr::event_is(&event, "pane.focused");
             }
             // ponytail: herdr's events do not name the client; a focus change Shepherd did not just cause is
             // another client's (its TUI in a terminal, over ssh), and the client used last sizes the panes
@@ -119,6 +115,18 @@ pub(super) async fn sync_loop(this: gpui::WeakEntity<Shell>, rt: tokio::runtime:
             }
         }
     }
+}
+
+/// Subscribes, following the agents of `watched`. A failure lets go of them: herdr turns down a subscription that
+/// names a pane closed since (`pane_not_found`), so asking with the same ones would fail forever and the window
+/// would never sync again; the next try asks with none, and the snapshot after it names the panes to follow.
+async fn subscribe(rt: &tokio::runtime::Handle, client: &Client, watched: &mut Vec<String>) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>> {
+    let (c, panes) = (client.clone(), watched.clone());
+    let sub = rt.spawn(async move { c.subscribe(EVENT_TYPES, &panes).await }).await.expect("tokio");
+    if sub.is_err() {
+        watched.clear();
+    }
+    sub
 }
 
 /// Asks the server which protocol it speaks, and returns the complaint when it is not Shepherd's. A change of
@@ -180,6 +188,39 @@ fn moved_focus<'a>(old: Option<Option<&str>>, new: Option<&'a str>) -> Option<&'
 mod tests {
     use super::{ECHO, moved_focus, own_echo};
     use std::time::Instant;
+
+    /// A fake herdr whose pane `w1:p2` has closed: a subscription that names it is turned down, as herdr 0.9.5 does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_subscription_naming_a_closed_pane_is_tried_again_without_it() {
+        use serde_json::{Value, json};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut lines = BufReader::new(r).lines();
+                    let req: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                    let closed = req["params"]["subscriptions"].as_array().unwrap().iter().any(|s| s["pane_id"] == "w1:p2");
+                    let answer = match closed {
+                        true => json!({"id": req["id"], "error": {"code": "pane_not_found", "message": "pane w1:p2 not found"}}),
+                        false => json!({"id": req["id"], "result": {"type": "subscription_started"}}),
+                    };
+                    w.write_all(format!("{answer}\n").as_bytes()).await.unwrap();
+                    let _ = lines.next_line().await; // held open until the client hangs up
+                });
+            }
+        });
+        let (rt, client) = (tokio::runtime::Handle::current(), crate::herdr::Client::at(path));
+        let mut watched = vec!["w1:p1".to_string(), "w1:p2".to_string()];
+        assert!(super::subscribe(&rt, &client, &mut watched).await.is_err());
+        assert!(watched.is_empty(), "the closed pane is not asked for again");
+        assert!(super::subscribe(&rt, &client, &mut watched).await.is_ok());
+    }
 
     #[test]
     fn shepherds_own_switches_echo_for_a_while() {
