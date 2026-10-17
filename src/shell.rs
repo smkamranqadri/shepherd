@@ -35,6 +35,7 @@ mod session_views;
 mod sessions;
 mod sidebar;
 mod sidebar_tree;
+mod needs_you;
 mod watchers;
 mod sync;
 mod file_tabs;
@@ -1801,6 +1802,7 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &CommandPanel, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Commands, w, cx)))
             .on_action(cx.listener(|this, _: &ChangeTheme, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Themes, w, cx)))
             .on_action(cx.listener(|this, _: &AgentsPanel, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Agents, w, cx)))
+            .on_action(cx.listener(|this, _: &NextNeedsYou, _, cx| this.next_needs_you(cx)))
             .on_action(cx.listener(|this, _: &WorkspacesPanel, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Workspaces, w, cx)))
             .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Shortcuts, w, cx)))
             .on_action(cx.listener(|this, c: &crate::herdr::keys::HerdrCommand, w, cx| this.run_herdr_command(c, w, cx)))
