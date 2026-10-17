@@ -417,6 +417,8 @@ impl Shell {
         // a click that switched elsewhere waits no more for the session it named
         self.tree.switching_to(&key);
         (self.snapshot, self.since) = self.watchers.unpark(&key);
+        // the session shown has no feed, the one left gets one
+        self.sync_feeds(cx);
         // the new server is told the tab shown, whatever ids the last one gave its tabs
         self.focused_tab = None;
         self.own_focus.clear();

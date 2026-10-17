@@ -1,12 +1,17 @@
 //! The sessions and machines not shown, kept fresh in the background: one watcher each polls its `session.snapshot`
 //! (at most one call in flight, each with a deadline), backing off while it fails, so the sidebar's tree shows every
 //! session's workspaces and agents. The session shown has no poll: the sync loop follows it, and a switch hands its
-//! last snapshot to its watcher (`park`) and takes the next session's from its watcher (`unpark`).
+//! last snapshot to its watcher (`park`) and takes the next session's from its watcher (`unpark`). A live session
+//! also has a feed of herdr's events (`feeds`), which asks it sooner when something changed, and slows its poll to a
+//! heartbeat while it is on.
+mod feeds;
+
 use super::sessions::Place;
 use super::*;
 use crate::herdr::Machine;
 use crate::model::Since;
 use std::hash::{Hash, Hasher};
+use feeds::{Feed, agent_panes};
 
 /// A session's key: [`Place::key`] (its socket, or `machine:<id>`), as the settings and the file tabs key it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -68,6 +73,9 @@ const TICK: Duration = Duration::from_secs(1);
 const LIST_ACTIVE: Duration = Duration::from_secs(15);
 const LIST_INACTIVE: Duration = Duration::from_secs(60);
 
+/// At most this many polls are out at once, over every session: a storm of changes in many sessions waits its turn.
+const MAX_FETCHES: usize = 6;
+
 pub(super) struct Watcher {
     pub place: Place,
     /// The socket it is asked on; a machine's relay is started on its first poll.
@@ -94,6 +102,16 @@ pub(super) struct Watcher {
     /// Moves on with each switch to or from the session (`park`, `unpark`): a poll asked for before one is answered
     /// against a snapshot it never saw, so its answer is dropped.
     generation: u64,
+    /// Its feed of herdr's events, which wakes the poll and never decides the status.
+    pub feed: Feed,
+    /// Moves on with each feed opened or closed: news of an older feed is dropped.
+    feed_gen: u64,
+    /// Feeds that failed or ended early in a row, for the wait before the next.
+    feed_failures: u32,
+    /// The feed brought news while a poll was out: asked again once it is answered.
+    dirty: bool,
+    /// When the feed last closed to follow other agents.
+    resubscribed: Option<Instant>,
 }
 
 impl Watcher {
@@ -112,6 +130,11 @@ impl Watcher {
             listed_running: running(&place),
             starting_until: None,
             generation: 0,
+            feed: Feed::Off,
+            feed_gen: 0,
+            feed_failures: 0,
+            dirty: false,
+            resubscribed: None,
             place,
         }
     }
@@ -125,9 +148,10 @@ impl Watcher {
         self.starting_until.is_some_and(|until| now < until)
     }
 
-    /// Live, but nothing came for three of its intervals: drawn as connecting.
+    /// Live, but nothing came for three of its intervals (its heartbeat's while fed): drawn as connecting.
     pub(super) fn stale(&self, now: Instant, activity: Activity) -> bool {
-        self.status == Status::Live && self.fetched.is_some_and(|at| now.duration_since(at) > interval(self.kind(), activity, 0) * 3)
+        let every = interval(self.kind(), activity, 0, self.fed());
+        self.status == Status::Live && self.fetched.is_some_and(|at| now.duration_since(at) > every * 3)
     }
 }
 
@@ -155,6 +179,10 @@ pub(super) struct Applied {
     /// The agents that just started waiting or finished (`attention::alerts`): only from a session that was live
     /// with a snapshot before, so its first answer, and one after it was unreachable or stopped, tell nothing.
     pub alerts: Vec<super::attention::Alert>,
+    /// The feed brought news while the poll was out: it is asked again now.
+    pub again: bool,
+    /// Its agents changed: the feed closed, to open again following them.
+    pub resubscribe: bool,
 }
 
 /// Every place's watcher, in the tree's order.
@@ -173,11 +201,13 @@ pub(super) struct Watchers {
     listing: bool,
     relist: bool,
     listed: Option<Instant>,
+    /// Shepherd runs on Windows: machines are polled only, and slower.
+    windows: bool,
 }
 
 impl Watchers {
     pub(super) fn new() -> Self {
-        Self { active: true, ..Default::default() }
+        Self { active: true, windows: cfg!(windows), ..Default::default() }
     }
 
     /// Follows herdr's list of places: new ones get a watcher, gone ones lose theirs, and `shown` is left to the
@@ -201,6 +231,7 @@ impl Watchers {
                 _ if !now_running => {
                     w.snapshot = None;
                     w.digest = 0;
+                    w.close_feed();
                     Status::Stopped
                 }
                 Status::Shown => {
@@ -208,7 +239,9 @@ impl Watchers {
                     Status::Connecting
                 }
                 Status::Stopped if !was_running => {
-                    (w.next_due, w.failures) = (now, 0);
+                    // its server started again: a feed it refused is tried on the new one
+                    (w.next_due, w.failures, w.feed_failures) = (now, 0, 0);
+                    w.close_feed();
                     Status::Connecting
                 }
                 status => status,
@@ -219,11 +252,15 @@ impl Watchers {
 
     /// The watchers due a poll now, each marked in flight until its answer is applied: its key, its socket, how long
     /// the call may take and its generation, which the answer brings back. A machine's watcher without its relay yet
-    /// is skipped (`without_client`).
+    /// is skipped (`without_client`), and past [`MAX_FETCHES`] out at once the rest stay due for the next call.
     pub(super) fn due(&mut self, now: Instant, activity: Activity) -> Vec<(SessionKey, Client, Duration, u64)> {
         self.activity = activity;
+        let mut out = self.map.values().filter(|w| w.in_flight).count();
         let mut due = Vec::new();
         for key in &self.order {
+            if out >= MAX_FETCHES {
+                break;
+            }
             let Some(w) = self.map.get_mut(key) else { continue };
             let skip = match w.status {
                 Status::Shown => true,
@@ -235,20 +272,30 @@ impl Watchers {
             }
             let Some(client) = w.client.clone() else { continue };
             w.in_flight = true;
+            out += 1;
             due.push((key.clone(), client, timeout(w.kind(), w.failures, w.fetched.is_none()), w.generation));
         }
         due
     }
 
-    /// A poll's answer, asked for at `generation`: dropped when a switch to or from the session came since.
+    /// A poll's answer, asked for at `generation`: dropped when a switch to or from the session came since. News
+    /// the feed brought while it was out asks again now (`again`), whatever the answer was.
     pub(super) fn answer(&mut self, key: &SessionKey, generation: u64, result: anyhow::Result<Snapshot>, now: Instant) -> Applied {
-        match self.map.get_mut(key) {
+        let mut applied = match self.map.get_mut(key) {
             Some(w) if w.generation != generation => {
                 w.in_flight = false;
                 Applied::default()
             }
             _ => self.apply(key, result, now),
+        };
+        if let Some(w) = self.map.get_mut(key)
+            && std::mem::take(&mut w.dirty)
+            && !matches!(w.status, Status::Shown | Status::Stopped)
+        {
+            w.next_due = now;
+            applied.again = true;
         }
+        applied
     }
 
     /// A poll's answer: a snapshot (`changed` only when its digest or the status moved), no server (stopped), or a
@@ -280,16 +327,19 @@ impl Watchers {
                         .collect(),
                     _ => Vec::new(),
                 };
+                let panes = agent_panes(&snapshot);
                 (w.digest, w.snapshot, w.status, w.error) = (digest, Some(snapshot), Status::Live, None);
                 (w.failures, w.fetched) = (0, Some(now));
-                w.next_due = now + interval(kind, activity, 0);
-                Applied { changed, stopped: false, alerts }
+                w.next_due = now + interval(kind, activity, 0, w.fed());
+                let resubscribe = w.follow_agents(&panes, now, interval(kind, activity, 0, false));
+                Applied { changed, alerts, resubscribe, ..Default::default() }
             }
             Err(e) if crate::herdr::no_server(&e) => {
                 let changed = w.status != Status::Stopped;
                 (w.status, w.snapshot, w.digest, w.error, w.failures) = (Status::Stopped, None, 0, None, 0);
                 w.next_due = now + Duration::from_secs(60);
-                Applied { changed, stopped: changed, alerts: Vec::new() }
+                w.close_feed();
+                Applied { changed, stopped: changed, ..Default::default() }
             }
             Err(e) => {
                 let before = (w.status, w.error.clone());
@@ -298,26 +348,29 @@ impl Watchers {
                     w.status = Status::Unreachable;
                 }
                 w.error = Some(format!("{e:#}"));
-                w.next_due = now + interval(kind, activity, w.failures);
-                Applied { changed: before != (w.status, w.error.clone()), stopped: false, alerts: Vec::new() }
+                w.next_due = now + interval(kind, activity, w.failures, w.fed());
+                Applied { changed: before != (w.status, w.error.clone()), ..Default::default() }
             }
         }
     }
 
-    /// The session left keeps its last snapshot and its agents' clocks in its watcher, and is polled from now on.
+    /// The session left keeps its last snapshot and its agents' clocks in its watcher, and is polled from now on; a
+    /// live one gets its feed at once, whose first poll tells against the snapshot it was left with.
     pub(super) fn park(&mut self, key: &SessionKey, snapshot: Option<Snapshot>, since: Since, now: Instant) {
         let Some(w) = self.map.get_mut(key) else { return };
         w.generation += 1;
+        w.close_feed();
         w.digest = snapshot.as_ref().map_or(0, digest);
         w.status = if snapshot.is_some() { Status::Live } else { Status::Connecting };
         w.fetched = snapshot.is_some().then_some(now);
-        (w.snapshot, w.since, w.failures, w.error, w.next_due) = (snapshot, since, 0, None, now + interval(w.kind(), self.activity, 0));
+        (w.snapshot, w.since, w.failures, w.error, w.next_due) = (snapshot, since, 0, None, now + interval(w.kind(), self.activity, 0, false));
     }
 
     /// The session switched to: its watcher's snapshot and clocks seed the window until the sync loop's own come.
     pub(super) fn unpark(&mut self, key: &SessionKey) -> (Option<Snapshot>, Since) {
         let Some(w) = self.map.get_mut(key) else { return Default::default() };
         w.generation += 1;
+        w.close_feed();
         w.status = Status::Shown;
         w.digest = 0;
         (w.snapshot.take(), std::mem::take(&mut w.since))
@@ -346,10 +399,13 @@ impl Watchers {
         self.activity
     }
 
-    /// Asked again now: Retry.
+    /// Asked again now: Retry. A feed that failed or was refused is tried again after the answer.
     pub(super) fn poll_now(&mut self, key: &SessionKey, now: Instant) {
         if let Some(w) = self.map.get_mut(key) {
             w.next_due = now;
+            if matches!(w.feed, Feed::Retry { .. } | Feed::Unsupported { .. }) {
+                (w.feed, w.feed_failures) = (Feed::Off, 0);
+            }
         }
     }
 
@@ -407,8 +463,12 @@ impl Watchers {
             .collect()
     }
 
+    /// The socket a machine's watcher asks on, once its relay runs: a feed on another socket is no news of this one.
     pub(super) fn set_client(&mut self, key: &SessionKey, client: Client) {
         if let Some(w) = self.map.get_mut(key) {
+            if w.client.as_ref().is_some_and(|c| c.path() != client.path()) {
+                w.close_feed();
+            }
             w.client = Some(client);
         }
     }
@@ -453,12 +513,16 @@ fn activity(active: bool, inactive_since: Option<Instant>, now: Instant, touched
 
 /// How long a watcher waits between polls: a session here every 3 s with the window in front, 5 s behind it and 15 s
 /// once the machine is left alone; a machine over SSH every 10 s, 20 s behind (a minute on Windows, which shares no
-/// SSH connection between them). Each failure in a row doubles it, up to a minute here and two over SSH.
-pub(super) fn interval(kind: Kind, activity: Activity, failures: u32) -> Duration {
-    interval_on(kind, activity, failures, cfg!(windows))
+/// SSH connection between them). Each failure in a row doubles it, up to a minute here and two over SSH. While `fed`
+/// and answering, the feed asks it when something changes, and the poll is a heartbeat.
+pub(super) fn interval(kind: Kind, activity: Activity, failures: u32, fed: bool) -> Duration {
+    interval_on(kind, activity, failures, fed, cfg!(windows))
 }
 
-fn interval_on(kind: Kind, activity: Activity, failures: u32, windows: bool) -> Duration {
+fn interval_on(kind: Kind, activity: Activity, failures: u32, fed: bool, windows: bool) -> Duration {
+    if fed && failures == 0 {
+        return feeds::heartbeat(kind, windows);
+    }
     let (base, cap) = match (kind, activity) {
         (Kind::Local, Activity::Active) => (3, 60),
         (Kind::Local, Activity::Inactive) => (5, 60),
@@ -530,6 +594,7 @@ impl Shell {
         for (key, client, timeout, generation) in self.watchers.due(now, activity) {
             self.fetch(key, client, timeout, generation, cx);
         }
+        self.sync_feeds(cx);
     }
 
     /// One poll: `session.snapshot` on the runtime within `timeout`, parsed off the main thread, then `fetched`.
@@ -566,6 +631,10 @@ impl Shell {
         if applied.changed {
             cx.notify();
         }
+        // a feed to open (the answer was a live one), to follow other agents, or to close (it stopped); a poll owed
+        // (`again`), or one that waited for this one's place
+        s.sync_feeds(cx);
+        s.poll_due(cx);
     }
 
     /// The shown session's key: as herdr's list names it, else (before the list came) a machine's by its id, and this
@@ -592,19 +661,19 @@ mod tests {
     use super::*;
     use crate::herdr::SessionInfo;
 
-    fn session(name: &str, running: bool) -> Place {
+    pub(super) fn session(name: &str, running: bool) -> Place {
         Place::Session(SessionInfo { name: name.into(), running, socket_path: format!("/tmp/{name}.sock"), default: name == "default" })
     }
 
-    fn machine(id: &str) -> Place {
+    pub(super) fn machine(id: &str) -> Place {
         Place::Machine(Machine { id: id.into(), label: id.into(), target: format!("you@{id}"), session: "default".into(), enabled: true })
     }
 
-    fn key(name: &str) -> SessionKey {
+    pub(super) fn key(name: &str) -> SessionKey {
         SessionKey(format!("/tmp/{name}.sock"))
     }
 
-    fn snapshot(workspaces: &[&str]) -> Snapshot {
+    pub(super) fn snapshot(workspaces: &[&str]) -> Snapshot {
         let ws: Vec<_> = workspaces
             .iter()
             .enumerate()
@@ -613,23 +682,23 @@ mod tests {
         Snapshot::from_result(&json!({"snapshot": {"focused_workspace_id": null, "focused_tab_id": null, "focused_pane_id": null, "workspaces": ws, "tabs": [], "panes": [], "layouts": []}})).unwrap()
     }
 
-    fn refused() -> anyhow::Error {
+    pub(super) fn refused() -> anyhow::Error {
         anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)).context("herdr is not reachable")
     }
 
     #[test]
     fn intervals_back_off_to_their_caps() {
         use Activity::*;
-        assert_eq!(interval_on(Kind::Local, Active, 0, false), Duration::from_secs(3));
-        assert_eq!(interval_on(Kind::Local, Inactive, 0, false), Duration::from_secs(5));
-        assert_eq!(interval_on(Kind::Local, Idle, 0, false), Duration::from_secs(15));
-        assert_eq!(interval_on(Kind::Remote, Active, 0, false), Duration::from_secs(10));
-        assert_eq!(interval_on(Kind::Remote, Inactive, 0, false), Duration::from_secs(20));
-        assert_eq!(interval_on(Kind::Remote, Active, 0, true), Duration::from_secs(60), "Windows shares no SSH connection");
-        assert_eq!(interval_on(Kind::Local, Active, 2, false), Duration::from_secs(12));
-        assert_eq!(interval_on(Kind::Local, Active, 9, false), Duration::from_secs(60));
-        assert_eq!(interval_on(Kind::Remote, Active, 9, false), Duration::from_secs(120));
-        assert_eq!(interval_on(Kind::Remote, Active, 99, true), Duration::from_secs(120));
+        assert_eq!(interval_on(Kind::Local, Active, 0, false, false), Duration::from_secs(3));
+        assert_eq!(interval_on(Kind::Local, Inactive, 0, false, false), Duration::from_secs(5));
+        assert_eq!(interval_on(Kind::Local, Idle, 0, false, false), Duration::from_secs(15));
+        assert_eq!(interval_on(Kind::Remote, Active, 0, false, false), Duration::from_secs(10));
+        assert_eq!(interval_on(Kind::Remote, Inactive, 0, false, false), Duration::from_secs(20));
+        assert_eq!(interval_on(Kind::Remote, Active, 0, false, true), Duration::from_secs(60), "Windows shares no SSH connection");
+        assert_eq!(interval_on(Kind::Local, Active, 2, false, false), Duration::from_secs(12));
+        assert_eq!(interval_on(Kind::Local, Active, 9, false, false), Duration::from_secs(60));
+        assert_eq!(interval_on(Kind::Remote, Active, 9, false, false), Duration::from_secs(120));
+        assert_eq!(interval_on(Kind::Remote, Active, 99, false, true), Duration::from_secs(120));
     }
 
     #[test]
@@ -672,7 +741,7 @@ mod tests {
         w.reconcile(&[session("menqal", true)], None, now);
         let k = key("menqal");
         w.due(now, Activity::Active);
-        assert_eq!(w.apply(&k, Ok(snapshot(&["w1"])), now), Applied { changed: true, stopped: false, alerts: vec![] });
+        assert_eq!(w.apply(&k, Ok(snapshot(&["w1"])), now), Applied { changed: true, ..Default::default() });
         assert_eq!(w.get(&k).unwrap().status, Status::Live);
         // the same snapshot again draws nothing new
         assert_eq!(w.apply(&k, Ok(snapshot(&["w1"])), now), Applied::default());
@@ -697,7 +766,7 @@ mod tests {
         w.reconcile(&[session("menqal", true)], None, now);
         let k = key("menqal");
         w.due(now, Activity::Active);
-        assert_eq!(w.apply(&k, Err(refused()), now), Applied { changed: true, stopped: true, alerts: vec![] });
+        assert_eq!(w.apply(&k, Err(refused()), now), Applied { changed: true, stopped: true, ..Default::default() });
         assert_eq!(w.get(&k).unwrap().status, Status::Stopped);
         assert_eq!(w.apply(&k, Err(refused()), now), Applied::default(), "told once");
         // herdr's list still says it runs: asked again a minute on, not every second
@@ -781,7 +850,7 @@ mod tests {
         assert_eq!(w.inactive_since, None);
     }
 
-    fn agents(panes: &[(&str, &str)]) -> Snapshot {
+    pub(super) fn agents(panes: &[(&str, &str)]) -> Snapshot {
         let panes: Vec<_> = panes
             .iter()
             .map(|(id, status)| json!({"pane_id": id, "tab_id": "t1", "workspace_id": "w1", "terminal_id": id, "agent_status": status, "agent": "claude"}))
@@ -789,7 +858,7 @@ mod tests {
         Snapshot::from_result(&json!({"snapshot": {"focused_workspace_id": null, "focused_tab_id": null, "focused_pane_id": null, "workspaces": [], "tabs": [], "panes": panes, "layouts": []}})).unwrap()
     }
 
-    fn told(applied: Applied) -> Vec<String> {
+    pub(super) fn told(applied: Applied) -> Vec<String> {
         applied.alerts.into_iter().map(|a| a.pane).collect()
     }
 
