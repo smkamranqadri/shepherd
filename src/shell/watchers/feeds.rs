@@ -522,10 +522,10 @@ mod tests {
     #[test]
     fn a_fed_poll_is_a_heartbeat_and_goes_stale_only_after_three() {
         use Activity::*;
-        assert_eq!(interval_on(Kind::Local, Active, 0, true, false), HEARTBEAT);
-        assert_eq!(interval_on(Kind::Local, Idle, 0, true, false), HEARTBEAT);
-        assert_eq!(interval_on(Kind::Remote, Active, 0, true, false), HEARTBEAT);
-        assert_eq!(interval_on(Kind::Local, Active, 1, true, false), Duration::from_secs(6), "failing: backing off as unfed");
+        assert_eq!(interval_on(Kind::Local, Active, 0, true, false, false), HEARTBEAT);
+        assert_eq!(interval_on(Kind::Local, Idle, 0, true, false, false), HEARTBEAT);
+        assert_eq!(interval_on(Kind::Remote, Active, 0, true, false, false), HEARTBEAT);
+        assert_eq!(interval_on(Kind::Local, Active, 1, true, false, false), Duration::from_secs(6), "failing: backing off as unfed");
         let now = Instant::now();
         let mut w = fed(now);
         let k = key("menqal");

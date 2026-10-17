@@ -26,6 +26,11 @@ use std::time::{Duration, Instant};
 /// How often the open folders are read again while the tab is in view and the window active, when the root is not
 /// watched (the watcher did not start, or gave up): just the folders on screen.
 pub(super) const POLL: Duration = Duration::from_secs(3);
+
+/// [`POLL`], doubled on `battery` as every background check is (`power`).
+pub(super) fn poll_on(battery: bool) -> Duration {
+    crate::power::stretch_on(POLL, battery)
+}
 /// A poll reads at most this many open folders: the root, then the open ones in the order they are drawn.
 const MAX_POLLED: usize = 200;
 const ROW_HEIGHT: f32 = 22.;
@@ -830,6 +835,12 @@ impl SidePanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_polls_clock_runs_half_as_fast_on_battery() {
+        assert_eq!(poll_on(false), POLL);
+        assert_eq!(poll_on(true), POLL * 2);
+    }
 
     fn memory(root: &str, open: &[&str]) -> FilesMemory {
         FilesMemory { root: root.into(), expanded: open.iter().map(PathBuf::from).collect(), selected: None, top: Some(3) }

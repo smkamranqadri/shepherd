@@ -22,6 +22,37 @@ const CHANGES_TTL: Duration = Duration::from_secs(30);
 /// How often gh is asked about a worktree's PR; it goes over the network.
 const PR_TTL: Duration = Duration::from_secs(120);
 
+/// The bar's background lookups, each asked again once older than its TTL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lookup {
+    Git,
+    Origin,
+    Usage,
+    Spent,
+    Changes,
+    Pr,
+}
+
+impl Lookup {
+    /// Its TTL as the power source stands.
+    fn ttl(self) -> Duration {
+        self.ttl_on(crate::power::on_battery())
+    }
+
+    /// Its TTL, doubled on `battery` as every background check is (`power`).
+    fn ttl_on(self, battery: bool) -> Duration {
+        let base = match self {
+            Lookup::Git => GIT_TTL,
+            Lookup::Origin => ORIGIN_TTL,
+            Lookup::Usage => USAGE_TTL,
+            Lookup::Spent => SPENT_TTL,
+            Lookup::Changes => CHANGES_TTL,
+            Lookup::Pr => PR_TTL,
+        };
+        crate::power::stretch_on(base, battery)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Git {
     pub branch: String,
@@ -150,13 +181,13 @@ pub fn branch_of(dir: &str, cx: &mut App) -> Option<String> {
 
 /// `dir`'s branch and how far it is from its upstream, as the status bar shows them.
 pub fn git_of(dir: &str, cx: &mut App) -> Option<Git> {
-    cached(dir, GIT_TTL, read_git, cx)
+    cached(dir, Lookup::Git.ttl(), read_git, cx)
 }
 
 /// `dir`'s repo has an `origin` remote, so a PR or MR can be asked about: the right panel's PR tab shows. A local
 /// `git remote get-url`, asked every `ORIGIN_TTL`; `false` until it answers and outside a repo.
 pub fn has_origin(dir: &str, cx: &mut App) -> bool {
-    cached(dir, ORIGIN_TTL, read_origin, cx).is_some_and(|Origin(yes)| yes)
+    cached(dir, Lookup::Origin.ttl(), read_origin, cx).is_some_and(|Origin(yes)| yes)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -269,13 +300,13 @@ fn read_pr(key: &str) -> Option<Pr> {
 /// key). It's cached per branch, so after a checkout the last branch's PR is not shown.
 pub fn pr_of(dir: &str, active: bool, cx: &mut App) -> Option<Pr> {
     let branch = branch_of(dir, cx)?;
-    cached(&format!("{dir}\n{branch}"), if active { PR_TTL } else { Duration::MAX }, read_pr, cx)
+    cached(&format!("{dir}\n{branch}"), if active { Lookup::Pr.ttl() } else { Duration::MAX }, read_pr, cx)
 }
 
 /// The worktree at `dir`'s cached changes and PR state, asked again after their TTLs while `active` (the window
 /// is key); in the background only a first lookup runs.
 pub fn changes_of(dir: &str, active: bool, cx: &mut App) -> (Option<(u32, u32)>, Option<&'static str>) {
-    let ttl = if active { CHANGES_TTL } else { Duration::MAX };
+    let ttl = if active { Lookup::Changes.ttl() } else { Duration::MAX };
     (cached(dir, ttl, read_changes, cx), pr_of(dir, active, cx).map(|p| p.state))
 }
 
@@ -365,7 +396,7 @@ fn usage_color(used: f64, theme: &Theme) -> gpui::Hsla {
 
 /// `agent`'s limits as the bar polls them: cached, asked again every [`USAGE_TTL`].
 pub fn usage_of(agent: UsageAgent, cx: &mut App) -> Option<Vec<Limit>> {
-    cached(agent.key(), USAGE_TTL, read_usage, cx)
+    cached(agent.key(), Lookup::Usage.ttl(), read_usage, cx)
 }
 
 /// A limit's row: its ring, its name over when it resets, and the percent used.
@@ -572,7 +603,7 @@ fn read_remote_spent(target: &str, id: &str) -> Option<Spent> {
 
 /// What `pane`'s agent session spent so far, refreshed in the background.
 fn spent_of(pane: &Pane, cx: &mut App) -> Option<Spent> {
-    pane.agent_session.as_ref().and_then(|s| cached(&crate::herdr::locate(&s.value), SPENT_TTL, read_spent, cx))
+    pane.agent_session.as_ref().and_then(|s| cached(&crate::herdr::locate(&s.value), Lookup::Spent.ttl(), read_spent, cx))
 }
 
 /// The spend popup's card: every agent with a session, what it spent by kind, and the sum; in the sidebar's
@@ -781,7 +812,7 @@ pub fn bar(
 ) -> gpui::AnyElement {
     let pane = snapshot.zip(pane_id).and_then(|(s, id)| s.panes.iter().find(|p| p.pane_id == id));
     let dir = pane_dir(snapshot, pane_id);
-    let git = dir.as_deref().filter(|_| show.branch).and_then(|d| cached(d, GIT_TTL, read_git, cx));
+    let git = dir.as_deref().filter(|_| show.branch).and_then(|d| cached(d, Lookup::Git.ttl(), read_git, cx));
     let usage = show.usage.then(|| usage_of(crate::settings::SettingsGlobal::of(cx).settings.usage_agent, cx)).flatten().filter(|l| !l.is_empty());
     let home = std::env::home_dir();
     let muted = theme.text_muted.opacity(0.7);
@@ -850,6 +881,16 @@ pub fn bar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_lookup_waits_twice_as_long_on_battery() {
+        let base = [GIT_TTL, ORIGIN_TTL, USAGE_TTL, SPENT_TTL, CHANGES_TTL, PR_TTL];
+        let all = [Lookup::Git, Lookup::Origin, Lookup::Usage, Lookup::Spent, Lookup::Changes, Lookup::Pr];
+        for (lookup, base) in all.into_iter().zip(base) {
+            assert_eq!(lookup.ttl_on(false), base, "{lookup:?}");
+            assert_eq!(lookup.ttl_on(true), base * 2, "{lookup:?}");
+        }
+    }
 
     #[test]
     fn parses_branch_tracking_and_changes() {

@@ -31,12 +31,12 @@ const BADGE_POLL: Duration = Duration::from_secs(12);
 
 /// How long after a run that took `took` the next poll may start: the tab's pace (`POLL` while the Changes tab shows,
 /// `BADGE_POLL` while only its badge does, `SAFETY_POLL` either way while the root is `watched`), but never sooner
-/// than `floor(took)`.
-pub(super) fn poll_delay(took: Duration, tab_shown: bool, watched: bool) -> Duration {
+/// than `floor(took)`. The polls double on `battery` (`power`); the safety net is slow already.
+pub(super) fn poll_delay(took: Duration, tab_shown: bool, watched: bool, battery: bool) -> Duration {
     let pace = match (watched, tab_shown) {
         (true, _) => crate::files::watch::SAFETY_POLL,
-        (false, true) => super::files::POLL,
-        (false, false) => BADGE_POLL,
+        (false, true) => super::files::poll_on(battery),
+        (false, false) => crate::power::stretch_on(BADGE_POLL, battery),
     };
     pace.max(floor(took))
 }
@@ -372,7 +372,7 @@ impl SidePanel {
         list.job = None;
         let Some(answer) = answer else { return };
         let (now, took) = (Instant::now(), started.elapsed());
-        list.next_at = Some(now + poll_delay(took, tab_shown, watched));
+        list.next_at = Some(now + poll_delay(took, tab_shown, watched, crate::power::on_battery()));
         list.ran = Some((now, took));
         if let Err(e) = &answer {
             list.halted |= halts(e);
@@ -749,15 +749,20 @@ mod tests {
     #[test]
     fn the_next_run_waits_for_the_pace_or_five_times_the_last() {
         let ms = Duration::from_millis;
-        assert_eq!(poll_delay(ms(40), true, false), ms(3000));
-        assert_eq!(poll_delay(ms(40), false, false), ms(12_000));
-        assert_eq!(poll_delay(ms(1000), true, false), ms(5000));
-        assert_eq!(poll_delay(ms(1000), false, false), ms(12_000));
-        assert_eq!(poll_delay(ms(4000), false, false), ms(20_000));
-        assert_eq!(poll_delay(Duration::MAX, true, false), Duration::MAX);
+        assert_eq!(poll_delay(ms(40), true, false, false), ms(3000));
+        assert_eq!(poll_delay(ms(40), false, false, false), ms(12_000));
+        assert_eq!(poll_delay(ms(1000), true, false, false), ms(5000));
+        assert_eq!(poll_delay(ms(1000), false, false, false), ms(12_000));
+        assert_eq!(poll_delay(ms(4000), false, false, false), ms(20_000));
+        assert_eq!(poll_delay(Duration::MAX, true, false, false), Duration::MAX);
         // watched: the polls are a safety net, the floor still holds for a change heard
-        assert_eq!(poll_delay(ms(40), true, true), ms(30_000));
-        assert_eq!(poll_delay(ms(8000), false, true), ms(40_000));
+        assert_eq!(poll_delay(ms(40), true, true, false), ms(30_000));
+        assert_eq!(poll_delay(ms(8000), false, true, false), ms(40_000));
+        // on battery the polls slow to half; the safety net and the floor stay
+        assert_eq!(poll_delay(ms(40), true, false, true), ms(6000));
+        assert_eq!(poll_delay(ms(40), false, false, true), ms(24_000));
+        assert_eq!(poll_delay(ms(40), true, true, true), ms(30_000));
+        assert_eq!(poll_delay(ms(8000), true, false, true), ms(40_000));
         assert_eq!(floor(ms(40)), ms(200));
         // a change heard: 1.5 s apart while the tab shows, the badge's pace while only it does, and the floor
         assert_eq!(watch_delay(ms(40), true), ms(1500));
