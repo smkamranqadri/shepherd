@@ -350,14 +350,15 @@ impl Pending {
 }
 
 /// How fast the tree scrolls by itself, in px a frame, with the pointer `at` near its view's top (up) or bottom
-/// (down) edge during a drag; 0 elsewhere.
+/// (down) edge during a drag, fastest once past it (above or below the tree, over its width); 0 elsewhere.
 pub(super) fn edge_scroll(view: Bounds<Pixels>, at: Point<Pixels>) -> f32 {
     const BAND: f32 = 28.;
     const FASTEST: f32 = 10.;
-    if !view.contains(&at) {
+    if at.x < view.origin.x || at.x >= view.origin.x + view.size.width {
         return 0.;
     }
-    let (top, bottom) = (f32::from(at.y - view.origin.y), f32::from(view.origin.y + view.size.height - at.y));
+    // past an edge counts as on it
+    let (top, bottom) = (f32::from(at.y - view.origin.y).max(0.), f32::from(view.origin.y + view.size.height - at.y).max(0.));
     if top < BAND {
         -FASTEST * (1. - top / BAND)
     } else if bottom < BAND {
@@ -422,6 +423,8 @@ pub(super) struct TreeDrop {
     pub edge: Edge,
     pub line: Line,
     pub bounds: Bounds<Pixels>,
+    /// The tree's scroll offset when the row's bounds were taken: a scroll since moves the row from them.
+    pub offset: Pixels,
 }
 
 impl TreeDrop {
@@ -429,6 +432,43 @@ impl TreeDrop {
     pub(super) fn holds(&self, at: Point<Pixels>) -> bool {
         hovered(self.bounds, at).is_some()
     }
+
+    /// The tree scrolled to `offset` (by the drag at its edge, or a wheel): the row moved with it, and the drop holds
+    /// while the row is still under the pointer (`at`, where it last moved), so a pointer resting at the edge keeps
+    /// its row until the row scrolls away from it.
+    pub(super) fn scrolled(&mut self, offset: Pixels, at: Option<Point<Pixels>>) -> bool {
+        self.bounds.origin.y += offset - self.offset;
+        self.offset = offset;
+        at.is_some_and(|at| self.holds(at))
+    }
+}
+
+/// How long a workspace move may wait for herdr's answer, the session shown or another: on this machine 2 s, over
+/// SSH 10 s. With none, a herdr that hangs would hold every drop after it.
+pub(super) fn move_timeout(remote: bool) -> Duration {
+    Duration::from_secs(if remote { 10 } else { 2 })
+}
+
+/// `call` given up on after `timeout`, as an error that names the wait.
+pub(super) async fn bounded<T>(timeout: Duration, call: impl std::future::Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+    match tokio::time::timeout(timeout, call).await {
+        Ok(done) => done,
+        Err(_) => Err(anyhow::anyhow!("no answer in {} s", timeout.as_secs())),
+    }
+}
+
+/// Whether a drag resting at the tree's edge starts the scroll ticker: only when it should scroll and none runs, so
+/// a pointer jittering at the band's edge never starts a second.
+pub(super) fn starts_ticker(speed: f32, ticking: bool) -> bool {
+    speed != 0. && !ticking
+}
+
+/// Whether the peek card still has the pointer `at` when a drag ends: gpui forgets hover during a drag, so the card
+/// is measured, `width` wide, 6 px in from the window's left, top and bottom (`height` tall); the edge strip that
+/// brings it out counts too.
+pub(super) fn on_peek(at: Point<Pixels>, width: f32, height: f32) -> bool {
+    let (x, y) = (f32::from(at.x), f32::from(at.y));
+    (0. ..=6. + width).contains(&x) && (6. ..=height - 6.).contains(&y)
 }
 
 /// The 2 px line along a row's top or bottom, inside it: a worktree group's body clips what is outside.
@@ -500,7 +540,8 @@ impl Shell {
         }
         let Some(edge) = hovered(e.bounds, e.event.position) else { return };
         let d = e.drag(cx).clone();
-        let next = self.plan_drop(&d, &over, edge).map(|(_, line)| TreeDrop { over, edge, line, bounds: e.bounds });
+        let offset = self.tree.scroll.offset().y;
+        let next = self.plan_drop(&d, &over, edge).map(|(_, line)| TreeDrop { over, edge, line, bounds: e.bounds, offset });
         if self.tree.drop != next {
             self.tree.drop = next;
             cx.notify();
@@ -512,20 +553,36 @@ impl Shell {
     /// bottom edge the tree scrolls.
     pub(super) fn tree_drag_left(&mut self, e: &DragMoveEvent<DraggedTreeItem>, cx: &mut Context<Self>) {
         self.tree.view = Some(e.bounds);
+        self.tree.pointer = Some(e.event.position);
+        self.follow_scroll(cx);
         if self.tree.drop.as_ref().is_some_and(|d| !d.holds(e.event.position)) {
             self.tree.drop = None;
             cx.notify();
         }
         let speed = edge_scroll(e.bounds, e.event.position);
-        let was = std::mem::replace(&mut self.tree.scroll_speed, speed);
-        if speed != 0. && was == 0. {
+        self.tree.scroll_speed = speed;
+        if starts_ticker(speed, self.tree.ticking) {
             self.scroll_while_dragging(cx);
         }
     }
 
-    /// Scrolls the tree a frame's worth at a time while a drag rests near its edge. Rows move under a still pointer,
-    /// so the drop's row is let go: the pointer's next move finds the row under it.
+    /// The drop's row follows a scroll of the tree since its bounds were taken, and goes once it leaves the pointer.
+    fn follow_scroll(&mut self, cx: &mut Context<Self>) {
+        let offset = self.tree.scroll.offset().y;
+        let at = self.tree.pointer;
+        if let Some(d) = self.tree.drop.as_mut().filter(|d| d.offset != offset)
+            && !d.scrolled(offset, at)
+        {
+            self.tree.drop = None;
+            cx.notify();
+        }
+    }
+
+    /// Scrolls the tree a frame's worth at a time while a drag rests near its edge, one ticker at a time. Rows move
+    /// under a still pointer: the drop's row moves with them and goes once it leaves the pointer; the pointer's next
+    /// move finds the row under it.
     fn scroll_while_dragging(&mut self, cx: &mut Context<Self>) {
+        self.tree.ticking = true;
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(16)).await;
@@ -533,18 +590,21 @@ impl Shell {
                     let speed = this.tree.scroll_speed;
                     if speed == 0. || !cx.has_active_drag() {
                         this.tree.scroll_speed = 0.;
+                        this.tree.ticking = false;
                         return false;
                     }
                     let (offset, max) = (this.tree.scroll.offset(), this.tree.scroll.max_offset());
                     let y = (offset.y - px(speed)).clamp(-max.y, px(0.));
                     if y != offset.y {
                         this.tree.scroll.set_offset(gpui::point(offset.x, y));
-                        this.tree.drop = None;
+                        this.follow_scroll(cx);
                         cx.notify();
                     }
                     true
                 });
                 if !matches!(go_on, Ok(true)) {
+                    // the window went: no ticker runs
+                    let _ = this.update(cx, |this, _| this.tree.ticking = false);
                     break;
                 }
             }
@@ -560,6 +620,9 @@ impl Shell {
     /// A release over the tree, `at` the pointer: on the row the line is at, planned again against what is shown
     /// now, then carried out.
     pub(super) fn drop_tree_item(&mut self, d: &DraggedTreeItem, at: Point<Pixels>, cx: &mut Context<Self>) {
+        // a wheel scroll since the last move moved the rows under the pointer
+        self.tree.pointer = Some(at);
+        self.follow_scroll(cx);
         let Some(TreeDrop { over, edge, .. }) = self.tree.drop.take().filter(|drop| drop.holds(at)) else { return };
         cx.notify();
         let plan = self.plan_drop(d, &over, edge).map(|(plan, _)| plan);
@@ -613,25 +676,19 @@ impl Shell {
     /// waiting, which built on it, with a toast.
     fn send_move(&mut self, key: SessionKey, mv: Move, cx: &mut Context<Self>) {
         let command = Command::MoveWorkspaces { workspace_ids: mv.ids, before: mv.before };
-        let call = if self.shown_key().as_ref() == Some(&key) {
-            let (method, params) = command.request();
-            let client = self.client.clone();
-            self.rt.spawn(async move { client.call(method, params).await })
+        let client = if self.shown_key().as_ref() == Some(&key) {
+            self.client.clone()
         } else {
             let Some(client) = self.watchers.get(&key).filter(|w| w.status != Status::Stopped).and_then(|w| w.client.clone()) else {
                 self.tree.pending.remove(&key);
                 return crate::ui::toast::error(cx, "Couldn't move the workspace: not connected to its session");
             };
-            let remote = self.watchers.get(&key).is_some_and(|w| w.kind() == Kind::Remote);
-            let timeout = if remote { Duration::from_secs(10) } else { Duration::from_secs(2) };
-            let (method, params) = command.request();
-            self.rt.spawn(async move {
-                match tokio::time::timeout(timeout, client.call(method, params)).await {
-                    Ok(done) => done,
-                    Err(_) => Err(anyhow::anyhow!("no answer in {} s", timeout.as_secs())),
-                }
-            })
+            client
         };
+        // the shown session's call has its deadline too: a herdr that hangs fails it, and the drops after it go
+        let timeout = move_timeout(self.watchers.get(&key).is_some_and(|w| w.kind() == Kind::Remote));
+        let (method, params) = command.request();
+        let call = self.rt.spawn(async move { bounded(timeout, client.call(method, params)).await });
         cx.spawn(async move |this, cx| {
             let result = call.await.map_err(anyhow::Error::from).and_then(|r| r);
             let _ = this.update(cx, |this, cx| {
@@ -668,14 +725,21 @@ impl Shell {
 
     /// Once no drag is under way (released anywhere): its line goes, and a peek it held out hides unless the
     /// pointer is on it. Drops herdr has carried out, with none out, go too.
-    pub(super) fn tidy_tree_drag(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn tidy_tree_drag(&mut self, window: &Window, cx: &mut Context<Self>) {
         let dragging = cx.has_active_drag();
         if !dragging {
             self.tree.drop = None;
             self.tree.view = None;
-            if std::mem::take(&mut self.tree.was_dragging) && !self.peek_hovered {
+            self.tree.pointer = None;
+            // gpui forgets hover during a drag: the pointer itself says whether it is still on the card
+            let height = f32::from(window.viewport_size().height);
+            let on_card = on_peek(window.mouse_position(), self.sidebar_width, height);
+            if std::mem::take(&mut self.tree.was_dragging) && !(self.peek_hovered || on_card) {
                 self.hover_peek(false, cx);
             }
+        } else {
+            // a wheel scroll mid drag: the drop's row moves with the rows
+            self.follow_scroll(cx);
         }
         self.tree.was_dragging |= dragging;
         let now = Instant::now();
@@ -957,13 +1021,58 @@ mod tests {
         assert!(at(101.) < 0. && at(101.) < at(120.), "up, faster at the edge");
         assert!(at(399.) > 0.);
         assert_eq!(at(250.), 0.);
-        assert_eq!(at(90.), 0., "off the tree");
+        // past an edge, over the tree's width: the fastest, so the scroll goes on
+        assert_eq!(at(90.), -10., "above the tree");
+        assert_eq!(at(450.), 10., "below it");
+        assert_eq!(edge_scroll(view, gpui::point(px(250.), px(90.))), 0., "beside it");
+        assert_eq!(edge_scroll(view, gpui::point(px(-5.), px(390.))), 0.);
+    }
+
+    #[test]
+    fn one_scroll_ticker_runs_at_a_time() {
+        assert!(starts_ticker(-4., false));
+        assert!(!starts_ticker(-4., true), "one runs already: a jitter at the band's edge starts no second");
+        assert!(!starts_ticker(0., false));
+    }
+
+    #[test]
+    fn a_drop_s_row_moves_with_a_scroll_and_holds_while_under_the_pointer() {
+        let bounds = Bounds::new(gpui::point(px(0.), px(100.)), gpui::size(px(200.), px(30.)));
+        let mut d = TreeDrop { over: Over::Machine("you@box".into()), edge: Edge::Above, line: Line::Machine("you@box".into(), Edge::Above), bounds, offset: px(0.) };
+        // scrolled down 10 px: the row is at 90..120, still under a pointer resting at 115
+        assert!(d.scrolled(px(-10.), Some(gpui::point(px(10.), px(115.)))));
+        assert_eq!(d.bounds.origin.y, px(90.));
+        // 20 px more: at 70..100, no longer under it
+        assert!(!d.scrolled(px(-30.), Some(gpui::point(px(10.), px(115.)))));
+        assert!(!d.scrolled(px(-30.), None), "no pointer known: nowhere");
+    }
+
+    #[test]
+    fn a_move_herdr_never_answers_fails_after_its_deadline() {
+        assert_eq!(move_timeout(false), Duration::from_secs(2));
+        assert_eq!(move_timeout(true), Duration::from_secs(10));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let hung = std::future::pending::<anyhow::Result<()>>();
+        // the outer deadline keeps a bounded call that never gives up from hanging the test
+        let done = rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), bounded(Duration::from_millis(20), hung)).await });
+        let err = done.expect("given up on, not hung").unwrap_err();
+        assert_eq!(format!("{err}"), "no answer in 0 s");
+        let answered = rt.block_on(async { bounded(Duration::from_millis(20), async { anyhow::Ok(7) }).await });
+        assert_eq!(answered.unwrap(), 7);
+    }
+
+    #[test]
+    fn the_peek_card_keeps_a_pointer_still_on_it_after_a_drag() {
+        assert!(on_peek(gpui::point(px(100.), px(300.)), 240., 800.), "on the card");
+        assert!(on_peek(gpui::point(px(2.), px(300.)), 240., 800.), "on the edge strip");
+        assert!(!on_peek(gpui::point(px(260.), px(300.)), 240., 800.), "over the panes");
+        assert!(!on_peek(gpui::point(px(100.), px(797.)), 240., 800.), "under it");
     }
 
     #[test]
     fn a_drop_off_its_row_lands_nowhere() {
         let bounds = Bounds::new(gpui::point(px(0.), px(100.)), gpui::size(px(200.), px(30.)));
-        let d = TreeDrop { over: Over::Machine("you@box".into()), edge: Edge::Above, line: Line::Machine("you@box".into(), Edge::Above), bounds };
+        let d = TreeDrop { over: Over::Machine("you@box".into()), edge: Edge::Above, line: Line::Machine("you@box".into(), Edge::Above), bounds, offset: px(0.) };
         assert!(d.holds(gpui::point(px(10.), px(110.))));
         assert!(!d.holds(gpui::point(px(10.), px(131.))), "the gap under it");
     }

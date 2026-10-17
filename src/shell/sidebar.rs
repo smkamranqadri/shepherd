@@ -576,7 +576,7 @@ impl Shell {
 
         let strip = update_strip(theme, cx);
         // a drag's line and drops herdr carried out are tidied whichever view shows
-        self.tidy_tree_drag(cx);
+        self.tidy_tree_drag(window, cx);
         let settings = &SettingsGlobal::of(cx).settings;
         let layout = sidebar_layout(settings.sidebar_view, settings.show_agents, any_agents);
         let (body, listed) = if layout.tree {

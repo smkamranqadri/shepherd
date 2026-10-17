@@ -104,6 +104,10 @@ pub(super) struct TreeState {
     pub(super) scroll: gpui::ScrollHandle,
     /// How fast that drag scrolls it, in px a frame; 0 when it doesn't.
     pub(super) scroll_speed: f32,
+    /// A scroll ticker runs (`scroll_while_dragging`): one at a time.
+    pub(super) ticking: bool,
+    /// Where the drag's pointer last moved over the tree: a scroll since must leave the drop's row under it.
+    pub(super) pointer: Option<gpui::Point<Pixels>>,
     /// A drag was under way at the last frame: its end lets a peek it held out go.
     pub(super) was_dragging: bool,
     /// herdr's list of machines was read the last time: when not, a drop keeps every machine's saved place.
