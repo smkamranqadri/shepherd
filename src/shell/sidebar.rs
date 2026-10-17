@@ -447,12 +447,8 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
-        let mut agents = snapshot.as_ref().map(|s| agent_entries(s, self.agent_sort, &self.since)).unwrap_or_default();
-        // the section stays while any agent runs, so its menu can turn the filter off again
-        let any_agents = !agents.is_empty();
-        if SettingsGlobal::of(cx).settings.attention_agents {
-            agents.retain(|(p, _, _)| crate::notify::wants_attention(p.agent_status));
-        }
+        // every session's agents; the section stays while any agent runs, so its menu can turn the filter off again
+        let (agents, any_agents) = self.agents_everywhere(SettingsGlobal::of(cx).settings.attention_agents, cx);
         let active = window.is_window_active();
 
         let strip = update_strip(theme, cx);
@@ -598,9 +594,10 @@ impl Shell {
                             .when(agents.is_empty(), |el| {
                                 el.child(div().px(px(8.)).py(px(6.)).text_size(px(11.)).text_color(theme.text_faint).child("Nothing needs you"))
                             })
-                            .children(agent_rows(agents, self.agent_sort, SettingsGlobal::of(cx).settings.compact_agents, shown_tab.as_deref(), theme, |row, pane| {
-                                let (tab_id, pane_id) = (pane.tab_id.clone(), pane.pane_id.clone());
-                                row.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.show_agent(tab_id.clone(), pane_id.clone(), cx)))
+                            .children(agent_rows(agents, self.agent_sort, SettingsGlobal::of(cx).settings.compact_agents, shown_tab.as_deref(), theme, |row, e| {
+                                let (key, tab, pane) = (e.key.clone(), e.pane.tab_id.clone(), e.pane.pane_id.clone());
+                                let goal = sidebar_tree::Goal::Pane { tab, pane };
+                                row.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.go_to(key.clone(), goal.clone(), cx)))
                             }))
                             // the last row scrolls clear of the list's faded edge
                             .child(div().flex_none().h(px(4.)))),
@@ -675,36 +672,24 @@ impl Shell {
     }
 }
 
-/// The agents list's entries for `s`, in `sort`'s order: each agent with its workspace's label and how long it has
-/// waited.
-pub(super) fn agent_entries(s: &Snapshot, sort: AgentSort, since: &crate::model::Since) -> Vec<(crate::model::Pane, String, Option<String>)> {
-    s.agents_by(sort, since)
-        .into_iter()
-        .map(|p| {
-            let ws = s.workspaces.iter().find(|w| w.workspace_id == p.workspace_id);
-            let waited = crate::model::waiting_since(since, p).map(|at| crate::model::ago(at.elapsed()));
-            (p.clone(), ws.map(|w| w.label.clone()).unwrap_or_default(), waited)
-        })
-        .collect()
-}
-
 /// The agents list's rows, `act` making each one do something.
 pub(super) fn agent_rows(
-    agents: Vec<(crate::model::Pane, String, Option<String>)>,
+    agents: Vec<sidebar_tree::AgentEntry>,
     sort: AgentSort,
     compact: bool,
     shown_tab: Option<&str>,
     theme: &Theme,
-    act: impl Fn(Stateful<Div>, &crate::model::Pane) -> Stateful<Div>,
+    act: impl Fn(Stateful<Div>, &sidebar_tree::AgentEntry) -> Stateful<Div>,
 ) -> Vec<gpui::AnyElement> {
-    let workspaces: Vec<String> = agents.iter().map(|(p, _, _)| p.workspace_id.clone()).collect();
+    let workspaces: Vec<(usize, String)> = agents.iter().map(|e| (e.n, e.pane.workspace_id.clone())).collect();
     let grouped = sort == AgentSort::Grouped;
     agents
         .into_iter()
         .enumerate()
-        .flat_map(|(i, (pane, workspace, waited))| {
-            // Grouped: a heading where the workspace changes, which the rows then leave out.
-            let heading = (grouped && (i == 0 || workspaces[i - 1] != pane.workspace_id)).then(|| {
+        .flat_map(|(i, entry)| {
+            let (pane, workspace, waited) = (&entry.pane, entry.workspace.clone(), entry.waited.clone());
+            // Grouped: a heading where the workspace (or its session) changes, which the rows then leave out.
+            let heading = (grouped && (i == 0 || workspaces[i - 1] != workspaces[i])).then(|| {
                 div()
                     .flex_none()
                     .px(px(8.))
@@ -716,11 +701,11 @@ pub(super) fn agent_rows(
                     .child(workspace.clone())
                     .into_any_element()
             });
-            let selected = shown_tab == Some(pane.tab_id.as_str());
+            let selected = entry.shown && shown_tab == Some(pane.tab_id.as_str());
             let title = pane.terminal_title_stripped.clone().unwrap_or_default();
             let mark = crate::ui::command_panel::agent_icon(pane.agent.as_deref().unwrap_or_default());
             let mark = || gpui::svg().path(mark).size(px(14.)).flex_none().text_color(crate::ui::command_panel::icon_ink(mark, theme.text_muted));
-            let agent = row(theme, selected, SharedString::from(format!("agent-{}", pane.pane_id)))
+            let agent = row(theme, selected, SharedString::from(format!("agent-{}-{}", entry.n, pane.pane_id)))
                 .h(px(if compact { 30. } else { 44. }))
                 .child(status_dot(pane.agent_status, theme))
                 .when(compact, |el| {
@@ -747,7 +732,7 @@ pub(super) fn agent_rows(
                             .child(div().truncate().text_size(px(11.)).text_color(theme.text_muted).child(title)),
                     )
                 });
-            heading.into_iter().chain([act(agent, &pane).into_any_element()])
+            heading.into_iter().chain([act(agent, &entry).into_any_element()])
         })
         .collect()
 }

@@ -1,8 +1,9 @@
 //! The sidebar's tree: every machine, its sessions, and each session's workspaces, all at once. A level with one
 //! entry hides (one machine: no machine row; one machine with one session: no session rows either, as before the
 //! tree). The shown session's workspace rows are its live ones; another session's come from its watcher's last
-//! snapshot, and a click there switches to it (`go_to`). The session and machine menus start, stop and restart
-//! sessions and turn machines on and off.
+//! snapshot, and a click there switches to it (`go_to`). A session row is a header over its indented workspaces: a
+//! click on it folds them, and its menu switches there. The session and machine menus start, stop and restart
+//! sessions and turn machines on and off. The Agents section lists the agents of every session (`cross_agents`).
 use super::sessions::Place;
 use super::watchers::{Kind, SessionKey, Status, Watchers};
 use super::*;
@@ -148,6 +149,81 @@ pub(super) fn longest_waiting(s: &Snapshot, since: &crate::model::Since) -> Opti
             (at.is_none(), at)
         })
         .map(|p| (p.tab_id.clone(), p.pane_id.clone()))
+}
+
+/// Folds the session `key` when it is open, opens it when it is folded.
+pub(super) fn toggle_in(collapsed: &mut Vec<String>, key: &str) {
+    match collapsed.iter().position(|k| k == key) {
+        Some(at) => {
+            collapsed.remove(at);
+        }
+        None => collapsed.push(key.to_string()),
+    }
+}
+
+/// Whether a header (a session or machine row) gets a divider over it: every one but the first, and none right
+/// under its machine's row, which heads the group already.
+pub(super) fn divider_above(rows: &[TreeRow], i: usize) -> bool {
+    i > 0 && matches!(rows[i], TreeRow::Session { .. } | TreeRow::Machine { .. }) && !matches!(rows[i - 1], TreeRow::Machine { .. })
+}
+
+/// One session's agents, as the Agents section reads them: the shown session's live snapshot with Shepherd's own
+/// `since`, another's from its watcher, timed by the watcher's.
+pub(super) struct SessionAgents<'a> {
+    pub key: SessionKey,
+    pub name: String,
+    pub shown: bool,
+    pub snapshot: &'a Snapshot,
+    pub since: &'a crate::model::Since,
+}
+
+/// A row of the Agents section: the agent, its session, the workspace it is in ("session · workspace" when there
+/// is more than one session) and how long it has waited.
+#[derive(Clone, Debug)]
+pub(super) struct AgentEntry {
+    pub key: SessionKey,
+    /// The session's place in the list, for the rows' ids: pane ids repeat across sessions.
+    pub n: usize,
+    pub shown: bool,
+    pub pane: crate::model::Pane,
+    pub workspace: String,
+    pub waited: Option<String>,
+}
+
+/// The Agents section's entries across `sessions` (in the tree's order), in `sort`'s order, those that need you
+/// alone when `attention`; and whether any session has an agent at all. Status puts what needs you first, every
+/// session's together; Waiting the longest wait first; Grouped keeps each session's workspaces together, in turn.
+pub(super) fn cross_agents(sessions: &[SessionAgents], sort: AgentSort, attention: bool, now: Instant) -> (Vec<AgentEntry>, bool) {
+    let rank = |s: AgentStatus| match s {
+        AgentStatus::Blocked => 0,
+        AgentStatus::Done => 1,
+        AgentStatus::Working => 2,
+        AgentStatus::Idle => 3,
+        AgentStatus::Unknown => 4,
+    };
+    let named = sessions.len() > 1;
+    let mut any = false;
+    let mut out: Vec<(AgentEntry, Option<Instant>)> = Vec::new();
+    for (n, s) in sessions.iter().enumerate() {
+        for p in s.snapshot.agents_by(sort, s.since) {
+            any = true;
+            if attention && !crate::notify::wants_attention(p.agent_status) {
+                continue;
+            }
+            let at = crate::model::waiting_since(s.since, p);
+            let ws = s.snapshot.workspaces.iter().find(|w| w.workspace_id == p.workspace_id).map(|w| w.label.as_str()).unwrap_or_default();
+            let workspace = if named { format!("{} · {ws}", s.name) } else { ws.to_string() };
+            let waited = at.map(|at| crate::model::ago(now.saturating_duration_since(at)));
+            out.push((AgentEntry { key: s.key.clone(), n, shown: s.shown, pane: p.clone(), workspace, waited }, at));
+        }
+    }
+    // stable sorts: within a rank or a wait, each session's own order, and the sessions in the tree's
+    match sort {
+        AgentSort::Status => out.sort_by_key(|(e, _)| rank(e.pane.agent_status)),
+        AgentSort::Waiting => out.sort_by_key(|(_, at)| (at.is_none(), *at)),
+        AgentSort::Grouped => {}
+    }
+    (out.into_iter().map(|(e, _)| e).collect(), any)
 }
 
 /// The tree's rows for `places` (in [`tree_order`]), their watchers and the collapsed sessions; `shown` is the shown
@@ -336,14 +412,38 @@ impl Shell {
 
     fn toggle_collapsed(&mut self, key: &SessionKey, cx: &mut Context<Self>) {
         let key = key.0.clone();
-        save_from_sidebar(cx, move |s| {
-            if let Some(at) = s.collapsed_sessions.iter().position(|k| *k == key) {
-                s.collapsed_sessions.remove(at);
-            } else {
-                s.collapsed_sessions.push(key);
-            }
-        });
+        save_from_sidebar(cx, move |s| toggle_in(&mut s.collapsed_sessions, &key));
         cx.notify();
+    }
+
+    /// The Agents section's entries from every session: the shown one's live snapshot, the others' from their
+    /// watchers; and whether any session has an agent at all.
+    // TODO(L2): notifications still come from the shown session alone; another session's agents that start
+    // waiting are listed here but notify nothing.
+    pub(super) fn agents_everywhere(&self, attention: bool, cx: &App) -> (Vec<AgentEntry>, bool) {
+        let shown = self.shown_key();
+        let mut sessions: Vec<SessionAgents> = Vec::new();
+        let listed = |k: &SessionKey| self.places.iter().any(|p| SessionKey::of(p) == *k);
+        if let (Some(key), Some(snapshot)) = (&shown, self.snapshot.as_ref()) {
+            // a socket of one's own, outside herdr's list, leads as its workspaces do
+            if !listed(key) {
+                sessions.push(SessionAgents { key: key.clone(), name: self.place_label(cx), shown: true, snapshot, since: &self.since });
+            }
+        }
+        for place in &self.places {
+            let key = SessionKey::of(place);
+            let name = place.look(cx).0;
+            if shown.as_ref() == Some(&key) {
+                if let Some(snapshot) = self.snapshot.as_ref() {
+                    sessions.push(SessionAgents { key, name, shown: true, snapshot, since: &self.since });
+                }
+            } else if let Some(w) = self.watchers.get(&key).filter(|w| w.status != Status::Stopped)
+                && let Some(snapshot) = w.snapshot.as_ref()
+            {
+                sessions.push(SessionAgents { key, name, shown: false, snapshot, since: &w.since });
+            }
+        }
+        cross_agents(&sessions, self.agent_sort, attention, Instant::now())
     }
 
     /// The tree's elements, and whether it lists sessions (then the header leaves out the shown one's name).
@@ -356,43 +456,79 @@ impl Shell {
             (opacity, order.into_iter().zip(WORKSPACE_ACTIONS).filter_map(|((k, w), a)| Some((k, w, chord_of(cx, a)?))).collect())
         });
         let mut out = Vec::new();
-        for row in rows {
-            match row {
-                TreeRow::Machine { id, label, enabled, .. } => out.push(self.machine_row(theme, id, label, enabled, cx)),
+        for (i, row) in rows.iter().enumerate() {
+            // a divider and 8 px or more between session groups
+            if divider_above(&rows, i) {
+                out.push(div().flex_none().mx(px(6.)).mt(px(6.)).mb(px(4.)).h(px(1.)).bg(theme.border.opacity(0.6)).into_any_element());
+            }
+            match row.clone() {
+                TreeRow::Machine { id, label, status, enabled } => out.push(self.machine_row(theme, id, label, status, enabled, cx)),
                 TreeRow::Session { key, collapsed, waiting, status } => {
                     if let Some(place) = self.places.iter().find(|p| SessionKey::of(p) == key).cloned() {
                         out.push(self.session_row(theme, place, key, collapsed, waiting, status, cx));
                     }
                 }
                 TreeRow::Notice { key, text, action } => out.push(self.notice_row(theme, key, text, action, cx)),
-                TreeRow::Workspaces { key } if key == shown => {
-                    out.extend(self.workspace_rows(theme, snapshot.as_ref(), shown_ws, RowMode::Live, hints.as_ref(), active, cx));
-                }
                 TreeRow::Workspaces { key } => {
-                    let other = self.watchers.snapshot(&key);
-                    out.extend(self.workspace_rows(theme, other, &None, RowMode::Other(key), hints.as_ref(), active, cx));
+                    let ws = if key == shown {
+                        self.workspace_rows(theme, snapshot.as_ref(), shown_ws, RowMode::Live, hints.as_ref(), active, cx)
+                    } else {
+                        let other = self.watchers.snapshot(&key);
+                        self.workspace_rows(theme, other, &None, RowMode::Other(key), hints.as_ref(), active, cx)
+                    };
+                    if listed {
+                        // indented under their session's header, a faint guide down their left
+                        out.push(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .ml(px(15.))
+                                .pl(px(5.))
+                                .border_l_1()
+                                .border_color(theme.border.opacity(0.6))
+                                .children(ws)
+                                .into_any_element(),
+                        );
+                    } else {
+                        out.extend(ws);
+                    }
                 }
             }
         }
         (out, listed)
     }
 
-    fn machine_row(&self, theme: &Theme, id: String, label: String, enabled: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// A machine's header: its icon, its name in small caps, a dot for whether it answers, and ⋯ on hover.
+    fn machine_row(&self, theme: &Theme, id: String, label: String, status: Status, enabled: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         let hover_bg = theme.hover;
         let menu_id = id.clone();
+        let group = SharedString::from(format!("tree-machine-group-{id}"));
+        let open = self.tree.machine_menu.as_ref().is_some_and(|m| m.is_open() && m.value.0 == id);
+        let ink = if enabled { theme.text_muted } else { theme.text_faint.opacity(0.6) };
+        let dot = match status {
+            _ if !enabled => theme.text_faint.opacity(0.4),
+            Status::Unreachable => theme.danger,
+            Status::Stopped => theme.text_faint.opacity(0.6),
+            _ => theme.success,
+        };
+        let icon = if id == LOCAL { "icons/monitor.svg" } else { "icons/remote-server.svg" };
         div()
             .id(SharedString::from(format!("tree-machine-{id}")))
-            .h(px(20.))
-            .mt(px(6.))
+            .group(group.clone())
+            .h(px(26.))
             .px(px(8.))
             .flex()
             .flex_none()
             .items_center()
             .gap(px(6.))
-            .text_size(px(11.))
-            .text_color(if enabled { theme.text_faint } else { theme.text_faint.opacity(0.6) })
-            .when(id != LOCAL, |el| el.child(gpui::svg().path("icons/remote-server.svg").size(px(11.)).flex_none().text_color(theme.text_faint)))
-            .child(div().flex_1().min_w_0().truncate().child(if enabled { label } else { format!("{label} · off") }))
+            .text_size(px(10.5))
+            .font_weight(gpui::FontWeight::BOLD)
+            .text_color(ink)
+            .child(gpui::svg().path(icon).size(px(13.)).flex_none().text_color(ink))
+            .child(div().flex_1().min_w_0().truncate().child(if enabled { label.to_uppercase() } else { format!("{} · OFF", label.to_uppercase()) }))
+            .child(div().size(px(6.)).flex_none().rounded_full().bg(dot))
             .child(
                 div()
                     .id(SharedString::from(format!("tree-machine-menu-{id}")))
@@ -403,6 +539,7 @@ impl Shell {
                     .rounded(px(4.))
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover_bg))
+                    .when(!open, |el| el.opacity(0.).group_hover(group, |s| s.opacity(1.)))
                     .child(gpui::svg().path("icons/more-horizontal.svg").size(px(12.)).text_color(theme.text_faint))
                     .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
@@ -427,19 +564,11 @@ impl Shell {
         let shown = status == Status::Shown;
         let (name, icon) = place.look(cx);
         let ink = if shown { theme.text } else { theme.text_muted };
+        // the icon set in Edit…, else a terminal for this computer's sessions and a server for an SSH machine's
         let mark = match (icon, &place) {
-            (Some(icon), _) => sessions::icon_mark(&icon, 13., ink),
-            (None, Place::Machine(_)) => gpui::svg().path("icons/remote-server.svg").size(px(13.)).flex_none().text_color(ink).into_any_element(),
-            (None, Place::Session(_)) => div()
-                .size(px(14.))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(11.))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(name.chars().next().unwrap_or('?').to_uppercase().to_string())
-                .into_any_element(),
+            (Some(icon), _) => sessions::icon_mark(&icon, 14., ink),
+            (None, Place::Machine(_)) => gpui::svg().path("icons/remote-server.svg").size(px(14.)).flex_none().text_color(ink).into_any_element(),
+            (None, Place::Session(_)) => gpui::svg().path("icons/terminal.svg").size(px(14.)).flex_none().text_color(ink).into_any_element(),
         };
         let badge = (waiting > 0).then(|| {
             let goal_key = key.clone();
@@ -472,11 +601,10 @@ impl Shell {
                 }))
         });
         let toggle_key = key.clone();
-        let chevron = fold_chevron(theme, &format!("session-{idx}"), !collapsed, 1., None).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-            cx.stop_propagation();
-            this.toggle_collapsed(&toggle_key, cx);
-        }));
-        let (menu_place, right_place, to) = (place.clone(), place.clone(), place);
+        let chevron = fold_chevron(theme, &format!("session-{idx}"), !collapsed, 1., None);
+        let group = SharedString::from(format!("tree-session-group-{idx}"));
+        let open = self.place_menu.as_ref().is_some_and(|m| m.is_open() && m.value.0.key() == place.key());
+        let (menu_place, right_place) = (place.clone(), place);
         let more = div()
             .id(("tree-session-menu", idx))
             .size(px(18.))
@@ -487,29 +615,29 @@ impl Shell {
             .rounded(px(4.))
             .cursor_pointer()
             .hover(move |s| s.bg(hover_bg))
+            .when(!open, |el| el.opacity(0.).group_hover(group.clone(), |s| s.opacity(1.)))
             .child(gpui::svg().path("icons/more-horizontal.svg").size(px(12.)).text_color(theme.text_faint))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
                 cx.stop_propagation();
                 this.open_place_menu(menu_place.clone(), e.position, cx);
             }));
+        // a header: the chevron, the session's icon and its name in bold; a click anywhere folds its workspaces
         row(theme, false, ("tree-session", idx))
-            .h(px(26.))
-            .mt(px(2.))
+            .group(group)
+            .h(px(28.))
+            .pl(px(2.))
+            .pr(px(4.))
             .gap(px(6.))
-            .text_size(px(12.))
+            .text_size(px(12.5))
             .text_color(ink)
-            .when(shown, |el| el.font_weight(gpui::FontWeight::MEDIUM))
-            .child(div().size(px(6.)).flex_none().rounded_full().bg(dot))
+            .font_weight(if shown { gpui::FontWeight::BOLD } else { gpui::FontWeight::SEMIBOLD })
+            .child(chevron)
             .child(mark)
             .child(div().flex_1().min_w_0().truncate().child(name))
             .children(badge)
-            .child(chevron)
+            .child(div().size(px(6.)).flex_none().rounded_full().bg(dot))
             .child(more)
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                if !this.places_shown(&to) {
-                    this.show_place_from_tree(to.clone(), cx);
-                }
-            }))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_collapsed(&toggle_key, cx)))
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, _, cx| this.open_place_menu(right_place.clone(), e.position, cx)))
             .into_any_element()
     }
@@ -626,6 +754,16 @@ impl Shell {
             }
         };
         let mut items = Vec::new();
+        // a click on the session's row folds it: switching there is here (or a click on one of its workspaces)
+        if !self.places_shown(place) {
+            let to = place.clone();
+            items.push(item("place-menu-switch", "Switch to this session").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                close(this);
+                if !this.places_shown(&to) {
+                    this.show_place_from_tree(to.clone(), cx);
+                }
+            })));
+        }
         if let Place::Session(s) = place {
             let key = SessionKey::of(place);
             let stopped = !s.running || self.watchers.get(&key).is_some_and(|w| w.status == Status::Stopped);
@@ -1000,5 +1138,76 @@ mod tests {
         since.insert("p1".into(), (crate::model::AgentStatus::Blocked, Instant::now()));
         assert_eq!(longest_waiting(&s, &since), Some(("t1".into(), "p1".into())));
         assert_eq!(waiting(&s), 1);
+    }
+
+    #[test]
+    fn a_click_folds_an_open_session_and_opens_a_folded_one() {
+        let mut collapsed = vec!["/tmp/a.sock".to_string()];
+        toggle_in(&mut collapsed, "/tmp/b.sock");
+        assert_eq!(collapsed, ["/tmp/a.sock", "/tmp/b.sock"]);
+        toggle_in(&mut collapsed, "/tmp/a.sock");
+        assert_eq!(collapsed, ["/tmp/b.sock"]);
+        toggle_in(&mut collapsed, "/tmp/b.sock");
+        assert!(collapsed.is_empty());
+    }
+
+    #[test]
+    fn dividers_part_the_session_groups() {
+        let session = |n: &str| TreeRow::Session { key: key(n), collapsed: false, waiting: 0, status: Status::Live };
+        let machine = TreeRow::Machine { id: "you@box".into(), label: "you@box".into(), status: Status::Live, enabled: true };
+        let rows = vec![session("a"), TreeRow::Workspaces { key: key("a") }, session("b"), machine, session("c")];
+        let at: Vec<usize> = (0..rows.len()).filter(|i| divider_above(&rows, *i)).collect();
+        assert_eq!(at, [2, 3], "not over the first, not under a machine's header");
+    }
+
+    fn agents_snapshot(panes: &[(&str, &str)]) -> Snapshot {
+        let panes: Vec<_> = panes
+            .iter()
+            .map(|(id, status)| json!({"pane_id": id, "tab_id": format!("t-{id}"), "workspace_id": "w1", "terminal_id": id, "agent_status": status, "agent": "claude"}))
+            .collect();
+        let ws = json!([{"workspace_id": "w1", "label": "web", "number": 1, "active_tab_id": null, "agent_status": "idle", "worktree": null}]);
+        Snapshot::from_result(&json!({"snapshot": {"focused_workspace_id": null, "focused_tab_id": null, "focused_pane_id": null, "workspaces": ws, "tabs": [], "panes": panes, "layouts": []}})).unwrap()
+    }
+
+    #[test]
+    fn the_agents_of_every_session_are_listed_in_one_order() {
+        let shown = agents_snapshot(&[("p1", "working"), ("p2", "done")]);
+        let other = agents_snapshot(&[("q1", "blocked"), ("q2", "idle")]);
+        let t0 = Instant::now();
+        let mut since_shown = crate::model::Since::new();
+        since_shown.insert("p2".into(), (AgentStatus::Done, t0 + Duration::from_secs(240)));
+        let mut since_other = crate::model::Since::new();
+        since_other.insert("q1".into(), (AgentStatus::Blocked, t0));
+        let now = t0 + Duration::from_secs(300);
+        let sessions = [
+            SessionAgents { key: key("default"), name: "default".into(), shown: true, snapshot: &shown, since: &since_shown },
+            SessionAgents { key: key("menqal"), name: "menqal".into(), shown: false, snapshot: &other, since: &since_other },
+        ];
+        let ids = |e: &[AgentEntry]| e.iter().map(|e| e.pane.pane_id.clone()).collect::<Vec<_>>();
+
+        let (all, any) = cross_agents(&sessions, AgentSort::Status, false, now);
+        assert!(any);
+        assert_eq!(ids(&all), ["q1", "p2", "p1", "q2"], "what needs you first, whichever session");
+        assert_eq!(all[0].workspace, "menqal · web");
+        assert_eq!((all[0].key.clone(), all[0].shown, all[0].n), (key("menqal"), false, 1));
+
+        let (attention, any) = cross_agents(&sessions, AgentSort::Status, true, now);
+        assert!(any);
+        assert_eq!(ids(&attention), ["q1", "p2"]);
+
+        // each session's wait is timed by its own `since`
+        let (waiting, _) = cross_agents(&sessions, AgentSort::Waiting, false, now);
+        assert_eq!(ids(&waiting)[..2], ["q1", "p2"]);
+        assert_eq!(waiting[0].waited.as_deref(), Some("5m"));
+        assert_eq!(waiting[1].waited.as_deref(), Some("1m"));
+
+        let (grouped, _) = cross_agents(&sessions, AgentSort::Grouped, false, now);
+        assert!(grouped[..2].iter().all(|e| e.key == key("default")), "each session's together, in the tree's order");
+
+        // one session: its workspaces alone name the rows
+        let (one, _) = cross_agents(&sessions[..1], AgentSort::Status, false, now);
+        assert_eq!(one[0].workspace, "web");
+        let (none, any) = cross_agents(&[], AgentSort::Status, true, now);
+        assert!(none.is_empty() && !any);
     }
 }
