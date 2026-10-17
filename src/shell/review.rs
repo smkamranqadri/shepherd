@@ -9,12 +9,22 @@ use crate::ui::statusbar::{branch_of, cached, fetching, pane_dir, refetch};
 const REVIEW_TTL: Duration = Duration::from_secs(120);
 /// How much of a description shows folded: about six lines.
 const FOLDED: f32 = 120.;
-/// How often while one of its checks runs or waits to; twice that on battery (`power::stretch`).
-pub(super) const REVIEW_POLL: Duration = Duration::from_secs(10);
+/// How often while one of its checks runs or waits to.
+const REVIEW_POLL: Duration = Duration::from_secs(10);
 /// Past this a swipe over the checks pages when the fingers lift; short of it, the page springs back.
 const PAGE_COMMIT: f32 = 60.;
 /// How long after a retry, play or cancel before asking again: the host takes a moment to queue it.
 const SETTLE: Duration = Duration::from_secs(3);
+
+/// [`REVIEW_TTL`], doubled on `battery` as every background check is (`power`).
+fn review_ttl(battery: bool) -> Duration {
+    crate::power::stretch_on(REVIEW_TTL, battery)
+}
+
+/// [`REVIEW_POLL`], doubled on `battery`.
+pub(super) fn review_poll(battery: bool) -> Duration {
+    crate::power::stretch_on(REVIEW_POLL, battery)
+}
 
 /// The shown pane's branch and its review, for the panel and the status bar.
 #[derive(Default)]
@@ -43,7 +53,7 @@ pub(super) struct MergeAsk {
 }
 
 impl Shell {
-    /// Asks gh or glab again about the branch the panel shows while its checks run; called every `REVIEW_POLL`.
+    /// Asks gh or glab again about the branch the panel shows while its checks run; called every `review_poll`.
     pub(super) fn poll_review(&mut self, cx: &mut Context<Self>) {
         if let Some(key) = self.review_poll.clone() {
             refetch::<Review>(&key, cx);
@@ -57,7 +67,7 @@ impl Shell {
         let dir = pane_dir(snapshot, pane.as_deref());
         let branch = dir.as_deref().and_then(|d| branch_of(d, cx));
         let key = dir.clone().zip(branch.clone()).map(|(d, b)| format!("{d}\n{b}"));
-        let ttl = if window.is_window_active() { REVIEW_TTL } else { Duration::MAX };
+        let ttl = if window.is_window_active() { review_ttl(crate::power::on_battery()) } else { Duration::MAX };
         let review = key.as_deref().and_then(|k| cached(k, ttl, read_review, cx));
         let running = review.as_ref().is_some_and(Review::running);
         self.review_poll = key.clone().filter(|_| running);
@@ -940,4 +950,15 @@ fn act_button(
                     .child(gpui::svg().path(icon).size(px(13.)).text_color(ink))
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_review_is_asked_half_as_often_on_battery() {
+        assert_eq!((review_ttl(false), review_poll(false)), (REVIEW_TTL, REVIEW_POLL));
+        assert_eq!((review_ttl(true), review_poll(true)), (REVIEW_TTL * 2, REVIEW_POLL * 2));
+    }
 }

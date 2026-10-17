@@ -684,7 +684,7 @@ impl Shell {
                 })
                 .detach();
                 cx.spawn(async move |this, cx| loop {
-                    cx.background_executor().timer(crate::power::stretch(review::REVIEW_POLL)).await;
+                    cx.background_executor().timer(review::review_poll(crate::power::on_battery())).await;
                     if this.update(cx, |s, cx| s.poll_review(cx)).is_err() {
                         return; // window closed
                     }

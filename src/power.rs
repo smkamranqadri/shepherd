@@ -59,10 +59,11 @@ pub struct Supply {
 /// names.
 const EXTERNAL: [&str; 9] = ["Mains", "USB", "USB_C", "USB_PD", "USB_PD_DRP", "USB_DCP", "USB_CDP", "USB_ACA", "Wireless"];
 
-/// On battery, from the machine's supplies: any external supply online means mains power; otherwise a battery that
-/// says it discharges, or one with every external supply offline, means battery. A supply scoped to a device (a
-/// mouse's or a headset's battery) says nothing about the machine and is left out. Anything else, a desktop with
-/// no supplies listed, a battery alone saying `Full`, counts as mains power, so a missed reading never slows things.
+/// On battery, from the machine's supplies: any external supply online, or a battery charging (an adapter the
+/// kernel lists under no supply of its own), means mains power; otherwise a battery that says it discharges, or one
+/// with every external supply offline, means battery. A supply scoped to a device (a mouse's or a headset's
+/// battery) says nothing about the machine and is left out. Anything else, a desktop with no supplies listed, a
+/// battery alone saying `Full`, counts as mains power, so a missed reading never slows things.
 pub fn on_battery_of(supplies: &[Supply]) -> bool {
     let system: Vec<&Supply> = supplies.iter().filter(|s| s.scope.as_deref() != Some("Device")).collect();
     let external: Vec<&Supply> = system.iter().copied().filter(|s| EXTERNAL.contains(&s.kind.as_str())).collect();
@@ -70,13 +71,18 @@ pub fn on_battery_of(supplies: &[Supply]) -> bool {
         return false;
     }
     let batteries: Vec<&Supply> = system.iter().copied().filter(|s| s.kind == "Battery").collect();
+    if batteries.iter().any(|b| b.status.as_deref() == Some("Charging")) {
+        return false;
+    }
     let discharging = batteries.iter().any(|b| b.status.as_deref() == Some("Discharging"));
     let unplugged = !external.is_empty() && external.iter().all(|s| s.online == Some(false));
     discharging || (!batteries.is_empty() && unplugged)
 }
 
 /// The supplies listed under `dir` (`/sys/class/power_supply`), each with the attributes it has; none when it
-/// cannot be read.
+/// cannot be read, and an entry without a `type` is skipped. `scope` and `type` come first and are all that is read
+/// of a device's own supply: its other attributes are asked of the device itself, which may wake a Bluetooth mouse
+/// or headset every 30 s. `status` is read of batteries only, `online` of the rest.
 #[cfg(target_os = "linux")]
 fn supplies(dir: &std::path::Path) -> Vec<Supply> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
@@ -85,12 +91,15 @@ fn supplies(dir: &std::path::Path) -> Vec<Supply> {
         .flatten()
         .filter_map(|e| {
             let p = e.path();
-            Some(Supply {
-                kind: attr(&p, "type")?,
-                online: attr(&p, "online").map(|v| v != "0"),
-                scope: attr(&p, "scope"),
-                status: attr(&p, "status"),
-            })
+            let scope = attr(&p, "scope");
+            let kind = attr(&p, "type")?;
+            if scope.as_deref() == Some("Device") {
+                return Some(Supply { kind, scope, ..Default::default() });
+            }
+            let battery = kind == "Battery";
+            let online = if battery { None } else { attr(&p, "online").map(|v| v != "0") };
+            let status = if battery { attr(&p, "status") } else { None };
+            Some(Supply { kind, online, scope, status })
         })
         .collect()
 }
@@ -117,7 +126,8 @@ fn read() -> bool {
     }
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
-        fn CFStringGetCString(s: Ref, buf: *mut c_char, len: isize, encoding: u32) -> bool;
+        // CoreFoundation's `Boolean` is an unsigned char: read as a byte, not trusted to be 0 or 1
+        fn CFStringGetCString(s: Ref, buf: *mut c_char, len: isize, encoding: u32) -> u8;
         fn CFRelease(r: Ref);
     }
     const UTF8: u32 = 0x0800_0100;
@@ -130,7 +140,7 @@ fn read() -> bool {
         }
         let kind = IOPSGetProvidingPowerSourceType(blob);
         let mut buf = [0 as c_char; 64];
-        let named = !kind.is_null() && CFStringGetCString(kind, buf.as_mut_ptr(), buf.len() as isize, UTF8);
+        let named = !kind.is_null() && CFStringGetCString(kind, buf.as_mut_ptr(), buf.len() as isize, UTF8) != 0;
         CFRelease(blob);
         named && std::ffi::CStr::from_ptr(buf.as_ptr()).to_str().is_ok_and(mac_source)
     }
@@ -183,6 +193,45 @@ mod tests {
         // a full battery says "Not charging" or "Full", not "Discharging": every external offline says it
         let full = vec![supply("Mains", Some(false), None, None), supply("Battery", None, None, Some("Full"))];
         assert!(on_battery_of(&full), "all external offline");
+    }
+
+    #[test]
+    fn a_charging_battery_is_on_mains() {
+        // an adapter the kernel shows only through the battery: no Mains, its USB-C port offline
+        let charging = vec![supply("Battery", None, None, Some("Charging")), supply("USB", Some(false), Some("System"), None)];
+        assert!(!on_battery_of(&charging));
+        let one_of_two = vec![supply("Battery", None, None, Some("Charging")), supply("Battery", None, None, Some("Discharging"))];
+        assert!(!on_battery_of(&one_of_two), "one battery charging from the other's drain is still plugged in");
+    }
+
+    /// A sysfs tree as the kernel lays it out: values end in a newline, `online` may be 2 (a programmable
+    /// supply), and an entry may lack a `type`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supplies_are_read_from_sysfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = |name: &str, attrs: &[(&str, &str)]| {
+            let p = dir.path().join(name);
+            std::fs::create_dir(&p).unwrap();
+            for (attr, value) in attrs {
+                std::fs::write(p.join(attr), value).unwrap();
+            }
+        };
+        entry("AC", &[("type", "Mains\n"), ("online", "2\n"), ("status", "Charging\n")]);
+        entry("BAT0", &[("type", "Battery\n"), ("status", "Discharging\n"), ("online", "1\n")]);
+        entry("ucsi-source-psy-USBC000:001", &[("type", "USB\n"), ("online", "0\n"), ("scope", "System\n")]);
+        entry("hid-mouse-battery", &[("type", "Battery\n"), ("scope", "Device\n"), ("status", "Discharging\n"), ("online", "1\n")]);
+        entry("no-type", &[("online", "1\n"), ("status", "Discharging\n")]);
+        let mut read = supplies(dir.path());
+        read.sort_by(|a, b| (&a.kind, &a.scope).cmp(&(&b.kind, &b.scope)));
+        assert_eq!(read, [
+            supply("Battery", None, None, Some("Discharging")),
+            supply("Battery", None, Some("Device"), None),
+            supply("Mains", Some(true), None, None),
+            supply("USB", Some(false), Some("System"), None),
+        ]);
+        assert!(!on_battery_of(&read), "online 2 is online");
+        assert!(supplies(&dir.path().join("missing")).is_empty());
     }
 
     #[test]

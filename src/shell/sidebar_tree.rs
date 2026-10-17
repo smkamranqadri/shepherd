@@ -978,7 +978,7 @@ impl Shell {
     /// The branch of another session's workspace row: its checkout's HEAD, read from the file (no git, no status,
     /// no ahead or behind) on a background thread, at most once a minute.
     pub(super) fn other_branch(dir: &str, cx: &mut App) -> Option<String> {
-        crate::ui::statusbar::cached(dir, HEAD_TTL, read_head, cx).map(|Head(b)| b)
+        crate::ui::statusbar::cached(dir, crate::power::stretch(HEAD_TTL), read_head, cx).map(|Head(b)| b)
     }
 
     /// The fold key and element id prefix of a session's workspace rows.

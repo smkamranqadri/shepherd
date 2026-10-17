@@ -120,7 +120,7 @@ impl SidePanel {
     pub fn new(rt: Handle, tab: PanelTab, cx: &mut Context<Self>) -> SidePanel {
         // the polls' clock: a tick does nothing for a tab that is not live; half the pace on battery
         cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(crate::power::stretch(files::POLL)).await;
+            cx.background_executor().timer(files::poll_on(crate::power::on_battery())).await;
             let polled = this.update(cx, |p, cx| {
                 p.poll_files(true, cx);
                 p.poll_changes(cx);
