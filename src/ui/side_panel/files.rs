@@ -29,15 +29,71 @@ pub(super) const POLL: Duration = Duration::from_secs(3);
 /// A poll reads at most this many open folders: the root, then the open ones in the order they are drawn.
 const MAX_POLLED: usize = 200;
 const ROW_HEIGHT: f32 = 22.;
+/// The list's padding above its first row (and below its last).
+const LIST_PAD: f32 = 4.;
 const INDENT: f32 = 12.;
 /// `git check-ignore` gets 20k names at most (a folder's cap); it answers with as many.
 const CHECK_IGNORE: Limits = Limits { timeout: Duration::from_secs(10), max_bytes: 1 << 20 };
+
+/// Workspaces whose Files tree is remembered when another root replaces it (`FilesMemories`).
+const FILES_MEMORY: usize = 64;
+
+/// What a workspace's Files tree showed when another root replaced it: the folders open, the row selected and the
+/// row at the top. Given back only to a tree of the same root.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilesMemory {
+    pub root: PathBuf,
+    pub expanded: Vec<PathBuf>,
+    pub selected: Option<PathBuf>,
+    pub top: Option<usize>,
+}
+
+/// Each workspace's [`FilesMemory`] by its key (`roots::root_key`), most recently left first, at most
+/// `FILES_MEMORY`.
+#[derive(Debug, Default)]
+pub(super) struct FilesMemories(Vec<(String, FilesMemory)>);
+
+impl FilesMemories {
+    /// Keeps `memory` for `key` as the most recent; a tree with no workspace (`""`) is not kept.
+    pub(super) fn stash(&mut self, key: &str, memory: FilesMemory) {
+        if key.is_empty() {
+            return;
+        }
+        self.0.retain(|(k, _)| k != key);
+        self.0.insert(0, (key.to_string(), memory));
+        self.0.truncate(FILES_MEMORY);
+    }
+
+    /// `key`'s memory, when it was of `root`: a workspace given another root starts afresh.
+    pub(super) fn recall(&self, key: &str, root: &Path) -> Option<&FilesMemory> {
+        self.0.iter().find(|(k, _)| k == key).map(|(_, m)| m).filter(|m| m.root == root)
+    }
+
+    /// Kept from the last run: only where this run has none, behind this run's.
+    pub(super) fn seed(&mut self, key: String, memory: FilesMemory) {
+        if !key.is_empty() && self.0.len() < FILES_MEMORY && !self.0.iter().any(|(k, _)| *k == key) {
+            self.0.push((key, memory));
+        }
+    }
+
+    pub(super) fn forget(&mut self, keys: &[String]) {
+        self.0.retain(|(k, _)| !keys.contains(k));
+    }
+
+    pub(super) fn entries(&self) -> &[(String, FilesMemory)] {
+        &self.0
+    }
+}
 
 /// One root's tree: what was read of it, what is open, and the rows that makes.
 pub(super) struct FileTree {
     /// Told apart from the tree of a root chosen since, whose reads must not land here.
     id: u64,
     pub(super) root: PathBuf,
+    /// The workspace it shows (`roots::root_key`; `""` for none), whose memory it is kept as.
+    memory_key: String,
+    /// The row to scroll to the top once the remembered folders' reads land.
+    pending_top: Option<usize>,
     reads: HashMap<PathBuf, Read>,
     /// Each read folder's `Listing::fingerprint` (or its error's): a poll hands these over and hears back only
     /// what changed.
@@ -81,11 +137,13 @@ struct Answer {
 }
 
 impl FileTree {
-    fn new(root: PathBuf, flags: (bool, bool)) -> FileTree {
+    fn new(root: PathBuf, flags: (bool, bool), memory_key: String) -> FileTree {
         static IDS: AtomicU64 = AtomicU64::new(0);
         FileTree {
             id: IDS.fetch_add(1, Ordering::Relaxed),
             root,
+            memory_key,
+            pending_top: None,
             reads: HashMap::new(),
             fingerprints: HashMap::new(),
             expanded: HashSet::new(),
@@ -105,6 +163,45 @@ impl FileTree {
     fn rebuild(&mut self, flags: (bool, bool)) {
         self.flags = flags;
         self.rows = tree::visible_rows(&self.root, &self.reads, &self.expanded, flags.0, flags.1);
+        // the remembered folders came in one read with the root: the rows are as they were left
+        if self.reads.contains_key(&self.root)
+            && let Some(top) = self.pending_top.take()
+            && !self.rows.is_empty()
+        {
+            self.scroll.scroll_to_item(top.min(self.rows.len() - 1), ScrollStrategy::Top);
+        }
+    }
+
+    /// What it shows, to give back to its workspace's next tree: the open folders that read (not those gone).
+    fn memory(&self) -> FilesMemory {
+        let mut expanded: Vec<PathBuf> = self.expanded.iter().filter(|d| matches!(self.reads.get(*d), Some(Read::Listed(_)))).cloned().collect();
+        expanded.sort();
+        let top = (!self.rows.is_empty()).then(|| self.top_row());
+        FilesMemory { root: self.root.clone(), expanded, selected: self.selected.clone(), top: self.pending_top.or(top) }
+    }
+
+    /// The row at the top of the list: one asked for and not yet scrolled to, else the scroll offset's.
+    fn top_row(&self) -> usize {
+        let state = self.scroll.0.borrow();
+        let scrolled = -f32::from(state.base_handle.offset().y) - LIST_PAD;
+        state.deferred_scroll_to_item.as_ref().map_or((scrolled.max(0.) / ROW_HEIGHT) as usize, |d| d.item_index)
+    }
+
+    /// Opens what `memory` had open (inside the root only); returns the folders to read with the root.
+    fn recall(&mut self, memory: &FilesMemory) -> Vec<PathBuf> {
+        let inside = |p: &PathBuf| p != &self.root && p.starts_with(&self.root);
+        self.expanded = memory.expanded.iter().filter(|p| inside(p)).cloned().collect();
+        self.selected = memory.selected.clone().filter(|p| inside(p));
+        self.pending_top = memory.top;
+        let mut dirs: Vec<PathBuf> = self.expanded.iter().cloned().collect();
+        dirs.sort();
+        dirs.truncate(MAX_POLLED - 1);
+        dirs
+    }
+
+    /// Nothing opened or picked yet: a memory from the last run may still be given to it.
+    fn untouched(&self) -> bool {
+        self.expanded.is_empty() && self.selected.is_none()
     }
 
     /// The row of the entry at `path`, if it is drawn.
@@ -232,19 +329,74 @@ async fn mark_ignored(root: &Path, dir: &Path, listing: &mut Listing, git: Optio
 impl SidePanel {
     /// Keeps the tree on the context's root: a new root gets a new tree (read when the Files tab shows it); no
     /// root, or a machine's, none.
+    /// A tree replaced (by another root or none) is remembered for its workspace, and a workspace shown again with
+    /// the same root opens what it had open, at the row it was scrolled to.
     pub(super) fn sync_files(&mut self, cx: &mut Context<Self>) {
         let root = self.context.root.as_deref().filter(|_| !self.context.remote).map(PathBuf::from);
+        let key = self.context.workspace_id.as_deref().map_or_else(String::new, |ws| crate::files::roots::root_key(&self.context.place, ws));
         let Some(root) = root else {
+            self.stash_files(cx);
             self.files = None;
             self.file_menu = None;
             return;
         };
-        if self.tab != crate::settings::PanelTab::Files || self.files.as_ref().is_some_and(|t| t.root == root) {
+        if self.tab != crate::settings::PanelTab::Files {
             return;
         }
-        self.files = Some(FileTree::new(root.clone(), flags(cx)));
+        if self.files.as_ref().is_some_and(|t| t.root == root) {
+            // another workspace on the same root: the tree stays, and is that workspace's from now on
+            if self.files.as_ref().is_some_and(|t| t.memory_key != key) {
+                self.stash_files(cx);
+                if let Some(tree) = self.files.as_mut() {
+                    tree.memory_key = key;
+                }
+            }
+            return;
+        }
+        self.stash_files(cx);
+        let mut tree = FileTree::new(root.clone(), flags(cx), key);
+        let open = self.files_memory.recall(&tree.memory_key, &root).cloned().map(|m| tree.recall(&m)).unwrap_or_default();
+        self.files = Some(tree);
         self.file_menu = None;
-        self.read_dirs(vec![root], false, false, cx);
+        self.read_dirs(std::iter::once(root).chain(open).collect(), false, false, cx);
+    }
+
+    /// The shown tree, remembered for its workspace.
+    fn stash_files(&mut self, cx: &mut Context<Self>) {
+        if let Some(tree) = self.files.as_ref().filter(|t| !t.memory_key.is_empty()) {
+            self.files_memory.stash(&tree.memory_key, tree.memory());
+            cx.emit(SidePanelEvent::FilesRemembered);
+        }
+    }
+
+    /// Every workspace's open folders as remembered, the shown tree's as it is now: (key, root, open folders), kept
+    /// for the next run.
+    pub fn files_memory_now(&self) -> Vec<(String, PathBuf, Vec<PathBuf>)> {
+        let live = self.files.as_ref().filter(|t| !t.memory_key.is_empty()).map(|t| (t.memory_key.clone(), t.memory()));
+        live.iter()
+            .chain(self.files_memory.entries().iter().filter(|(k, _)| live.as_ref().is_none_or(|(l, _)| l != k)))
+            .map(|(k, m)| (k.clone(), m.root.clone(), m.expanded.clone()))
+            .collect()
+    }
+
+    /// The open folders kept from the last run: remembered where this run has nothing, and opened in the shown tree
+    /// when nothing was opened in it yet.
+    pub fn seed_files_memory(&mut self, kept: Vec<(String, PathBuf, Vec<PathBuf>)>, cx: &mut Context<Self>) {
+        for (key, root, expanded) in kept {
+            self.files_memory.seed(key, FilesMemory { root, expanded, selected: None, top: None });
+        }
+        let Some(tree) = self.files.as_mut().filter(|t| t.untouched()) else { return };
+        let Some(memory) = self.files_memory.recall(&tree.memory_key, &tree.root).cloned() else { return };
+        let open = tree.recall(&memory);
+        if !open.is_empty() {
+            let root = tree.root.clone();
+            self.read_dirs(std::iter::once(root).chain(open).collect(), false, false, cx);
+        }
+    }
+
+    /// Workspaces closed, or ids herdr gave to another: their open folders are forgotten.
+    pub fn forget_files(&mut self, keys: &[String]) {
+        self.files_memory.forget(keys);
     }
 
     /// The Shell's word on whether the Files tab is on screen and the window active. Coming into view reads the
@@ -416,6 +568,8 @@ impl SidePanel {
             self.read_dirs(vec![path], false, false, cx);
         }
         self.rebuild_files(cx);
+        // kept for the next run
+        cx.emit(SidePanelEvent::FilesRemembered);
     }
 
     /// A click or Enter on the entry at `path`: a folder opens or folds, a file (an image too) opens in a file tab, a
@@ -513,7 +667,7 @@ impl SidePanel {
         let list = gpui::uniform_list("files", tree.rows.len(), cx.processor(|this: &mut SidePanel, range: Range<usize>, window, cx| this.file_rows(range, window, cx)))
             .track_scroll(&tree.scroll)
             .size_full()
-            .py(px(4.));
+            .py(px(LIST_PAD));
         let scroll = tree.scroll.0.borrow().base_handle.clone();
         let menu = self.file_menu(theme, cx);
         div()
@@ -676,6 +830,61 @@ impl SidePanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn memory(root: &str, open: &[&str]) -> FilesMemory {
+        FilesMemory { root: root.into(), expanded: open.iter().map(PathBuf::from).collect(), selected: None, top: Some(3) }
+    }
+
+    #[test]
+    fn a_workspace_gets_its_open_folders_back_on_the_same_root_only() {
+        let mut m = FilesMemories::default();
+        m.stash("s\nw1", memory("/r", &["/r/src"]));
+        m.stash("s\nw2", memory("/q", &[]));
+        assert_eq!(m.recall("s\nw1", Path::new("/r")), Some(&memory("/r", &["/r/src"])));
+        assert_eq!(m.recall("s\nw1", Path::new("/other")), None, "the workspace was given another root");
+        assert_eq!(m.recall("s\nw3", Path::new("/r")), None);
+        // stashed again: the newer one, at the front
+        m.stash("s\nw1", memory("/r", &["/r/src", "/r/docs"]));
+        assert_eq!(m.entries()[0].1.expanded.len(), 2);
+        assert_eq!(m.entries().len(), 2);
+        // the last run's never overrides this run's
+        m.seed("s\nw1".into(), memory("/r", &[]));
+        assert_eq!(m.recall("s\nw1", Path::new("/r")).unwrap().expanded.len(), 2);
+        m.stash("", memory("/r", &[]));
+        assert_eq!(m.entries().len(), 2, "no workspace, nothing kept");
+        m.forget(&["s\nw2".to_string()]);
+        assert_eq!(m.entries().iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["s\nw1"]);
+    }
+
+    #[test]
+    fn files_memory_keeps_the_most_recent_workspaces() {
+        let mut m = FilesMemories::default();
+        for i in 0..FILES_MEMORY + 5 {
+            m.stash(&format!("s\nw{i}"), memory("/r", &[]));
+        }
+        assert_eq!(m.entries().len(), FILES_MEMORY);
+        assert_eq!(m.entries()[0].0, format!("s\nw{}", FILES_MEMORY + 4));
+        assert!(m.recall("s\nw4", Path::new("/r")).is_none(), "the oldest went");
+        assert!(m.recall("s\nw5", Path::new("/r")).is_some());
+        m.seed("s\nnew".into(), memory("/r", &[]));
+        assert!(m.recall("s\nnew", Path::new("/r")).is_none(), "full: the last run's waits");
+    }
+
+    #[test]
+    fn a_tree_opens_what_it_remembers_inside_its_root() {
+        let mut tree = FileTree::new("/r".into(), (false, false), "s\nw1".into());
+        let m = FilesMemory { root: "/r".into(), expanded: vec!["/r/src".into(), "/elsewhere".into(), "/r".into()], selected: Some("/r/src/a.rs".into()), top: Some(7) };
+        assert_eq!(tree.recall(&m), [PathBuf::from("/r/src")]);
+        assert_eq!((tree.selected.clone(), tree.pending_top), (Some(PathBuf::from("/r/src/a.rs")), Some(7)));
+        assert!(!tree.untouched());
+        // what it gives back: only folders that read, the top it still waits to scroll to
+        tree.reads.insert("/r".into(), Read::Listed(Listing::default()));
+        tree.reads.insert("/r/src".into(), Read::Listed(Listing::default()));
+        tree.expanded.insert("/r/gone".into());
+        tree.reads.insert("/r/gone".into(), Read::Failed("This folder no longer exists".into()));
+        assert_eq!(tree.memory().expanded, [PathBuf::from("/r/src")]);
+        assert_eq!(tree.memory().top, Some(7));
+    }
 
     fn ignored(answer: &Answer) -> Vec<(&str, bool)> {
         match &answer.read {

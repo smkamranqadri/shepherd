@@ -496,6 +496,8 @@ impl Shell {
                     crate::ui::side_panel::SidePanelEvent::OpenMatch { path, line, cols, preview } => s.open_match(path.clone(), *line, cols.clone(), *preview, window, cx),
                     // the badge is in the Shell's tab strip
                     crate::ui::side_panel::SidePanelEvent::ChangesCounted => cx.notify(),
+                    // the side panel keeps it for the run
+                    crate::ui::side_panel::SidePanelEvent::FilesRemembered => {}
                     crate::ui::side_panel::SidePanelEvent::ChangesPolled => {
                         s.reload_shown_diff(true, cx);
                         // the editors' gutters too (W1's watch on .git calls `files_git_changed` as well)

@@ -60,6 +60,9 @@ pub enum SidePanelEvent {
     ChangesCounted,
     /// git status answered (changed or not): the shown diff tab reads its diff again.
     ChangesPolled,
+    /// A folder opened or folded, or a workspace's tree left: what the Files tab remembers changed, for the next
+    /// run.
+    FilesRemembered,
 }
 
 /// What live updates are doing (`files::watch`); the polls run at their own pace unless `Live`.
@@ -87,6 +90,8 @@ pub struct SidePanel {
     context: PanelContext,
     /// The Files tab's tree of the context's root, once the tab has shown it.
     files: Option<files::FileTree>,
+    /// What each workspace's tree had open when it was left.
+    files_memory: files::FilesMemories,
     file_menu: Option<crate::ui::Popup<files::FileMenu>>,
     /// The Files tab is on screen in the active window: its open folders are polled.
     files_live: bool,
@@ -131,6 +136,7 @@ impl SidePanel {
             tab,
             context: PanelContext::default(),
             files: None,
+            files_memory: Default::default(),
             file_menu: None,
             files_live: false,
             changes: None,
