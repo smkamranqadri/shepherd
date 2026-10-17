@@ -771,11 +771,11 @@ impl Shell {
                 let bindings = cx.try_global::<ActiveBindings>().map(|b| b.0.clone()).unwrap_or_default();
                 // ponytail: this open lists the actions read last time; one installed since shows next time
                 self.refresh_plugin_actions(cx);
-                crate::ui::command_panel::items(self.snapshot.as_ref(), &bindings, &self.plugin_actions)
+                crate::ui::command_panel::items(self.shown_in_order().as_deref(), &bindings, &self.plugin_actions)
             }
             Kind::Shortcuts => crate::ui::command_panel::shortcut_items(&cx.try_global::<ActiveBindings>().map(|b| b.0.clone()).unwrap_or_default()),
-            Kind::Agents => crate::ui::command_panel::agent_items(self.snapshot.as_ref(), self.agent_sort, &self.since),
-            Kind::Workspaces => crate::ui::command_panel::workspace_items(self.snapshot.as_ref()),
+            Kind::Agents => crate::ui::command_panel::agent_items(self.shown_in_order().as_deref(), self.agent_sort, &self.since),
+            Kind::Workspaces => crate::ui::command_panel::workspace_items(self.shown_in_order().as_deref()),
             Kind::Branches => match dir.as_deref() {
                 Some(d) => crate::ui::command_panel::branch_items(&crate::ui::statusbar::read_branches(d), crate::ui::statusbar::branch_of(d, cx).as_deref()),
                 None => Vec::new(),
@@ -1125,8 +1125,8 @@ impl Shell {
     }
 
     fn step_workspace(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let (Some(snapshot), Some(tab)) = (self.snapshot.as_ref(), self.shown_tab()) else { return };
-        // sidebar order, so Cmd+Up/Down walk the tree as shown
+        let (Some(snapshot), Some(tab)) = (self.shown_in_order(), self.shown_tab()) else { return };
+        // sidebar order, so Cmd+Up/Down walk the tree as shown, a drop herdr hasn't carried out yet included
         let workspaces: Vec<_> = snapshot.workspace_tree().into_iter().map(|(w, _)| w).collect();
         let Some(i) = workspaces.iter().position(|w| w.workspace_id == tab.workspace_id) else { return };
         let n = workspaces.len();

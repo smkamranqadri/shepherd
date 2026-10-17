@@ -98,8 +98,16 @@ pub(super) struct TreeState {
     pub(super) drop: Option<tree_drag::TreeDrop>,
     /// The tree's view while a row is dragged: rows scrolled out of it don't take a drop.
     pub(super) view: Option<Bounds<Pixels>>,
-    /// Each session's drop that herdr hasn't answered yet, shown meanwhile.
+    /// Each session's drops that herdr hasn't carried out yet, sent one at a time and shown meanwhile.
     pub(super) pending: HashMap<SessionKey, tree_drag::Pending>,
+    /// The tree's scroll, which a drag near its edge moves.
+    pub(super) scroll: gpui::ScrollHandle,
+    /// How fast that drag scrolls it, in px a frame; 0 when it doesn't.
+    pub(super) scroll_speed: f32,
+    /// A drag was under way at the last frame: its end lets a peek it held out go.
+    pub(super) was_dragging: bool,
+    /// herdr's list of machines was read the last time: when not, a drop keeps every machine's saved place.
+    pub(super) machines_known: bool,
 }
 
 impl TreeState {
@@ -344,6 +352,25 @@ pub(super) fn line_row(rows: &[TreeRow], line: &tree_drag::Line) -> Option<(usiz
     Some((last, edge))
 }
 
+/// [`workspace_order`] as the tree shows it: with drops herdr hasn't carried out yet (`pending`) already counted.
+pub(super) fn numbered<'a>(
+    rows: &[TreeRow],
+    snaps: impl Fn(&SessionKey) -> Option<&'a Snapshot>,
+    pending: &HashMap<SessionKey, tree_drag::Pending>,
+    folded: &HashSet<String>,
+    now: Instant,
+) -> Vec<(SessionKey, String)> {
+    let ordered: HashMap<SessionKey, Snapshot> = pending
+        .iter()
+        .filter_map(|(k, p)| {
+            let s = snaps(k)?;
+            let list: Vec<String> = s.workspaces.iter().map(|w| w.workspace_id.clone()).collect();
+            Some((k.clone(), tree_drag::with_order(s, p.order(&list, now)?)))
+        })
+        .collect();
+    workspace_order(rows, |k| ordered.get(k).or_else(|| snaps(k)), folded)
+}
+
 /// Moves an older Shepherd's folded workspaces (bare ids) under the shown session's key; true when any moved.
 pub(super) fn migrate_folds(folded: &mut HashSet<String>, shown: &str) -> bool {
     let bare: Vec<String> = folded.iter().filter(|f| !f.contains('\n')).cloned().collect();
@@ -367,12 +394,10 @@ impl Shell {
         (rows, shown)
     }
 
-    /// The workspaces Workspace1–9 go to, in the tree's order (a drop herdr hasn't answered yet already counted).
+    /// The workspaces Workspace1–9 go to and their hint chips sit on, in the tree's order.
     fn numbered_workspaces(&self, rows: &[TreeRow], shown: &SessionKey) -> Vec<(SessionKey, String)> {
         let snap = |k: &SessionKey| if k == shown { self.snapshot.as_ref() } else { self.watchers.snapshot(k) };
-        let pending: HashMap<SessionKey, Snapshot> =
-            self.tree.pending.keys().filter_map(|k| Some((k.clone(), self.pending_order(k, snap(k)?)?))).collect();
-        workspace_order(rows, |k| pending.get(k).or_else(|| snap(k)), &self.folded)
+        numbered(rows, snap, &self.tree.pending, &self.folded, Instant::now())
     }
 
     /// Workspace1–9: the `index`th workspace the tree shows, in whichever session.
@@ -1206,6 +1231,25 @@ mod tests {
         let many = snapshot(&[("a", None), ("b", None), ("c", None), ("d", None), ("e", None), ("f", None)]);
         let rows = vec![TreeRow::Workspaces { key: key("x") }, TreeRow::Workspaces { key: key("y") }];
         assert_eq!(workspace_order(&rows, |_| Some(&many), &HashSet::new()).len(), 9);
+    }
+
+    #[test]
+    fn numbering_and_its_hints_follow_a_drop_herdr_has_not_carried_out() {
+        use super::super::tree_drag::{Move, Pending};
+        let shown = snapshot(&[("w1", None), ("w2", None), ("w3", None)]);
+        let rows = vec![TreeRow::Workspaces { key: key("default") }];
+        let snaps = |k: &SessionKey| (*k == key("default")).then_some(&shown);
+        let now = Instant::now();
+        let mut pending = HashMap::new();
+        let mut p = Pending::new(now);
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        p.push(Move { ids: ids(&["w3"]), before: Some("w1".into()) }, ids(&["w1", "w2", "w3"]), ids(&["w3", "w1", "w2"]), now);
+        pending.insert(key("default"), p);
+        let order: Vec<String> = numbered(&rows, snaps, &pending, &HashSet::new(), now).into_iter().map(|(_, w)| w).collect();
+        // the chips sit on the same order: `tree_rows` zips it with Workspace1–9's chords
+        assert_eq!(order, ["w3", "w1", "w2"]);
+        let none: Vec<String> = numbered(&rows, snaps, &HashMap::new(), &HashSet::new(), now).into_iter().map(|(_, w)| w).collect();
+        assert_eq!(none, ["w1", "w2", "w3"]);
     }
 
     #[test]

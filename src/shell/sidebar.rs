@@ -548,9 +548,10 @@ impl Shell {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .track_scroll(&self.tree.scroll)
                     // a row dragged in the tree: its rows find where it lands, a release anywhere on it drops it
                     .on_drag_move(cx.listener(|this, e: &gpui::DragMoveEvent<tree_drag::DraggedTreeItem>, _, cx| this.tree_drag_left(e, cx)))
-                    .on_drop(cx.listener(|this, d: &tree_drag::DraggedTreeItem, _, cx| this.drop_tree_item(d, cx)))
+                    .on_drop(cx.listener(|this, d: &tree_drag::DraggedTreeItem, window, cx| this.drop_tree_item(d, window.mouse_position(), cx)))
                     .px(px(8.))
                     .flex()
                     .flex_col()

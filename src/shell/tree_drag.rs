@@ -135,26 +135,22 @@ pub(super) fn plan_workspaces(ws: &Workspaces, item: &Item, target: &str, edge: 
             if !kids.contains(id) || target == id {
                 return None;
             }
-            let next_sibling = |from: usize| kids[from..].iter().find(|k| *k != id).cloned();
-            let (before, line) = if target == root {
+            let mut order: Vec<String> = kids.iter().filter(|k| *k != id).cloned().collect();
+            let (at, line) = if target == root {
                 if edge == Edge::Above {
                     return None;
                 }
-                (next_sibling(0), Line::Kid(kids[0].clone(), Edge::Above))
+                (0, Line::Kid(kids[0].clone(), Edge::Above))
             } else {
-                let t = kids.iter().position(|k| k == target)?;
-                let before = match edge {
-                    Edge::Above => Some(target.to_string()),
-                    // after the last sibling: before whatever herdr lists after it
-                    Edge::Below => next_sibling(t + 1).or_else(|| {
-                        let last = kids.iter().rev().find(|k| *k != id)?;
-                        let from = list.iter().position(|w| w == last)?;
-                        list[from + 1..].iter().find(|w| *w != id).cloned()
-                    }),
-                };
-                (before, Line::Kid(target.to_string(), edge))
+                let t = order.iter().position(|k| k == target)?;
+                (if edge == Edge::Above { t } else { t + 1 }, Line::Kid(target.to_string(), edge))
             };
-            (vec![id.clone()], before, line)
+            order.insert(at, id.clone());
+            // the whole group goes over, its checkout first, where its checkout was: herdr's own list (its TUI's
+            // order) keeps the group together rather than a worktree landing among other workspaces
+            let ids: Vec<String> = std::iter::once(root.clone()).chain(order).collect();
+            let before = list.iter().skip_while(|w| *w != root).skip(1).find(|w| !ids.contains(w)).cloned();
+            (ids, before, line)
         }
         Item::Session(_) | Item::Machine(_) => return None,
     };
@@ -270,29 +266,103 @@ pub(super) fn order_places(places: Vec<Place>, session_order: &[String], machine
     places
 }
 
-/// The order to save: `now` (everything listed, as dropped), then the names saved before that are not listed but
-/// `keep` keeps (a machine turned off, which comes back where it was). The rest were deleted.
+/// The order to save: `now` (everything listed, in its new order) in the slots the listed ones had, the names
+/// saved before that are not listed but `keep` keeps left in theirs (a machine turned off, or every machine while
+/// herdr's list of them could not be read, comes back where it was), and the listed ones saved nowhere after. The
+/// rest were deleted.
 pub(super) fn merged(now: Vec<String>, saved: &[String], keep: impl Fn(&str) -> bool) -> Vec<String> {
-    let gone: Vec<String> = saved.iter().filter(|s| !now.contains(s) && keep(s)).cloned().collect();
-    now.into_iter().chain(gone).collect()
+    let mut next = now.iter();
+    let mut out: Vec<String> = saved
+        .iter()
+        .filter_map(|s| if now.contains(s) { next.next().cloned() } else { keep(s).then(|| s.clone()) })
+        .collect();
+    out.extend(next.cloned());
+    out
 }
 
-/// How long a drop's order is shown while herdr's list has not changed.
-const PENDING_FOR: Duration = Duration::from_secs(5);
+/// Whether a saved name not listed now is kept: a machine turned off (`off`, by key or target), or any machine
+/// while herdr's list of them could not be read. A session not listed was deleted.
+pub(super) fn kept_unlisted(name: &str, off: &[String], machines_known: bool, is_machine: bool) -> bool {
+    off.iter().any(|o| o == name) || (!machines_known && is_machine)
+}
 
-/// A drop's order shown before herdr's answer: what herdr listed when it was dropped, and the order it should list.
+/// How long a drop's order shows with nothing heard from herdr: past the slowest call's deadline (10 s over SSH).
+pub(super) const PENDING_FOR: Duration = Duration::from_secs(15);
+
+/// A session's drops herdr hasn't carried out yet. Each call has its own connection, so they go one at a time,
+/// in order: a later drop never overtakes an earlier one. Meanwhile the tree shows the last drop's order.
 #[derive(Clone, Debug)]
 pub(super) struct Pending {
-    pub base: Vec<String>,
-    pub order: Vec<String>,
-    pub at: Instant,
+    /// What herdr listed at each drop: lists on the way to the last order.
+    seen: Vec<Vec<String>>,
+    /// Each drop's order, the last shown.
+    orders: Vec<Vec<String>>,
+    /// Drops waiting for the one being sent.
+    queued: std::collections::VecDeque<Move>,
+    sending: bool,
+    /// When a drop was last made or answered.
+    at: Instant,
 }
 
 impl Pending {
-    /// The order to show while herdr lists `list`: the drop's, until herdr's list changes at all (to it, or to
-    /// anything else: herdr's word wins) or `PENDING_FOR` passes.
+    pub(super) fn new(now: Instant) -> Self {
+        Pending { seen: Vec::new(), orders: Vec::new(), queued: Default::default(), sending: false, at: now }
+    }
+
+    /// A drop made while herdr lists `list`, which leads to `order`: the move to send now, or `None` when it waits
+    /// for the one being sent.
+    pub(super) fn push(&mut self, mv: Move, list: Vec<String>, order: Vec<String>, now: Instant) -> Option<Move> {
+        if !self.seen.contains(&list) {
+            self.seen.push(list);
+        }
+        self.orders.push(order);
+        self.at = now;
+        if self.sending {
+            self.queued.push_back(mv);
+            return None;
+        }
+        self.sending = true;
+        Some(mv)
+    }
+
+    /// herdr carried out the move sent: the next to send.
+    pub(super) fn sent(&mut self, now: Instant) -> Option<Move> {
+        self.at = now;
+        let next = self.queued.pop_front();
+        self.sending = next.is_some();
+        next
+    }
+
+    /// A move is out, or waits to go.
+    pub(super) fn busy(&self) -> bool {
+        self.sending
+    }
+
+    /// The order to show while herdr lists `list`: the last drop's, while herdr lists what it had at a drop or a
+    /// drop's order on the way; not once it lists the last one (done), something no drop leads through (herdr's
+    /// word wins: the TUI moved one), or nothing has been heard for `PENDING_FOR`.
     pub(super) fn order(&self, list: &[String], now: Instant) -> Option<&[String]> {
-        (list == self.base.as_slice() && now.saturating_duration_since(self.at) < PENDING_FOR).then_some(self.order.as_slice())
+        let last = self.orders.last()?;
+        let on_the_way = self.seen.iter().chain(&self.orders).any(|l| l.as_slice() == list);
+        (list != last.as_slice() && on_the_way && now.saturating_duration_since(self.at) < PENDING_FOR).then_some(last.as_slice())
+    }
+}
+
+/// How fast the tree scrolls by itself, in px a frame, with the pointer `at` near its view's top (up) or bottom
+/// (down) edge during a drag; 0 elsewhere.
+pub(super) fn edge_scroll(view: Bounds<Pixels>, at: Point<Pixels>) -> f32 {
+    const BAND: f32 = 28.;
+    const FASTEST: f32 = 10.;
+    if !view.contains(&at) {
+        return 0.;
+    }
+    let (top, bottom) = (f32::from(at.y - view.origin.y), f32::from(view.origin.y + view.size.height - at.y));
+    if top < BAND {
+        -FASTEST * (1. - top / BAND)
+    } else if bottom < BAND {
+        FASTEST * (1. - bottom / BAND)
+    } else {
+        0.
     }
 }
 
@@ -343,12 +413,21 @@ impl Render for DraggedTreeItem {
     }
 }
 
-/// The row under the pointer while a row is dragged, the half it is in, and the line its drop draws.
+/// The row under the pointer while a row is dragged, the half it is in, the line its drop draws, and the row's
+/// bounds: off them (a gap, a divider, a notice) the drop lands nowhere.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct TreeDrop {
     pub over: Over,
     pub edge: Edge,
     pub line: Line,
+    pub bounds: Bounds<Pixels>,
+}
+
+impl TreeDrop {
+    /// The pointer `at` is still on its row.
+    pub(super) fn holds(&self, at: Point<Pixels>) -> bool {
+        hovered(self.bounds, at).is_some()
+    }
 }
 
 /// The 2 px line along a row's top or bottom, inside it: a worktree group's body clips what is outside.
@@ -379,11 +458,19 @@ impl Shell {
         if self.shown_key().as_ref() == Some(key) { self.snapshot.as_ref() } else { self.watchers.snapshot(key) }
     }
 
-    /// `s` (the session `key`'s) in the order of a drop herdr hasn't answered yet; `None` when there is none.
+    /// `s` (the session `key`'s) in the order of drops herdr hasn't carried out yet; `None` when there are none.
     pub(super) fn pending_order(&self, key: &SessionKey, s: &Snapshot) -> Option<Snapshot> {
-        let list: Vec<String> = s.workspaces.iter().map(|w| w.workspace_id.clone()).collect();
-        let order = self.tree.pending.get(key)?.order(&list, Instant::now())?;
+        let order = self.tree.pending.get(key)?.order(&ids_of(s), Instant::now())?;
         Some(with_order(s, order))
+    }
+
+    /// The shown session's snapshot in the tree's order: what the keys' steps and the command panel walk.
+    pub(super) fn shown_in_order(&self) -> Option<std::borrow::Cow<'_, Snapshot>> {
+        let s = self.snapshot.as_ref()?;
+        Some(match self.shown_key().and_then(|k| self.pending_order(&k, s)) {
+            Some(ordered) => std::borrow::Cow::Owned(ordered),
+            None => std::borrow::Cow::Borrowed(s),
+        })
     }
 
     /// Whether the session `key`'s workspaces can be dragged: the shown one, or another that answers and has a
@@ -412,19 +499,56 @@ impl Shell {
         }
         let Some(edge) = hovered(e.bounds, e.event.position) else { return };
         let d = e.drag(cx).clone();
-        let next = self.plan_drop(&d, &over, edge).map(|(_, line)| TreeDrop { over, edge, line });
+        let next = self.plan_drop(&d, &over, edge).map(|(_, line)| TreeDrop { over, edge, line, bounds: e.bounds });
         if self.tree.drop != next {
             self.tree.drop = next;
             cx.notify();
         }
     }
 
-    /// The tree's drag listener, heard before its rows': where its view is, and off it a drop lands nowhere.
+    /// The tree's drag listener, heard before its rows': where its view is; off the row it was over (a gap, a
+    /// divider, a notice, off the tree) a drop lands nowhere until another row takes it; near the view's top or
+    /// bottom edge the tree scrolls.
     pub(super) fn tree_drag_left(&mut self, e: &DragMoveEvent<DraggedTreeItem>, cx: &mut Context<Self>) {
         self.tree.view = Some(e.bounds);
-        if !e.bounds.contains(&e.event.position) && self.tree.drop.take().is_some() {
+        if self.tree.drop.as_ref().is_some_and(|d| !d.holds(e.event.position)) {
+            self.tree.drop = None;
             cx.notify();
         }
+        let speed = edge_scroll(e.bounds, e.event.position);
+        let was = std::mem::replace(&mut self.tree.scroll_speed, speed);
+        if speed != 0. && was == 0. {
+            self.scroll_while_dragging(cx);
+        }
+    }
+
+    /// Scrolls the tree a frame's worth at a time while a drag rests near its edge. Rows move under a still pointer,
+    /// so the drop's row is let go: the pointer's next move finds the row under it.
+    fn scroll_while_dragging(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(16)).await;
+                let go_on = this.update(cx, |this, cx| {
+                    let speed = this.tree.scroll_speed;
+                    if speed == 0. || !cx.has_active_drag() {
+                        this.tree.scroll_speed = 0.;
+                        return false;
+                    }
+                    let (offset, max) = (this.tree.scroll.offset(), this.tree.scroll.max_offset());
+                    let y = (offset.y - px(speed)).clamp(-max.y, px(0.));
+                    if y != offset.y {
+                        this.tree.scroll.set_offset(gpui::point(offset.x, y));
+                        this.tree.drop = None;
+                        cx.notify();
+                    }
+                    true
+                });
+                if !matches!(go_on, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Where a drag's line is drawn now.
@@ -432,23 +556,29 @@ impl Shell {
         self.tree.drop.as_ref().map(|d| &d.line)
     }
 
-    /// A release over the tree: planned again against what is shown now, then carried out.
-    pub(super) fn drop_tree_item(&mut self, d: &DraggedTreeItem, cx: &mut Context<Self>) {
-        let Some(TreeDrop { over, edge, .. }) = self.tree.drop.take() else { return };
+    /// A release over the tree, `at` the pointer: on the row the line is at, planned again against what is shown
+    /// now, then carried out.
+    pub(super) fn drop_tree_item(&mut self, d: &DraggedTreeItem, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(TreeDrop { over, edge, .. }) = self.tree.drop.take().filter(|drop| drop.holds(at)) else { return };
         cx.notify();
-        match self.plan_drop(d, &over, edge).map(|(plan, _)| plan) {
+        let plan = self.plan_drop(d, &over, edge).map(|(plan, _)| plan);
+        if matches!(plan, Some(Plan::Sessions(_) | Plan::Machines(_))) && SettingsGlobal::of(cx).error.is_some() {
+            return crate::ui::toast::error(cx, "Couldn't keep the new order: the settings file has an error to fix first");
+        }
+        let known = self.tree.machines_known;
+        match plan {
             Some(Plan::Workspaces(key, mv)) => self.move_workspaces(key, mv, cx),
             Some(Plan::Sessions(order)) => {
                 let off: Vec<String> = self.watchers.disabled.iter().map(|m| format!("machine:{}", m.id)).collect();
                 let saved = SettingsGlobal::of(cx).settings.session_order.clone();
-                let order = merged(order, &saved, |k| off.iter().any(|o| o == k));
+                let order = merged(order, &saved, |k| kept_unlisted(k, &off, known, k.starts_with("machine:")));
                 save_from_sidebar(cx, |s| s.session_order = order);
                 self.reorder_places(cx);
             }
             Some(Plan::Machines(order)) => {
                 let off: Vec<String> = self.watchers.disabled.iter().map(|m| m.target.clone()).collect();
                 let saved = SettingsGlobal::of(cx).settings.machine_order.clone();
-                let order = merged(order, &saved, |t| off.iter().any(|o| o == t));
+                let order = merged(order, &saved, |t| kept_unlisted(t, &off, known, true));
                 save_from_sidebar(cx, |s| s.machine_order = order);
                 self.reorder_places(cx);
             }
@@ -462,44 +592,59 @@ impl Shell {
         self.places = order_places(std::mem::take(&mut self.places), &settings.session_order, &settings.machine_order);
     }
 
-    /// Sends a drop's `move_block` to the session `key`: the shown one's own client, another's watcher's (2 s
-    /// here, 10 s over SSH). The tree shows the order at once; a refusal puts herdr's back, with a toast.
+    /// A drop's `move_block` for the session `key`: the tree shows its order at once, built on the drops before it
+    /// that herdr hasn't carried out, and it is sent once they are.
     fn move_workspaces(&mut self, key: SessionKey, mv: Move, cx: &mut Context<Self>) {
         let Some(s) = self.session_snapshot(&key) else { return };
-        let base: Vec<String> = s.workspaces.iter().map(|w| w.workspace_id.clone()).collect();
-        let shown = self.pending_order(&key, s).map(|s| s.workspaces.iter().map(|w| w.workspace_id.clone()).collect()).unwrap_or_else(|| base.clone());
+        let list = ids_of(s);
+        let shown = self.pending_order(&key, s).map(|s| ids_of(&s)).unwrap_or_else(|| list.clone());
         let order = moved(&shown, &mv.ids, mv.before.as_deref());
-        self.tree.pending.insert(key.clone(), Pending { base, order, at: Instant::now() });
-        let command = Command::MoveWorkspaces { workspace_ids: mv.ids, before: mv.before };
-        if self.shown_key().as_ref() == Some(&key) {
-            self.send_then(command, cx, move |this, result, cx| {
-                if let Err(e) = result {
-                    this.tree.pending.remove(&key);
-                    crate::ui::toast::error(cx, format!("Couldn't move the workspace: {e:#}"));
-                    cx.notify();
-                }
-            });
-            return;
+        let now = Instant::now();
+        let pending = self.tree.pending.entry(key.clone()).or_insert_with(|| Pending::new(now));
+        if let Some(mv) = pending.push(mv, list, order, now) {
+            self.send_move(key, mv, cx);
         }
-        let Some(w) = self.watchers.get(&key) else { return };
-        let Some(client) = w.client.clone() else {
-            self.tree.pending.remove(&key);
-            return crate::ui::toast::error(cx, "Couldn't move the workspace: not connected to its session yet");
+        self.notify_when_stale(cx);
+    }
+
+    /// Sends a move through the session's own client when shown, another's watcher's (2 s here, 10 s over SSH);
+    /// once herdr answers, the next drop waiting goes. A refusal puts herdr's order back and drops the drops
+    /// waiting, which built on it, with a toast.
+    fn send_move(&mut self, key: SessionKey, mv: Move, cx: &mut Context<Self>) {
+        let command = Command::MoveWorkspaces { workspace_ids: mv.ids, before: mv.before };
+        let call = if self.shown_key().as_ref() == Some(&key) {
+            let (method, params) = command.request();
+            let client = self.client.clone();
+            self.rt.spawn(async move { client.call(method, params).await })
+        } else {
+            let Some(client) = self.watchers.get(&key).filter(|w| w.status != Status::Stopped).and_then(|w| w.client.clone()) else {
+                self.tree.pending.remove(&key);
+                return crate::ui::toast::error(cx, "Couldn't move the workspace: not connected to its session");
+            };
+            let remote = self.watchers.get(&key).is_some_and(|w| w.kind() == Kind::Remote);
+            let timeout = if remote { Duration::from_secs(10) } else { Duration::from_secs(2) };
+            let (method, params) = command.request();
+            self.rt.spawn(async move {
+                match tokio::time::timeout(timeout, client.call(method, params)).await {
+                    Ok(done) => done,
+                    Err(_) => Err(anyhow::anyhow!("no answer in {} s", timeout.as_secs())),
+                }
+            })
         };
-        let timeout = if w.kind() == Kind::Remote { Duration::from_secs(10) } else { Duration::from_secs(2) };
-        let (method, params) = command.request();
-        let call = self.rt.spawn(async move {
-            match tokio::time::timeout(timeout, client.call(method, params)).await {
-                Ok(done) => done,
-                Err(_) => Err(anyhow::anyhow!("no answer in {} s", timeout.as_secs())),
-            }
-        });
         cx.spawn(async move |this, cx| {
             let result = call.await.map_err(anyhow::Error::from).and_then(|r| r);
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    // its watcher asks it now, rather than at its next poll
-                    Ok(_) => this.watchers.poll_now(&key, Instant::now()),
+                    Ok(_) => {
+                        // another session's watcher asks it now, rather than at its next poll
+                        if this.shown_key().as_ref() != Some(&key) {
+                            this.watchers.poll_now(&key, Instant::now());
+                        }
+                        if let Some(next) = this.tree.pending.get_mut(&key).and_then(|p| p.sent(Instant::now())) {
+                            this.send_move(key.clone(), next, cx);
+                        }
+                        this.notify_when_stale(cx);
+                    }
                     Err(e) => {
                         this.tree.pending.remove(&key);
                         crate::ui::toast::error(cx, format!("Couldn't move the workspace: {e:#}"));
@@ -511,25 +656,41 @@ impl Shell {
         .detach();
     }
 
-    /// Drops a drag's line once no drag is under way (released anywhere), and orders herdr has answered.
-    pub(super) fn tidy_tree_drag(&mut self, cx: &App) {
-        if !cx.has_active_drag() {
+    /// Draws again once a drop's order would go stale, so it never outstays `PENDING_FOR` waiting for a frame.
+    fn notify_when_stale(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PENDING_FOR + Duration::from_millis(50)).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    }
+
+    /// Once no drag is under way (released anywhere): its line goes, and a peek it held out hides unless the
+    /// pointer is on it. Drops herdr has carried out, with none out, go too.
+    pub(super) fn tidy_tree_drag(&mut self, cx: &mut Context<Self>) {
+        let dragging = cx.has_active_drag();
+        if !dragging {
             self.tree.drop = None;
             self.tree.view = None;
+            if std::mem::take(&mut self.tree.was_dragging) && !self.peek_hovered {
+                self.hover_peek(false, cx);
+            }
         }
+        self.tree.was_dragging |= dragging;
         let now = Instant::now();
-        let lists: Vec<(SessionKey, Vec<String>)> = self
-            .tree
-            .pending
-            .keys()
-            .map(|k| (k.clone(), self.session_snapshot(k).map(|s| s.workspaces.iter().map(|w| w.workspace_id.clone()).collect()).unwrap_or_default()))
-            .collect();
+        let lists: Vec<(SessionKey, Vec<String>)> =
+            self.tree.pending.keys().map(|k| (k.clone(), self.session_snapshot(k).map(ids_of).unwrap_or_default())).collect();
         for (key, list) in lists {
-            if self.tree.pending.get(&key).is_some_and(|p| p.order(&list, now).is_none()) {
+            if self.tree.pending.get(&key).is_some_and(|p| !p.busy() && p.order(&list, now).is_none()) {
                 self.tree.pending.remove(&key);
             }
         }
     }
+}
+
+/// herdr's list of the snapshot's workspaces.
+fn ids_of(s: &Snapshot) -> Vec<String> {
+    s.workspaces.iter().map(|w| w.workspace_id.clone()).collect()
 }
 
 #[cfg(test)]
@@ -599,10 +760,14 @@ mod tests {
 
     #[test]
     fn a_worktree_reorders_among_its_siblings() {
-        assert_eq!(mv(kid("m-y"), "m-x", Edge::Above), Some((ids(&["m-y"]), Some("m-x".into()))));
-        assert_eq!(mv(kid("m-y"), "m", Edge::Below), Some((ids(&["m-y"]), Some("m-x".into()))));
-        // after the last sibling: before what herdr lists after it
-        assert_eq!(mv(kid("m-x"), "m-y", Edge::Below), Some((ids(&["m-x"]), Some("c".into()))));
+        // the group goes as one block, its checkout first, before what followed its checkout: herdr's list keeps
+        // the group together where it was
+        let reordered = Some((ids(&["m", "m-y", "m-x"]), Some("b".into())));
+        assert_eq!(mv(kid("m-y"), "m-x", Edge::Above), reordered);
+        assert_eq!(mv(kid("m-y"), "m", Edge::Below), reordered);
+        assert_eq!(mv(kid("m-x"), "m-y", Edge::Below), reordered, "after the last sibling");
+        let (m, _) = plan_workspaces(&ws(), &kid("m-x"), "m-y", Edge::Below).unwrap();
+        assert_eq!(moved(&ws().list, &m.ids, m.before.as_deref()), ids(&["a", "m", "m-y", "m-x", "b", "c"]));
         let (_, line) = plan_workspaces(&ws(), &kid("m-y"), "m", Edge::Below).unwrap();
         assert_eq!(line, Line::Kid("m-x".into(), Edge::Above));
     }
@@ -633,6 +798,14 @@ mod tests {
             .iter()
             .map(|(m, k)| (m.to_string(), k.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn a_worktree_never_crosses_sessions() {
+        let both = |_: &SessionKey| Some(ws());
+        let drop = |over: Over| plan(&key("/s/default"), &kid("m-y"), &over, Edge::Above, both, &places());
+        assert!(matches!(drop(Over::Workspace(key("/s/default"), "m-x".into())), Some((Plan::Workspaces(..), _))));
+        assert_eq!(drop(Over::Workspace(key("/s/menqal"), "m-x".into())), None);
     }
 
     #[test]
@@ -712,16 +885,85 @@ mod tests {
     fn a_saved_order_keeps_machines_turned_off_and_forgets_the_deleted() {
         let saved = ids(&["/s/old", "machine:off", "/s/default"]);
         let order = merged(ids(&["/s/menqal", "/s/default"]), &saved, |k| k == "machine:off");
-        assert_eq!(order, ids(&["/s/menqal", "/s/default", "machine:off"]));
+        assert_eq!(order, ids(&["machine:off", "/s/menqal", "/s/default"]));
+    }
+
+    #[test]
+    fn a_machine_turned_off_comes_back_where_it_was() {
+        // a, off, b on one target; b dragged above a while off is turned off
+        let saved = ids(&["machine:a", "machine:off", "machine:b"]);
+        let order = merged(ids(&["machine:b", "machine:a"]), &saved, |k| k == "machine:off");
+        assert_eq!(order, ids(&["machine:b", "machine:off", "machine:a"]));
+        let back = apply_order(ids(&["machine:a", "machine:b", "machine:off"]), &order, String::clone);
+        assert_eq!(back, ids(&["machine:b", "machine:off", "machine:a"]), "not last");
+    }
+
+    #[test]
+    fn unlisted_machines_are_kept_while_herdr_cannot_list_them() {
+        let off = ids(&["machine:off"]);
+        assert!(kept_unlisted("machine:off", &off, true, true));
+        assert!(!kept_unlisted("machine:gone", &off, true, true), "deleted");
+        assert!(kept_unlisted("machine:x", &off, false, true), "machines unknown");
+        assert!(!kept_unlisted("/s/old", &off, false, false), "a session not listed was deleted");
+        // a session dragged while the machines are unknown leaves their saved order alone
+        let saved = ids(&["machine:b", "/s/default", "machine:a", "/s/menqal"]);
+        let order = merged(ids(&["/s/menqal", "/s/default"]), &saved, |k| kept_unlisted(k, &off, false, k.starts_with("machine:")));
+        assert_eq!(order, ids(&["machine:b", "/s/menqal", "machine:a", "/s/default"]));
+    }
+
+    fn one(id: &str) -> Move {
+        Move { ids: ids(&[id]), before: None }
     }
 
     #[test]
     fn a_drops_order_shows_until_herdrs_list_changes() {
         let t0 = Instant::now();
-        let p = Pending { base: ids(&["a", "b", "c"]), order: ids(&["c", "a", "b"]), at: t0 };
+        let mut p = Pending::new(t0);
+        assert_eq!(p.push(one("c"), ids(&["a", "b", "c"]), ids(&["c", "a", "b"]), t0), Some(one("c")));
         assert_eq!(p.order(&ids(&["a", "b", "c"]), t0), Some(&ids(&["c", "a", "b"])[..]));
-        assert_eq!(p.order(&ids(&["c", "a", "b"]), t0), None, "herdr answered");
+        assert_eq!(p.order(&ids(&["c", "a", "b"]), t0), None, "herdr carried it out");
         assert_eq!(p.order(&ids(&["b", "a", "c"]), t0), None, "something else moved it: herdr's word wins");
-        assert_eq!(p.order(&ids(&["a", "b", "c"]), t0 + PENDING_FOR), None, "no answer for too long");
+        assert_eq!(p.order(&ids(&["a", "b", "c"]), t0 + PENDING_FOR), None, "nothing heard for too long");
+        assert!(PENDING_FOR > Duration::from_secs(10), "outlasts the slowest call");
+    }
+
+    #[test]
+    fn two_drops_in_a_row_go_one_at_a_time_and_show_the_last() {
+        let t0 = Instant::now();
+        let mut p = Pending::new(t0);
+        let base = ids(&["a", "b", "c"]);
+        let first = moved(&base, &ids(&["c"]), Some("a"));
+        assert_eq!(p.push(one("c"), base.clone(), first.clone(), t0), Some(one("c")));
+        // the second drop builds on the first's order, which herdr hasn't listed yet
+        let shown = p.order(&base, t0).unwrap().to_vec();
+        let second = moved(&shown, &ids(&["b"]), Some("c"));
+        assert_eq!(second, ids(&["b", "c", "a"]));
+        assert_eq!(p.push(one("b"), base.clone(), second.clone(), t0), None, "waits for the first");
+        assert!(p.busy());
+        // the first carried out: the tree keeps the last order, not the one on the way
+        assert_eq!(p.order(&first, t0), Some(&second[..]));
+        assert_eq!(p.sent(t0), Some(one("b")));
+        assert!(p.busy());
+        assert_eq!(p.order(&second, t0), None);
+        assert_eq!(p.sent(t0), None);
+        assert!(!p.busy());
+    }
+
+    #[test]
+    fn the_tree_scrolls_near_its_edges_while_dragging() {
+        let view = Bounds::new(gpui::point(px(0.), px(100.)), gpui::size(px(200.), px(300.)));
+        let at = |y: f32| edge_scroll(view, gpui::point(px(10.), px(y)));
+        assert!(at(101.) < 0. && at(101.) < at(120.), "up, faster at the edge");
+        assert!(at(399.) > 0.);
+        assert_eq!(at(250.), 0.);
+        assert_eq!(at(90.), 0., "off the tree");
+    }
+
+    #[test]
+    fn a_drop_off_its_row_lands_nowhere() {
+        let bounds = Bounds::new(gpui::point(px(0.), px(100.)), gpui::size(px(200.), px(30.)));
+        let d = TreeDrop { over: Over::Machine("you@box".into()), edge: Edge::Above, line: Line::Machine("you@box".into(), Edge::Above), bounds };
+        assert!(d.holds(gpui::point(px(10.), px(110.))));
+        assert!(!d.holds(gpui::point(px(10.), px(131.))), "the gap under it");
     }
 }
