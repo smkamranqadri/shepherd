@@ -562,7 +562,7 @@ impl Shell {
     fn session_row(&self, theme: &Theme, place: Place, key: SessionKey, collapsed: bool, waiting: usize, status: Status, cx: &mut Context<Self>) -> gpui::AnyElement {
         let idx = self.watchers.index_of(&key).unwrap_or(0);
         let hover_bg = theme.hover;
-        let stale = self.watchers.get(&key).is_some_and(|w| w.stale(Instant::now(), self.watchers.activity()));
+        let stale = self.watchers.get(&key).is_some_and(|w| w.stale(Instant::now()));
         let dot = match status {
             Status::Shown | Status::Live if !stale => theme.success,
             Status::Shown | Status::Live | Status::Connecting => theme.warning,
