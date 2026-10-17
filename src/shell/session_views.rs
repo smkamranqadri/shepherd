@@ -112,6 +112,13 @@ impl<P> SessionViews<P> {
     }
 }
 
+/// Whether what is kept for the session `key` stays on a read of herdr's list: it is `listed` or `shown`, a machine
+/// turned `off`, or a machine while the machines could not be read (`machines_known` false: a timeout must not
+/// forget them all).
+pub(super) fn still_known(key: &str, listed: &[SessionKey], shown: Option<&SessionKey>, off: &[String], machines_known: bool) -> bool {
+    listed.iter().any(|l| l.0 == key) || shown.is_some_and(|s| s.0 == key) || off.iter().any(|o| o == key) || (!machines_known && key.starts_with("machine:"))
+}
+
 /// A parked pane no longer fits `snapshot`: herdr lists no such pane, or the id now names another terminal (herdr
 /// gives a closed pane's id to a new one). An unknown terminal (`""`) is taken on the id alone.
 pub(super) fn stale(pane_id: &str, terminal_id: &str, snapshot: &Snapshot) -> bool {
@@ -148,6 +155,15 @@ pub(super) fn validate<P>(view: SessionView<P>, snapshot: Option<&Snapshot>) -> 
     Restored { selected_tab: tab, shown_workspace: workspace, panes, dropped: dropped.into_iter().map(|p| p.pane).collect() }
 }
 
+/// The view of a session being left, read from its last snapshot (so before it goes to its watcher): herdr's focus
+/// then, and each parked pane's terminal, which its return is checked against.
+pub(super) fn leaving_view<P>(snapshot: Option<&Snapshot>, selected_tab: Option<String>, shown_workspace: Option<String>, mut panes: Vec<Parked<P>>, now: Instant) -> SessionView<P> {
+    for p in &mut panes {
+        p.terminal_id = snapshot.and_then(|s| s.panes.iter().find(|x| x.pane_id == p.pane_id)).map(|x| x.terminal_id.clone()).unwrap_or_default();
+    }
+    SessionView { selected_tab, shown_workspace, herdr_focus: snapshot.and_then(|s| s.focused_tab_id.clone()), panes, left_at: now }
+}
+
 /// The tab to show on return: herdr's focused tab now (`focus`) when it moved since the session was left (its TUI,
 /// another window), else the tab left (`left`).
 pub(super) fn tab_on_return<'a>(left: Option<&'a str>, focus_then: Option<&str>, focus: Option<&'a str>) -> Option<&'a str> {
@@ -163,6 +179,31 @@ pub(super) struct Restore {
     pub tab: String,
     pub pane: String,
     pub at: Instant,
+    /// The pane with the keyboard when the restore was first weighed uncovered (`None` until then): the keyboard
+    /// moving elsewhere since (herdr's focus, a click) was not the restore's doing, and lets it go.
+    pub focus: Option<Option<String>>,
+}
+
+impl Restore {
+    pub(super) fn new(tab: String, pane: String, at: Instant) -> Restore {
+        Restore { tab, pane, at, focus: None }
+    }
+}
+
+/// What a render knows when it weighs a [`Restore`].
+pub(super) struct Moment<'a> {
+    pub shown_tab: Option<&'a str>,
+    /// The restore's pane is among the shown tab's (not, say, a pane hidden by another's zoom).
+    pub pane_shown: bool,
+    /// A goal waits (an agent's pane, a workspace asked for): it wins.
+    pub goal: bool,
+    /// Settings, a panel, herdr's popup or a file tab covers the panes.
+    pub covered: bool,
+    /// The last key or click in the window.
+    pub touched: Instant,
+    /// The shown pane with the keyboard now, if one has it.
+    pub focus: Option<&'a str>,
+    pub now: Instant,
 }
 
 /// What a render does with a [`Restore`].
@@ -172,20 +213,43 @@ pub(super) enum Step {
     Apply,
     /// Not yet: its tab or pane is not shown, or something covers the panes.
     Wait,
-    /// Let go: too old, or a goal (an agent's pane, a workspace asked for) came after it and wins.
+    /// Let go: too old, a goal came after it, you typed or clicked since, the keyboard moved without it, or its tab
+    /// shows without its pane: given later, the keyboard would jump mid-command.
     Drop,
 }
 
-/// `restore` this render: `shown_tab` is the tab shown, `pane_shown` whether its pane is among the tab's,
-/// `goal` whether a goal waits (it wins), `covered` whether Settings or a file tab covers the panes.
-pub(super) fn restore_step(restore: &Restore, shown_tab: Option<&str>, pane_shown: bool, goal: bool, covered: bool, now: Instant) -> Step {
-    if goal || now.duration_since(restore.at) > RESTORE_EXPIRY {
+/// `restore` at moment `m`. The first uncovered look notes where the keyboard is (`Restore::focus`); covered, the
+/// look starts again once uncovered, since the cover held the keyboard.
+pub(super) fn restore_step(restore: &mut Restore, m: &Moment) -> Step {
+    if m.goal || m.touched > restore.at || m.now.duration_since(restore.at) > RESTORE_EXPIRY {
         return Step::Drop;
     }
-    if shown_tab != Some(restore.tab.as_str()) || !pane_shown || covered {
+    if m.covered {
+        restore.focus = None;
         return Step::Wait;
     }
+    match &restore.focus {
+        None => restore.focus = Some(m.focus.map(str::to_string)),
+        Some(then) if then.as_deref() != m.focus => return Step::Drop,
+        Some(_) => {}
+    }
+    if m.shown_tab != Some(restore.tab.as_str()) {
+        return Step::Wait;
+    }
+    if !m.pane_shown {
+        return Step::Drop;
+    }
     Step::Apply
+}
+
+/// The entry a render notes for the shown tab's keyboard (`focused`, the shown pane with it), or none: not before the
+/// kept file is read (the last run's entry would be written over by whichever pane herdr focused first), not while a
+/// remembered pane waits for the keyboard (`waiting`), and not when it is noted already (`noted`).
+pub(super) fn keyboard_note(loaded: bool, waiting: Option<&Restore>, tab: &str, focused: Option<KeyPane>, noted: Option<&KeyPane>) -> Option<KeyPane> {
+    if !loaded || waiting.is_some_and(|r| r.tab == tab) {
+        return None;
+    }
+    focused.filter(|f| noted != Some(f))
 }
 
 /// The pane a tab's keyboard was in, by its terminal too: herdr gives a closed pane's id to a new one, and a
@@ -203,6 +267,10 @@ pub(super) type KeyboardMemory = BTreeMap<String, BTreeMap<String, KeyPane>>;
 /// The tabs of `memory` (one session's) that `snapshot` no longer backs: a tab gone, its pane gone or moved to
 /// another tab, or another terminal behind its id. True when any went.
 pub(super) fn prune_keyboard(memory: &mut BTreeMap<String, KeyPane>, snapshot: &Snapshot) -> bool {
+    // a server still starting (or restarted empty) lists nothing: no reason to forget every tab
+    if snapshot.workspaces.is_empty() {
+        return false;
+    }
     let before = memory.len();
     memory.retain(|tab, k| {
         snapshot.tabs.iter().any(|t| &t.tab_id == tab)
@@ -216,21 +284,13 @@ impl super::Shell {
     /// focus are kept, and its panes parked in `recent_panes` order as far as the caps allow; the rest go. The
     /// keyboard leaves them on the next render.
     pub(super) fn park_view(&mut self, left: &SessionKey, cx: &mut gpui::Context<Self>) {
-        let snapshot = self.snapshot.as_ref();
-        let terminal = |id: &str| snapshot.and_then(|s| s.panes.iter().find(|p| p.pane_id == id)).map(|p| p.terminal_id.clone()).unwrap_or_default();
         let mut panes = Vec::new();
         for id in &self.recent_panes {
             let Some(pane) = self.panes.remove(id) else { continue };
             pane.update(cx, |p, cx| p.park(cx));
-            panes.push(Parked { pane_id: id.clone(), terminal_id: terminal(id), pane });
+            panes.push(Parked { pane_id: id.clone(), terminal_id: String::new(), pane });
         }
-        let view = SessionView {
-            selected_tab: self.shown_tab().map(|t| t.tab_id),
-            shown_workspace: self.shown_workspace.clone(),
-            herdr_focus: snapshot.and_then(|s| s.focused_tab_id.clone()),
-            panes,
-            left_at: Instant::now(),
-        };
+        let view = leaving_view(self.snapshot.as_ref(), self.shown_tab().map(|t| t.tab_id), self.shown_workspace.clone(), panes, Instant::now());
         let rest: Vec<_> = self.panes.drain().map(|(_, p)| p).collect();
         let evicted = self.views.park(left.clone(), view);
         self.retire_panes(evicted.into_iter().chain(rest), cx);
@@ -297,7 +357,7 @@ impl super::Shell {
             snapshot.is_some_and(|s| s.panes.iter().any(|p| p.pane_id == k.pane && p.tab_id == tab && (k.terminal.is_empty() || p.terminal_id == k.terminal)))
         };
         let remembered = key.and_then(|k| self.keyboard.get(&k.0)?.get(tab)).filter(fits);
-        self.restore = remembered.map(|k| Restore { tab: tab.to_string(), pane: k.pane.clone(), at: now });
+        self.restore = remembered.map(|k| Restore::new(tab.to_string(), k.pane.clone(), now));
     }
 
     /// After herdr's focused pane (and a goal's) took the keyboard: the remembered pane takes it once shown.
@@ -312,33 +372,37 @@ impl super::Shell {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
-        let Some(restore) = self.restore.as_ref() else { return };
+        let Some(mut restore) = self.restore.take() else { return };
         let handle = self.panes.get(&restore.pane).filter(|_| shown.iter().any(|f| f.pane_id == restore.pane)).map(|p| p.read(cx).focus_handle(cx));
-        match restore_step(restore, tab, handle.is_some(), goal, covered, now) {
+        let focus = self.keyboard_pane(shown, window, cx);
+        let moment = Moment { shown_tab: tab, pane_shown: handle.is_some(), goal, covered, touched: self.touched, focus: focus.as_deref(), now };
+        match restore_step(&mut restore, &moment) {
             Step::Apply => {
                 if let Some(handle) = handle {
                     window.focus(&handle, cx);
                 }
-                self.restore = None;
             }
-            Step::Drop => self.restore = None,
-            Step::Wait => {}
+            Step::Drop => {}
+            Step::Wait => self.restore = Some(restore),
         }
+    }
+
+    /// The shown pane with the keyboard.
+    fn keyboard_pane(&self, shown: &[crate::model::PaneFrame], window: &gpui::Window, cx: &gpui::App) -> Option<String> {
+        shown.iter().find(|f| self.panes.get(&f.pane_id).is_some_and(|p| p.read(cx).focus_handle(cx).is_focused(window))).map(|f| f.pane_id.clone())
     }
 
     /// The shown tab's pane with the keyboard is noted for the tab (and the next run), unless a remembered one
     /// waits to be given it back.
     pub(super) fn note_keyboard(&mut self, key: Option<&SessionKey>, tab: Option<&str>, shown: &[crate::model::PaneFrame], window: &gpui::Window, cx: &mut gpui::Context<Self>) {
         let (Some(key), Some(tab)) = (key, tab) else { return };
-        if self.restore.as_ref().is_some_and(|r| r.tab == tab) {
-            return;
-        }
-        let Some(f) = shown.iter().find(|f| self.panes.get(&f.pane_id).is_some_and(|p| p.read(cx).focus_handle(cx).is_focused(window))) else { return };
-        let terminal = self.snapshot.as_ref().and_then(|s| s.panes.iter().find(|p| p.pane_id == f.pane_id)).map(|p| p.terminal_id.clone()).unwrap_or_default();
-        let entry = KeyPane { pane: f.pane_id.clone(), terminal };
-        let tabs = self.keyboard.entry(key.0.clone()).or_default();
-        if tabs.get(tab) != Some(&entry) {
-            tabs.insert(tab.to_string(), entry);
+        let focused = self.keyboard_pane(shown, window, cx).map(|pane| {
+            let terminal = self.snapshot.as_ref().and_then(|s| s.panes.iter().find(|p| p.pane_id == pane)).map(|p| p.terminal_id.clone()).unwrap_or_default();
+            KeyPane { pane, terminal }
+        });
+        let noted = self.keyboard.get(&key.0).and_then(|m| m.get(tab));
+        if let Some(entry) = keyboard_note(self.kept_views.loaded, self.restore.as_ref(), tab, focused, noted) {
+            self.keyboard.entry(key.0.clone()).or_default().insert(tab.to_string(), entry);
             self.save_kept_views(cx);
         }
     }
@@ -425,6 +489,20 @@ mod tests {
     }
 
     #[test]
+    fn an_unread_machine_list_forgets_no_machine() {
+        let listed = [key("a"), SessionKey("machine:m1".into())];
+        let off = ["machine:m2".to_string()];
+        let known = |k: &str, machines_known: bool| still_known(k, &listed, Some(&key("shown")), &off, machines_known);
+        assert!(known("/tmp/a.sock", true) && known("/tmp/shown.sock", true) && known("machine:m1", true));
+        assert!(known("machine:m2", true), "turned off: kept for when it is back");
+        assert!(!known("machine:m3", true), "forgotten by herdr");
+        assert!(!known("/tmp/gone.sock", true));
+        // the machines could not be read: none is forgotten, a session still is
+        assert!(known("machine:m3", false));
+        assert!(!known("/tmp/gone.sock", false));
+    }
+
+    #[test]
     fn a_watcher_snapshot_drops_panes_that_left_or_changed_terminal() {
         let mut views = SessionViews::default();
         views.park(key("a"), view(&["w1:p1", "w1:p2", "w1:p3"], Instant::now()));
@@ -482,18 +560,74 @@ mod tests {
         assert_eq!((back.selected_tab.as_deref(), back.shown_workspace.as_deref()), (Some("w2:t1"), Some("w2")));
     }
 
+    /// A moment uncovered, with `w1:t1` and its pane shown, no goal, nothing touched since `t0 - 1 s`, the keyboard in
+    /// herdr's focused pane `w1:p1`.
+    fn moment(t0: Instant) -> Moment<'static> {
+        Moment { shown_tab: Some("w1:t1"), pane_shown: true, goal: false, covered: false, touched: t0 - Duration::from_secs(1), focus: Some("w1:p1"), now: t0 }
+    }
+
+    fn restore(t0: Instant) -> Restore {
+        Restore::new("w1:t1".into(), "w1:p2".into(), t0)
+    }
+
     #[test]
     fn a_restore_waits_for_its_tab_and_yields_to_a_goal() {
         let t0 = Instant::now();
-        let r = Restore { tab: "w1:t1".into(), pane: "w1:p2".into(), at: t0 };
-        assert_eq!(restore_step(&r, Some("w1:t1"), true, false, false, t0), Step::Apply);
-        assert_eq!(restore_step(&r, Some("w1:t2"), true, false, false, t0), Step::Wait, "another tab shown");
-        assert_eq!(restore_step(&r, None, false, false, false, t0), Step::Wait, "no snapshot yet");
-        assert_eq!(restore_step(&r, Some("w1:t1"), false, false, false, t0), Step::Wait, "its pane not laid out yet");
-        assert_eq!(restore_step(&r, Some("w1:t1"), true, false, true, t0), Step::Wait, "Settings or a file tab over the panes");
-        assert_eq!(restore_step(&r, Some("w1:t1"), true, true, false, t0), Step::Drop, "a goal wins");
-        assert_eq!(restore_step(&r, Some("w1:t1"), true, false, false, t0 + RESTORE_EXPIRY + Duration::from_millis(1)), Step::Drop);
-        assert_eq!(restore_step(&r, Some("w1:t1"), true, false, false, t0 + RESTORE_EXPIRY), Step::Apply);
+        let m = moment(t0);
+        assert_eq!(restore_step(&mut restore(t0), &m), Step::Apply);
+        assert_eq!(restore_step(&mut restore(t0), &Moment { shown_tab: Some("w1:t2"), ..moment(t0) }), Step::Wait, "another tab shown");
+        assert_eq!(restore_step(&mut restore(t0), &Moment { shown_tab: None, focus: None, ..moment(t0) }), Step::Wait, "no snapshot yet");
+        assert_eq!(restore_step(&mut restore(t0), &Moment { covered: true, ..moment(t0) }), Step::Wait, "Settings or a file tab over the panes");
+        assert_eq!(restore_step(&mut restore(t0), &Moment { goal: true, ..moment(t0) }), Step::Drop, "a goal wins");
+        let late = |d: Duration| restore_step(&mut restore(t0), &Moment { now: t0 + d, ..moment(t0) });
+        assert_eq!(late(RESTORE_EXPIRY + Duration::from_millis(1)), Step::Drop);
+        assert_eq!(late(RESTORE_EXPIRY), Step::Apply);
+    }
+
+    #[test]
+    fn a_restore_never_takes_the_keyboard_later() {
+        let t0 = Instant::now();
+        // its tab shows without its pane (another pane zoomed): let go, not given when the zoom ends mid-command
+        assert_eq!(restore_step(&mut restore(t0), &Moment { pane_shown: false, ..moment(t0) }), Step::Drop);
+        // your own key or click after it began
+        assert_eq!(restore_step(&mut restore(t0), &Moment { touched: t0 + Duration::from_millis(5), ..moment(t0) }), Step::Drop);
+        // the key or click that switched came before it: it stands
+        assert_eq!(restore_step(&mut restore(t0), &Moment { touched: t0, ..moment(t0) }), Step::Apply);
+        // waiting for its tab, the keyboard moved without it (herdr's focus, a click elsewhere): let go
+        let mut r = restore(t0);
+        assert_eq!(restore_step(&mut r, &Moment { shown_tab: Some("w1:t2"), ..moment(t0) }), Step::Wait);
+        assert_eq!(r.focus, Some(Some("w1:p1".to_string())));
+        assert_eq!(restore_step(&mut r, &Moment { focus: Some("w1:p3"), ..moment(t0) }), Step::Drop);
+        // a cover held the keyboard: once uncovered, where the keyboard went then is the start
+        let mut r = restore(t0);
+        assert_eq!(restore_step(&mut r, &Moment { shown_tab: Some("w1:t2"), ..moment(t0) }), Step::Wait);
+        assert_eq!(restore_step(&mut r, &Moment { covered: true, focus: None, ..moment(t0) }), Step::Wait);
+        assert_eq!(r.focus, None);
+        assert_eq!(restore_step(&mut r, &Moment { focus: Some("w1:p3"), ..moment(t0) }), Step::Apply);
+    }
+
+    #[test]
+    fn the_keyboard_is_noted_once_the_kept_file_is_read_and_no_restore_waits() {
+        let k = |pane: &str| KeyPane { pane: pane.into(), terminal: format!("term-{pane}") };
+        let t0 = Instant::now();
+        assert_eq!(keyboard_note(true, None, "w1:t1", Some(k("w1:p2")), None), Some(k("w1:p2")));
+        assert_eq!(keyboard_note(false, None, "w1:t1", Some(k("w1:p2")), None), None, "the last run's entry not read yet");
+        assert_eq!(keyboard_note(true, Some(&restore(t0)), "w1:t1", Some(k("w1:p1")), Some(&k("w1:p2"))), None, "the remembered pane waits");
+        assert_eq!(keyboard_note(true, Some(&restore(t0)), "w1:t9", Some(k("w9:p1")), None), Some(k("w9:p1")), "another tab's restore");
+        assert_eq!(keyboard_note(true, None, "w1:t1", Some(k("w1:p2")), Some(&k("w1:p2"))), None, "noted already");
+        assert_eq!(keyboard_note(true, None, "w1:t1", None, Some(&k("w1:p2"))), None, "no pane has it");
+    }
+
+    #[test]
+    fn leaving_reads_the_view_from_the_snapshot_before_it_goes() {
+        let snap = snapshot(&[("w1:p1", "w1:t1", "term-1")], Some("w1:t1"));
+        let t0 = Instant::now();
+        let v = leaving_view(Some(&snap), Some("w1:t1".into()), Some("w1".into()), vec![Parked { pane_id: "w1:p1".into(), terminal_id: String::new(), pane: 1 }], t0);
+        assert_eq!(v.herdr_focus.as_deref(), Some("w1:t1"));
+        assert_eq!(v.panes[0].terminal_id, "term-1", "its terminal, for the check on return");
+        // the snapshot already handed to the watcher: nothing to check against later
+        let v = leaving_view(None, Some("w1:t1".into()), None, vec![Parked { pane_id: "w1:p1".into(), terminal_id: String::new(), pane: 1 }], t0);
+        assert_eq!((v.herdr_focus, v.panes[0].terminal_id.as_str()), (None, ""));
     }
 
     #[test]
@@ -512,6 +646,9 @@ mod tests {
         assert!(prune_keyboard(&mut memory, &snap));
         assert_eq!(memory.keys().collect::<Vec<_>>(), ["w1:t1", "w1:t3"]);
         assert!(!prune_keyboard(&mut memory, &snap));
+        // a server starting lists nothing: nothing is forgotten
+        assert!(!prune_keyboard(&mut memory, &snapshot(&[], None)));
+        assert_eq!(memory.len(), 2);
         // kept for the next run as written
         let text = serde_json::to_string(&memory).unwrap();
         assert_eq!(serde_json::from_str::<BTreeMap<String, KeyPane>>(&text).unwrap(), memory);

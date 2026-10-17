@@ -294,7 +294,8 @@ impl Shell {
             let _ = this.update(cx, |s, cx| {
                 let again = s.watchers.listed(Instant::now());
                 if let Ok((sessions, machines)) = listed {
-                    let (places, disabled) = sidebar_tree::tree_order(sessions, machines);
+                    let machines_known = machines.is_some();
+                    let (places, disabled) = sidebar_tree::tree_order(sessions, machines.unwrap_or_default());
                     let changed = places != s.places || disabled != s.watchers.disabled;
                     s.places = places;
                     s.watchers.disabled = disabled;
@@ -302,15 +303,17 @@ impl Shell {
                     s.watchers.reconcile(&s.places, shown.as_ref(), Instant::now());
                     let listed: Vec<watchers::SessionKey> = s.places.iter().map(watchers::SessionKey::of).collect();
                     s.attention.keep_sessions(|k| listed.contains(k) || shown.as_ref() == Some(k));
-                    // a session deleted takes its view along; one herdr says stopped keeps it, without its terminals
-                    let gone = s.views.keep_sessions(|k| listed.contains(k) || shown.as_ref() == Some(k));
+                    // a session deleted takes its view and keyboard panes along (a machine turned off, or every machine
+                    // while herdr's list of them could not be read, keeps them); one herdr says stopped keeps its
+                    // view, without its terminals
+                    let off: Vec<String> = s.watchers.disabled.iter().map(|m| format!("machine:{}", m.id)).collect();
+                    let keep = |k: &str| session_views::still_known(k, &listed, shown.as_ref(), &off, machines_known);
+                    let gone = s.views.keep_sessions(|k| keep(&k.0));
                     let stopped: Vec<watchers::SessionKey> = listed.iter().filter(|k| s.watchers.get(k).is_some_and(|w| w.status == watchers::Status::Stopped)).cloned().collect();
                     let stopped: Vec<_> = stopped.iter().flat_map(|k| s.views.drop_panes(k)).collect();
                     s.retire_panes(gone.into_iter().chain(stopped), cx);
-                    // and its keyboard panes; a machine turned off keeps them for when it is back
-                    let off: Vec<String> = s.watchers.disabled.iter().map(|m| format!("machine:{}", m.id)).collect();
                     let before = s.keyboard.len();
-                    s.keyboard.retain(|k, _| listed.iter().any(|l| l.0 == *k) || shown.as_ref().is_some_and(|s| s.0 == *k) || off.contains(k));
+                    s.keyboard.retain(|k, _| keep(k));
                     if s.keyboard.len() != before {
                         s.save_kept_views(cx);
                     }

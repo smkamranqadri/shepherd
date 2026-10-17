@@ -6,6 +6,7 @@
 use super::session_views::KeyboardMemory;
 use super::*;
 use crate::files::open_files::{self, Fingerprinted};
+use futures::FutureExt;
 use crate::files::roots;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -60,6 +61,8 @@ pub(super) struct KeptState {
     /// Workspaces of the shown place checked against their Files entry this run (`open_files::reconcile`).
     pub seen: HashSet<String>,
     writes: open_files::Writes,
+    /// The write under way, which a quit waits for before it writes the latest.
+    in_flight: Option<open_files::InFlight>,
     save: Option<gpui::Task<()>>,
 }
 
@@ -145,6 +148,34 @@ impl Shell {
 
     /// Starts the write on the background executor when it differs from what the file holds; quitting waits for it.
     pub(super) fn write_kept_views(&mut self, cx: &mut Context<Self>) -> Option<gpui::Task<()>> {
+        let text = self.kept_views_text(cx)?;
+        if !self.kept_views.writes.start(&text) {
+            return None;
+        }
+        let write = cx
+            .background_spawn(async move {
+                let saved = open_files::save(&path(), &text);
+                if let Err(e) = &saved {
+                    eprintln!("shepherd: cannot save session views: {e}");
+                }
+                (text, saved.is_ok())
+            })
+            .shared();
+        self.kept_views.in_flight = Some(write.clone());
+        Some(cx.spawn(async move |this, cx| {
+            let (text, ok) = write.await;
+            let _ = this.update(cx, |s, cx| {
+                s.kept_views.in_flight = None;
+                if s.kept_views.writes.finish(text, ok) {
+                    s.save_kept_views(cx);
+                }
+            });
+        }))
+    }
+
+    /// The file's text for what is kept now (the side panel's open folders with their fingerprints); none before the
+    /// file was read.
+    fn kept_views_text(&mut self, cx: &mut Context<Self>) -> Option<String> {
         if !self.kept_views.loaded {
             return None;
         }
@@ -157,30 +188,21 @@ impl Shell {
         };
         self.kept_views.files = files_entries(now, &self.kept_views.files, fingerprint);
         let kept = KeptViews { keyboard: self.keyboard.iter().filter(|(_, m)| !m.is_empty()).map(|(k, m)| (k.clone(), m.clone())).collect(), files: self.kept_views.files.clone() };
-        let text = encode(&kept);
-        if !self.kept_views.writes.start(&text) {
-            return None;
-        }
-        let write = cx.background_spawn(async move {
-            let saved = open_files::save(&path(), &text);
-            if let Err(e) = &saved {
-                eprintln!("shepherd: cannot save session views: {e}");
-            }
-            (text, saved.is_ok())
-        });
-        Some(cx.spawn(async move |this, cx| {
-            let (text, ok) = write.await;
-            let _ = this.update(cx, |s, cx| {
-                if s.kept_views.writes.finish(text, ok) {
-                    s.save_kept_views(cx);
-                }
-            });
-        }))
+        Some(encode(&kept))
     }
 
-    /// Quitting: what changed since the last write is written now.
+    /// Quitting: what changed since the last write is written now; a write under way ends first, then the latest is
+    /// written after it.
     pub(super) fn flush_kept_views(&mut self, cx: &mut Context<Self>) -> Option<gpui::Task<()>> {
         drop(self.kept_views.save.take());
+        if let Some(in_flight) = self.kept_views.in_flight.clone() {
+            let text = self.kept_views_text(cx)?;
+            return Some(cx.background_spawn(async move {
+                if let Err(e) = open_files::write_after(in_flight, path(), text).await {
+                    eprintln!("shepherd: cannot save session views: {e}");
+                }
+            }));
+        }
         self.write_kept_views(cx)
     }
 }

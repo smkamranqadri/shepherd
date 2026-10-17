@@ -127,6 +127,8 @@ pub(super) struct KeptTabs {
     /// Workspaces of the shown place seen in a snapshot this run, whose kept entry was checked (`open_files::reconcile`).
     seen: HashSet<String>,
     writes: open_files::Writes,
+    /// The write under way, which a quit waits for before it writes the latest.
+    in_flight: Option<open_files::InFlight>,
     /// The timer of the next write; the write itself runs detached, so a later timer replacing this one never
     /// cancels it.
     save: Option<gpui::Task<()>>,
@@ -777,16 +779,19 @@ impl Shell {
         if !self.kept_tabs.writes.start(&text) {
             return None;
         }
-        let write = cx.background_spawn(async move {
-            let saved = open_files::save(&open_files::path(), &text);
-            if let Err(e) = &saved {
-                eprintln!("shepherd: cannot save open files: {e}");
-            }
-            (text, saved.is_ok())
-        });
+        let write = futures::FutureExt::shared(cx
+            .background_spawn(async move {
+                let saved = open_files::save(&open_files::path(), &text);
+                if let Err(e) = &saved {
+                    eprintln!("shepherd: cannot save open files: {e}");
+                }
+                (text, saved.is_ok())
+            }));
+        self.kept_tabs.in_flight = Some(write.clone());
         Some(cx.spawn(async move |this, cx| {
             let (text, ok) = write.await;
             let _ = this.update(cx, |s, cx| {
+                s.kept_tabs.in_flight = None;
                 if s.kept_tabs.writes.finish(text, ok) {
                     s.save_kept_tabs(cx);
                 }
@@ -794,10 +799,19 @@ impl Shell {
         }))
     }
 
-    /// Quitting: what changed since the last write is written now (unless a write is still under way).
+    /// Quitting: what changed since the last write is written now; a write under way ends first, then the latest is
+    /// written after it.
     pub(super) fn flush_kept_tabs(&mut self, cx: &mut Context<Self>) -> Option<gpui::Task<()>> {
         // the timer is dropped (cancelled): the write happens here instead
         drop(self.kept_tabs.save.take());
+        if let Some(in_flight) = self.kept_tabs.in_flight.clone().filter(|_| self.kept_tabs.loaded) {
+            let text = open_files::encode(&self.kept_tabs.map);
+            return Some(cx.background_spawn(async move {
+                if let Err(e) = open_files::write_after(in_flight, open_files::path(), text).await {
+                    eprintln!("shepherd: cannot save open files: {e}");
+                }
+            }));
+        }
         self.write_kept_tabs(cx)
     }
 }

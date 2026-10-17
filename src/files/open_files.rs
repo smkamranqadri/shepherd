@@ -59,14 +59,28 @@ pub fn encode(map: &BTreeMap<String, Remembered>) -> String {
     serde_json::to_string_pretty(map).unwrap_or_default()
 }
 
-/// Writes `text` through a temporary file renamed over, so a crash never leaves half a file.
+/// Writes `text` through a temporary file renamed over, so a crash never leaves half a file; the temporary file
+/// reaches the disk before the rename, so a power cut after it never leaves an empty one in its place.
 pub fn save(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text)?;
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
     std::fs::rename(&tmp, path)
+}
+
+/// A write of the file under way, for a quit to wait on: its text and whether it worked.
+pub type InFlight = futures::future::Shared<gpui::Task<(String, bool)>>;
+
+/// Quitting while a write is under way: that one ends first (they share the temporary file), then `text`, the
+/// latest, is written over it.
+pub async fn write_after(in_flight: InFlight, path: PathBuf, text: String) -> std::io::Result<()> {
+    in_flight.await;
+    save(&path, &text)
 }
 
 /// The writes of the file: what was written last, whether one is under way, and whether a change came in meanwhile.
@@ -156,6 +170,32 @@ pub fn reconcile<T: Fingerprinted>(map: &mut BTreeMap<String, T>, place: &str, l
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn a_quit_during_a_write_writes_the_latest_after_it(cx: &mut gpui::TestAppContext) {
+        use futures::FutureExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("open-files.json");
+        let executor = cx.executor();
+        let (slow, path) = (executor.clone(), file.clone());
+        // the write under way, slow to land
+        let in_flight: InFlight = executor
+            .spawn(async move {
+                slow.timer(std::time::Duration::from_millis(50)).await;
+                save(&path, "older").unwrap();
+                ("older".to_string(), true)
+            })
+            .shared();
+        // the Shell waits on it too, so it runs to its end whatever the quit does
+        let landed = executor.spawn(in_flight.clone());
+        let flush = executor.spawn(write_after(in_flight, file.clone(), "latest".into()));
+        cx.run_until_parked();
+        cx.executor().advance_clock(std::time::Duration::from_millis(60));
+        cx.run_until_parked();
+        flush.now_or_never().unwrap().unwrap();
+        assert_eq!(landed.now_or_never().unwrap(), ("older".to_string(), true));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "latest", "the older write landed after the latest");
+    }
 
     #[test]
     fn one_write_at_a_time_and_written_only_once_it_worked() {

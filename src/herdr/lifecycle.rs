@@ -9,15 +9,13 @@ use std::time::{Duration, Instant};
 /// How long a stop or a machine change may take before Shepherd gives up on it.
 const DEADLINE: Duration = Duration::from_secs(10);
 
-/// herdr's sessions and saved machines (enabled or not), each list read within `timeout`; a herdr without machines
-/// lists none.
-pub async fn list_places(timeout: Duration) -> anyhow::Result<(Vec<SessionInfo>, Vec<Machine>)> {
+/// herdr's sessions and saved machines (enabled or not), each list read within `timeout`. The machines are `None`
+/// when their list could not be read (it timed out, failed, or a herdr without machines): not known, rather than
+/// none, so nothing kept for them is forgotten.
+pub async fn list_places(timeout: Duration) -> anyhow::Result<(Vec<SessionInfo>, Option<Vec<Machine>>)> {
     let sessions = output(&["session", "list", "--json"], timeout).await?;
     let sessions = super::session::parse_sessions(&sessions)?;
-    let machines = match output(&["machine", "list", "--json"], timeout).await {
-        Ok(json) => serde_json::from_slice(&json).unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
+    let machines = output(&["machine", "list", "--json"], timeout).await.ok().and_then(|json| serde_json::from_slice(&json).ok());
     Ok((sessions, machines))
 }
 
