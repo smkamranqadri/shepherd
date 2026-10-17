@@ -248,6 +248,11 @@ pub struct PaneTerminal {
     pub takes_over: bool,
     /// Kitty images herdr shows on the pane (from the window's client shell), drawn over the grid.
     images: Vec<PaneImage>,
+    /// Its session was left for another (`park`): no stream, the grid kept as it was, attached again when shown.
+    parked: bool,
+    /// Attaches begun, for the tests.
+    #[cfg(test)]
+    attaches: usize,
 }
 
 impl PaneTerminal {
@@ -302,6 +307,9 @@ impl PaneTerminal {
             preview: None,
             takes_over: false,
             images: Vec::new(),
+            parked: false,
+            #[cfg(test)]
+            attaches: 0,
         }
         // Attaching waits for the first measured grid (`on_grid_metrics`): herdr resizes the real PTY to
         // whatever size the attach names.
@@ -319,6 +327,58 @@ impl PaneTerminal {
         self.ended.as_deref()
     }
 
+    pub fn is_parked(&self) -> bool {
+        self.parked
+    }
+
+    /// Shows a local copy of herdr's history (scrolled back with the wheel).
+    pub fn has_history(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// Back to the live grid, so a parked pane past the cap keeps one grid, not two.
+    pub fn drop_history(&mut self, cx: &mut Context<Self>) {
+        if self.live.is_some() {
+            self.leave_history();
+            cx.notify();
+        }
+    }
+
+    /// The window moves to another session: the pane's stream detaches (herdr frees its control, and the reader
+    /// thread ends) and the grid stays as it is, to paint at once on return. Nothing typed waits to be sent: keys
+    /// held for this pane must never land in it later, nor follow the keyboard elsewhere.
+    pub fn park(&mut self, cx: &mut Context<Self>) {
+        self.parked = true;
+        self.session = None;
+        self._pump = None;
+        self.held.clear();
+        self.history_pending = None;
+        self.drag = None;
+        self.pointer = None;
+        self.hover = None;
+        self.hover_cell = None;
+        self.preview = None;
+        // a find reads herdr's history through the window's socket, which now names the other session
+        self.search = None;
+        self._scroll_settle = None;
+        self.scroll_local_until = None;
+        (self.scroll_fetching, self.scroll_stale, self.scroll_due) = (false, false, false);
+        cx.notify();
+    }
+
+    /// Its session is shown again and so is the pane: it attaches again, once its grid was measured (else the
+    /// first measure attaches, as for a new pane). Called from a render, after the window's socket names the
+    /// session again: the attach goes to the socket set then.
+    pub fn resume(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.parked) {
+            return;
+        }
+        if self.geometry.is_some() && self.ended.is_none() {
+            self.attach(false, cx);
+        }
+        cx.notify();
+    }
+
     /// herdr's images on this pane now; returns those it no longer shows, for the window to free.
     pub fn set_images(&mut self, images: Vec<PaneImage>, cx: &mut Context<Self>) -> Vec<std::sync::Arc<gpui::RenderImage>> {
         if self.images.is_empty() && images.is_empty() {
@@ -332,6 +392,10 @@ impl PaneTerminal {
     /// Connects off the main thread: herdr's handshake takes tens of milliseconds, and attaching happens while a
     /// frame is laid out (a tab switch attaches every pane it shows).
     fn attach(&mut self, takeover: bool, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            self.attaches += 1;
+        }
         // herdr's popup comes with the client shell's surface, when there is one
         if let Some(ShellConnection(shell)) = cx.try_global::<ShellConnection>().filter(|_| self.takes_over) {
             let (session, rx) = Session::over_popup(shell.clone(), &self.pane_id);
@@ -394,7 +458,7 @@ impl PaneTerminal {
 
     /// Re-attaches as [`Yielded`] now asks: observing, or controlling again.
     pub fn follow_yield(&mut self, cx: &mut Context<Self>) {
-        if self.geometry.is_some() && self.ended.is_none() && self.observing != yielded(cx) {
+        if !self.parked && self.geometry.is_some() && self.ended.is_none() && self.observing != yielded(cx) {
             self.reattach(false, cx);
         }
     }
@@ -420,7 +484,7 @@ impl PaneTerminal {
             self.emulator.resize(cols, rows);
             self.resized_at = Some(std::time::Instant::now());
         }
-        if first && self.session.is_none() && self.ended.is_none() {
+        if first && self.session.is_none() && self.ended.is_none() && !self.parked {
             self.attach(false, cx);
         } else if let (Some(session), true) = (&self.session, resized || rescaled) {
             session.resize(cols, rows, geometry.cell_px);
@@ -963,6 +1027,9 @@ impl PaneTerminal {
     }
 
     fn input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        if self.parked {
+            return; // its session is not shown: nothing typed may wait to land in it later
+        }
         self.typed(cx);
         match &self.session {
             Some(session) if !self.observing => {
@@ -1766,6 +1833,48 @@ mod tests {
         cx.update(|cx| cx.set_global(GridHold(false)));
         pane.update(cx, |p, cx| p.on_grid_metrics(geometry(100, 40), cx));
         pane.read_with(cx, |p, _| assert_eq!(p.emulator.cols(), 100));
+    }
+
+    #[gpui::test]
+    fn a_parked_pane_forgets_held_keys_and_attaches_again_once_shown(cx: &mut gpui::TestAppContext) {
+        // No client socket and no binary: an attach fails without touching a real herdr.
+        unsafe {
+            std::env::set_var("SHEPHERD_HERDR", "/nonexistent/herdr");
+            std::env::set_var("HERDR_CLIENT_SOCKET_PATH", "/nonexistent/herdr-client.sock");
+        }
+        let pane = cx.new(|cx| PaneTerminal::new("w1:p1".into(), cx));
+        // keys typed while connecting are held for the session; parking forgets them
+        pane.update(cx, |p, cx| {
+            p.input(b"rm -rf build", cx);
+            assert_eq!(p.held, b"rm -rf build");
+            p.park(cx);
+        });
+        pane.read_with(cx, |p, _| assert!(p.is_parked() && p.held.is_empty() && p.session.is_none(), "held: {:?}", p.held));
+        pane.update(cx, |p, cx| p.input(b"y", cx));
+        pane.read_with(cx, |p, _| assert!(p.held.is_empty(), "held while parked: {:?}", p.held));
+        // never measured: shown again, it waits for its size, then attaches once
+        pane.update(cx, |p, cx| p.resume(cx));
+        cx.run_until_parked();
+        pane.read_with(cx, |p, _| assert_eq!((p.attaches, p.is_parked(), p.ended.is_none()), (0, false, true)));
+        pane.update(cx, |p, cx| p.on_grid_metrics(geometry(120, 40), cx));
+        cx.run_until_parked();
+        pane.read_with(cx, |p, _| assert_eq!(p.attaches, 1));
+        // measured: parked, a measure attaches nothing; shown again, it attaches at once, one time
+        pane.update(cx, |p, cx| {
+            p.ended = None;
+            p.park(cx);
+            p.on_grid_metrics(geometry(100, 40), cx);
+        });
+        pane.read_with(cx, |p, _| assert_eq!(p.attaches, 1, "attached while parked"));
+        pane.update(cx, |p, cx| {
+            p.resume(cx);
+            p.resume(cx);
+        });
+        cx.run_until_parked();
+        pane.read_with(cx, |p, _| {
+            assert_eq!(p.attaches, 2);
+            assert_eq!((p.emulator.cols(), p.emulator.rows()), (100, 40), "the grid kept its size while parked");
+        });
     }
 
     #[test]
