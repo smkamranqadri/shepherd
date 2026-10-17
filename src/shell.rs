@@ -242,8 +242,6 @@ pub struct Shell {
     pane_spring_back: Option<pane_drag::SpringBack>,
     /// The command panel (cmd-k), open over the window.
     command_panel: Option<crate::ui::Popup<(Entity<crate::ui::command_panel::Panel>, Subscription)>>,
-    /// Agents that started waiting or finished out of sight and have not been looked at since: the Dock badge.
-    unseen: std::collections::HashSet<String>,
     /// What was told of each agent in every session, so a change is told once.
     attention: attention::Attention,
     /// The count on the Dock icon now.
@@ -596,7 +594,6 @@ impl Shell {
                     pane_drop: None,
                     pane_spring_back: None,
                     command_panel: None,
-                    unseen: Default::default(),
                     attention: Default::default(),
                     badge: 0,
                     frame: None,
@@ -636,7 +633,8 @@ impl Shell {
                 cx.spawn(async move |this, cx| loop {
                     cx.background_executor().timer(Duration::from_secs(60)).await;
                     let alive = this.update(cx, |s, cx| {
-                        if s.since.values().any(|(status, _)| crate::notify::wants_attention(*status)) {
+                        let elsewhere = s.watchers.snapshots().any(|snap| sidebar_tree::waiting(snap) > 0);
+                        if elsewhere || s.since.values().any(|(status, _)| crate::notify::wants_attention(*status)) {
                             cx.notify();
                         }
                     });
@@ -903,8 +901,7 @@ impl Shell {
         (window_active && self.settings.is_none() && self.shown_file_tab().is_none()).then(|| self.shown_tab()).flatten().map(|t| t.tab_id)
     }
 
-    /// Agents of the session shown that just started waiting or finished out of sight: a notification each, and a
-    /// place in the Dock count.
+    /// Agents of the session shown that just started waiting or finished out of sight: a notification each.
     fn agents_changed(&mut self, next: &Snapshot, cx: &mut Context<Self>) {
         let in_view = self.tab_in_view(cx.active_window().is_some());
         let Some(old) = self.snapshot.as_ref() else { return };
@@ -914,24 +911,14 @@ impl Shell {
             .collect();
         let key = self.shown_key();
         for (pane, message) in told {
-            if crate::notify::wants_attention(pane.agent_status) {
-                self.unseen.insert(pane.pane_id.clone());
-            }
             self.tell(key.as_ref(), &pane, message, cx);
         }
     }
 
-    /// Agents leave the Dock count once their tab is in view or they moved on.
-    fn sync_badge(&mut self, window: &Window, cx: &App) {
-        let in_view = self.tab_in_view(window.is_window_active());
-        if let Some(snapshot) = &self.snapshot {
-            self.unseen.retain(|id| {
-                snapshot.panes.iter().any(|p| {
-                    &p.pane_id == id && crate::notify::wants_attention(p.agent_status) && in_view.as_deref() != Some(p.tab_id.as_str())
-                })
-            });
-        }
-        let count = if SettingsGlobal::of(cx).settings.dock_badge { self.unseen.len() } else { 0 };
+    /// The Dock count: every agent waiting or finished, in the session shown and in every other one its watcher
+    /// keeps, so a switch of session leaves it as it is. Agents in the tab in view count too: they still wait.
+    fn sync_badge(&mut self, cx: &App) {
+        let count = if SettingsGlobal::of(cx).settings.dock_badge { attention::badge(self.snapshot.iter().chain(self.watchers.snapshots())) } else { 0 };
         if count != self.badge {
             self.badge = count;
             crate::notify::set_badge(count);
@@ -1329,7 +1316,7 @@ impl Render for Shell {
         for image in self.retired_images.drain(..) {
             let _ = window.drop_image(image);
         }
-        self.sync_badge(window, cx);
+        self.sync_badge(cx);
         self.mark_seen(window, cx);
         // any Shepherd window in front, not this one: a window in the back renders too
         secure_input(SettingsGlobal::of(cx).settings.secure_input && cx.active_window().is_some());

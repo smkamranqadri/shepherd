@@ -1,6 +1,6 @@
 //! Agents that need you, in every session: which status changes alert (`alerts`), which of those are told
-//! (`Attention`: an exact repeat never, the same status again only after a while), what the notification says, and
-//! where a click on it or its Approve goes (`route`).
+//! (`Attention`: an exact repeat never, the same status again only after a while), what the notification says, where
+//! a click on it or its Approve goes (`route`), and the Dock count of every agent waiting anywhere (`badge`).
 use super::sidebar_tree::Goal;
 use super::watchers::{Kind, SessionKey};
 use super::*;
@@ -64,6 +64,11 @@ impl Attention {
     pub(super) fn keep_sessions(&mut self, keep: impl Fn(&SessionKey) -> bool) {
         self.told.retain(|(k, _), _| keep(k));
     }
+}
+
+/// The Dock count: every agent waiting or finished, in every session's snapshot.
+pub(super) fn badge<'a>(snapshots: impl IntoIterator<Item = &'a Snapshot>) -> usize {
+    snapshots.into_iter().map(sidebar_tree::waiting).sum()
 }
 
 /// A notification's title and body: "claude · api — menqal" (the session named when it is not the one shown), and
@@ -276,6 +281,15 @@ mod tests {
         assert!(a.tell(p1, AgentStatus::Blocked, 3, t0), "menqal's was let go");
         a.tell((key("x"), "w1:p1".into()), AgentStatus::Done, 1, t0 + FORGET_AFTER);
         assert_eq!(a.told.len(), 1, "only the one told just now is kept");
+    }
+
+    #[test]
+    fn the_badge_counts_every_waiting_agent_in_every_session() {
+        let shown = snapshot(&[("p1", "blocked", 1), ("p2", "working", 1), ("p3", "idle", 1)]);
+        let other = snapshot(&[("p1", "done", 1), ("p2", "blocked", 1)]);
+        assert_eq!(badge([&shown, &other]), 3);
+        assert_eq!(badge([&other]), 2);
+        assert_eq!(badge([]), 0);
     }
 
     #[test]

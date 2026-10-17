@@ -413,7 +413,6 @@ impl Shell {
         self.settling = None;
         self.pending_worktrees.clear();
         self.removing.clear();
-        self.unseen.clear();
         self.connect(cx);
         self.refresh_places(cx);
         cx.notify();

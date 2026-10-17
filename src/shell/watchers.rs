@@ -311,6 +311,11 @@ impl Watchers {
         self.map.get(key)?.snapshot.as_ref()
     }
 
+    /// The last snapshot of every session not shown that has one.
+    pub(super) fn snapshots(&self) -> impl Iterator<Item = &Snapshot> {
+        self.map.values().filter(|w| w.status != Status::Shown).filter_map(|w| w.snapshot.as_ref())
+    }
+
     /// The key's place in the tree, for element ids that tell sessions' rows apart.
     pub(super) fn index_of(&self, key: &SessionKey) -> Option<usize> {
         self.order.iter().position(|k| k == key)
@@ -770,8 +775,10 @@ mod tests {
         w.reconcile(&[session("default", true), session("menqal", true)], Some(&key("default")), now);
         w.park(&key("default"), Some(agents(&[("p1", "working"), ("p2", "working")])), Default::default(), now);
         assert_eq!(w.apply(&key("default"), Ok(agents(&[("p1", "blocked"), ("p2", "working")])), now).alerts, ["p1"]);
+        assert_eq!(w.snapshots().count(), 1, "a parked session counts toward the badge");
         // the shown session's answers are the sync loop's: nothing comes of them here
         w.unpark(&key("default"));
+        assert_eq!(w.snapshots().count(), 0, "the shown session's snapshot is the window's");
         assert!(w.apply(&key("default"), Ok(agents(&[("p1", "working"), ("p2", "done")])), now).alerts.is_empty());
     }
 

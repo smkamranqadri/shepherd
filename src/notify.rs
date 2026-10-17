@@ -1,5 +1,5 @@
 //! Agents that need you: a system notification when one starts waiting or finishes out of sight, and on macOS a
-//! Dock badge counting those not looked at yet.
+//! Dock badge counting every agent waiting or finished, in every session.
 use crate::model::AgentStatus;
 use gpui::{App, SystemNotification, SystemNotificationAction};
 #[cfg(target_os = "macos")]
