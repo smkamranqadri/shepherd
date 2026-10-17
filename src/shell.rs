@@ -50,6 +50,7 @@ pub(crate) use widgets::{menu_card, modal, row, status_dot, status_icon, tip};
 use widgets::*;
 pub(crate) use tab_bar::agent_favicon;
 pub(crate) use sessions::icon_mark;
+pub use sidebar_tree::Goal;
 
 const TITLEBAR_HEIGHT: f32 = 38.0;
 /// The titlebar's left cluster: traffic lights, then the sidebar toggle at Zeron's `titlebar_cluster_start` (88).
@@ -780,8 +781,23 @@ impl Shell {
                 crate::ui::command_panel::items(self.shown_in_order().as_deref(), &bindings, &self.plugin_actions)
             }
             Kind::Shortcuts => crate::ui::command_panel::shortcut_items(&cx.try_global::<ActiveBindings>().map(|b| b.0.clone()).unwrap_or_default()),
-            Kind::Agents => crate::ui::command_panel::agent_items(self.shown_in_order().as_deref(), self.agent_sort, &self.since),
-            Kind::Workspaces => crate::ui::command_panel::workspace_items(self.shown_in_order().as_deref()),
+            Kind::Agents => crate::ui::command_panel::agent_items(self.panel_agents(cx)),
+            Kind::Workspaces => {
+                let sessions = self.session_agents(cx);
+                // each session's workspaces in the order of drops herdr hasn't carried out yet, as the tree shows them
+                let ordered: Vec<Option<Snapshot>> = sessions.iter().map(|s| self.pending_order(&s.key, s.snapshot)).collect();
+                let rows: Vec<_> = sessions
+                    .iter()
+                    .zip(&ordered)
+                    .map(|(s, ordered)| crate::ui::command_panel::SessionWorkspaces {
+                        key: s.key.0.clone(),
+                        name: s.name.clone(),
+                        snapshot: ordered.as_ref().unwrap_or(s.snapshot),
+                        out_of_reach: self.out_of_reach(&s.key),
+                    })
+                    .collect();
+                crate::ui::command_panel::session_workspace_items(&rows)
+            }
             Kind::Branches => match dir.as_deref() {
                 Some(d) => crate::ui::command_panel::branch_items(&crate::ui::statusbar::read_branches(d), crate::ui::statusbar::branch_of(d, cx).as_deref()),
                 None => Vec::new(),
@@ -833,6 +849,15 @@ impl Shell {
                     this.run_herdr_command(command, window, cx);
                 }
                 PanelEvent::Run(Run::Tab(tab_id)) => this.show_herdr_tab(Some(tab_id.clone()), true, cx),
+                // as a click on its row in the tree: switched to first when in another session (a machine out of
+                // reach says so and stays)
+                PanelEvent::Run(Run::Go(key, goal)) => {
+                    if this.settings.is_some() {
+                        this.close_settings(cx);
+                    }
+                    window.focus(&this.focus, cx);
+                    this.go_to(watchers::SessionKey(key.clone()), goal.clone(), cx);
+                }
                 PanelEvent::Run(Run::Branch(branch)) => {
                     let (Some(dir), branch) = (dir.clone(), branch.clone()) else { return };
                     cx.spawn(async move |this, cx| {

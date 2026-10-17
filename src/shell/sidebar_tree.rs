@@ -66,9 +66,9 @@ pub(super) enum NoticeAction {
     Retry,
 }
 
-/// Where a click in the tree goes once its session is shown.
+/// Where a click in the tree (or a row of the agents and workspaces panels) goes once its session is shown.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) enum Goal {
+pub enum Goal {
     Workspace(String),
     Pane { tab: String, pane: String },
 }
@@ -532,6 +532,21 @@ impl Shell {
     /// watchers; and whether any session has an agent at all.
     pub(super) fn agents_everywhere(&self, attention: bool, cx: &App) -> (Vec<AgentEntry>, bool) {
         cross_agents(&self.session_agents(cx), self.agent_sort, attention, Instant::now())
+    }
+
+    /// Whether the session `key` is out of reach: its rows show the last snapshot it sent.
+    pub(super) fn out_of_reach(&self, key: &SessionKey) -> bool {
+        self.watchers.get(key).is_some_and(|w| w.status == Status::Unreachable)
+    }
+
+    /// The agents panel's rows: every session's agents in the Agents section's order (never filtered to those that
+    /// need you: the panel is searched), those of a session out of reach marked so.
+    pub(super) fn panel_agents(&self, cx: &App) -> Vec<crate::ui::command_panel::AgentRow> {
+        let (entries, _) = cross_agents(&self.session_agents(cx), self.agent_sort, false, Instant::now());
+        entries
+            .into_iter()
+            .map(|e| crate::ui::command_panel::AgentRow { out_of_reach: self.out_of_reach(&e.key), key: e.key.0, pane: e.pane, workspace: e.workspace, waited: e.waited })
+            .collect()
     }
 
     /// Every session's agents as the Agents section and Next agent that needs you read them, in the tree's order: a

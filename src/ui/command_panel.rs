@@ -1,7 +1,7 @@
 //! The command panel (cmd-k, Zeron's command palette): every app action with its chord, then every workspace
 //! and tab of the snapshot, filtered as you type. The agents panel is the same list over the agents.
 use crate::bindings::{ACTIONS, ActiveBindings, normalize};
-use crate::model::{AgentSort, AgentStatus, Since, Snapshot, ago, waiting_since};
+use crate::model::{AgentStatus, Snapshot};
 use crate::theme::Theme;
 use crate::ui::Popup;
 use gpui::{
@@ -31,6 +31,9 @@ pub enum Run {
     Worktree { repo: String, path: String, workspace_id: Option<String> },
     /// Show this session or machine, by its key in the sidebar's bar.
     Place(String),
+    /// Go to this workspace or agent of the session `key` (a socket, `machine:<id>`), switching there first when it
+    /// is not the one shown, as a click in the sidebar's tree does.
+    Go(String, crate::shell::Goal),
 }
 
 /// The heading an item sits under; also searched, so "tab" finds the tabs.
@@ -97,7 +100,7 @@ impl Item {
             Run::Action(_) | Run::EditKeys(_) | Run::Branch(_) | Run::Herdr(_) | Run::Theme(_) => self.label.clone(),
             // the branch, then its folder; the place, then where it is
             Run::Worktree { .. } | Run::Place(_) => [Some(self.label.as_str()), self.hint.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" "),
-            Run::Tab(_) => [Some(self.label.as_str()), self.hint.as_deref(), Some(self.section.title())].into_iter().flatten().collect::<Vec<_>>().join(" "),
+            Run::Tab(_) | Run::Go(..) => [Some(self.label.as_str()), self.hint.as_deref(), Some(self.section.title())].into_iter().flatten().collect::<Vec<_>>().join(" "),
         }
     }
 
@@ -311,6 +314,49 @@ pub fn workspace_items(snapshot: Option<&Snapshot>) -> Vec<Item> {
         .collect()
 }
 
+/// One session's workspaces as the workspaces panel lists them: its key, its name, its snapshot (in the tree's order)
+/// and whether it is out of reach, its snapshot then the last it sent.
+pub struct SessionWorkspaces<'a> {
+    pub key: String,
+    pub name: String,
+    pub snapshot: &'a Snapshot,
+    pub out_of_reach: bool,
+}
+
+/// Said of a row whose session is out of reach: what it shows is the last it heard, and going there may not work.
+pub const OUT_OF_REACH: &str = "out of reach";
+
+/// Every session's workspaces, in the tree's order, each going where a click on its row in the tree goes: named
+/// "session · workspace" when there is more than one session. Workspace ids repeat across sessions, so the session's
+/// key is in each item's key and run.
+pub fn session_workspace_items(sessions: &[SessionWorkspaces]) -> Vec<Item> {
+    let named = sessions.len() > 1;
+    let busy = |status: AgentStatus| (!matches!(status, AgentStatus::Idle | AgentStatus::Unknown)).then_some(status);
+    sessions
+        .iter()
+        .flat_map(|session| {
+            let s = session.snapshot;
+            s.workspace_tree().into_iter().filter_map(move |(w, _)| {
+                // a workspace without a tab has nothing to show
+                s.tabs_of(&w.workspace_id).first()?;
+                let linked = w.worktree.as_ref().is_some_and(|t| t.is_linked_worktree);
+                Some(Item {
+                    key: format!("workspace:{}\n{}", session.key, w.workspace_id),
+                    section: Section::Workspaces,
+                    icon: if linked { "icons/git-branch.svg" } else { "icons/folder.svg" },
+                    label: if named { format!("{} · {}", session.name, w.label) } else { w.label.clone() },
+                    mark: None,
+                    hint: session.out_of_reach.then(|| OUT_OF_REACH.to_string()),
+                    chords: Vec::new(),
+                    status: busy(w.agent_status),
+                    waiting: 0,
+                    run: Run::Go(session.key.clone(), crate::shell::Goal::Workspace(w.workspace_id.clone())),
+                })
+            })
+        })
+        .collect()
+}
+
 pub fn items(snapshot: Option<&Snapshot>, bindings: &[(String, String)], plugin_actions: &[(String, String)]) -> Vec<Item> {
     let busy = |status: AgentStatus| (!matches!(status, AgentStatus::Idle | AgentStatus::Unknown)).then_some(status);
     let mut out: Vec<Item> = ACTIONS
@@ -412,28 +458,37 @@ fn short_tab_label(label: &str) -> &str {
     rest.rsplit(" › ").next().unwrap_or(rest)
 }
 
-/// The sidebar's agents, in its order, by what they work on: each runs to its tab, as a click on its row does.
-/// A waiting one's hint leads with how long it has waited.
-pub fn agent_items(snapshot: Option<&Snapshot>, sort: AgentSort, since: &Since) -> Vec<Item> {
-    let Some(s) = snapshot else { return Vec::new() };
-    s.agents_by(sort, since)
-        .into_iter()
-        .map(|p| {
+/// An agent as the agents panel lists it: its session's key, the pane, its workspace ("session · workspace" when
+/// there is more than one session), how long it has waited, and whether its session is out of reach.
+pub struct AgentRow {
+    pub key: String,
+    pub pane: crate::model::Pane,
+    pub workspace: String,
+    pub waited: Option<String>,
+    pub out_of_reach: bool,
+}
+
+/// Every session's agents, in the Agents section's order, by what they work on: each goes to its pane, as a click on
+/// its row does, switching session first when it is in another. A waiting one's hint leads with how long it has
+/// waited; one whose session is out of reach says so, from that session's last snapshot.
+pub fn agent_items(rows: Vec<AgentRow>) -> Vec<Item> {
+    rows.into_iter()
+        .map(|row| {
+            let p = row.pane;
             let agent = p.agent.clone().unwrap_or_default();
+            let hint = [row.out_of_reach.then(|| OUT_OF_REACH.to_string()), row.waited, Some(row.workspace).filter(|w| !w.is_empty())];
+            let hint: Vec<String> = hint.into_iter().flatten().collect();
             Item {
-                key: format!("agent:{}", p.pane_id),
+                key: format!("agent:{}\n{}", row.key, p.pane_id),
                 section: Section::Agents,
                 icon: agent_icon(&agent),
                 mark: None,
                 label: p.terminal_title_stripped.clone().filter(|t| !t.is_empty()).unwrap_or(agent),
-                hint: s.workspaces.iter().find(|w| w.workspace_id == p.workspace_id).map(|w| match waiting_since(since, p) {
-                    Some(at) => format!("{} · {}", ago(at.elapsed()), w.label),
-                    None => w.label.clone(),
-                }),
+                hint: (!hint.is_empty()).then(|| hint.join(" · ")),
                 chords: Vec::new(),
                 status: Some(p.agent_status),
                 waiting: 0,
-                run: Run::Tab(p.tab_id.clone()),
+                run: Run::Go(row.key, crate::shell::Goal::Pane { tab: p.tab_id, pane: p.pane_id }),
             }
         })
         .collect()
@@ -1207,6 +1262,73 @@ mod tests {
         assert_eq!(place_after_current(&last, &rank("", &last)), 0);
         let none = place_items(vec![row("a", None, false), row("b", None, false)]);
         assert_eq!(place_after_current(&none, &rank("", &none)), 0);
+    }
+
+    /// One workspace `web` (w1) with a tab, and an agent waiting in it.
+    fn one_workspace() -> Snapshot {
+        serde_json::from_value(serde_json::json!({
+            "focused_workspace_id": null, "focused_tab_id": null, "focused_pane_id": null,
+            "workspaces": [
+                {"workspace_id": "w1", "label": "web", "number": 1, "active_tab_id": "t1", "agent_status": "blocked"},
+                {"workspace_id": "w2", "label": "bare", "number": 2, "active_tab_id": null, "agent_status": "idle"}
+            ],
+            "tabs": [{"tab_id": "t1", "workspace_id": "w1", "label": "claude", "number": 1, "agent_status": "blocked"}],
+            "panes": [{"pane_id": "p1", "tab_id": "t1", "workspace_id": "w1", "terminal_id": "x", "agent_status": "blocked", "agent": "claude", "terminal_title_stripped": "Fix tabs"}],
+            "layouts": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_workspaces_panel_lists_every_session_s_apart() {
+        let s = one_workspace();
+        let session = |key: &str, out_of_reach: bool| SessionWorkspaces { key: key.into(), name: key.trim_start_matches("/tmp/").into(), snapshot: &s, out_of_reach };
+        let items = session_workspace_items(&[session("/tmp/alpha", false), session("/tmp/beta", true)]);
+        let rows: Vec<_> = items.iter().map(|i| (i.key.as_str(), i.label.as_str(), i.hint.as_deref(), i.run.clone())).collect();
+        let go = |key: &str| Run::Go(key.into(), crate::shell::Goal::Workspace("w1".into()));
+        assert_eq!(
+            rows,
+            [
+                ("workspace:/tmp/alpha\nw1", "alpha · web", None, go("/tmp/alpha")),
+                ("workspace:/tmp/beta\nw1", "beta · web", Some(OUT_OF_REACH), go("/tmp/beta")),
+            ],
+            "the same id in two sessions, told apart; a workspace without a tab left out; one out of reach marked"
+        );
+        assert_eq!(ranked("beta", &items), ["beta · web"]);
+        assert_eq!(ranked("out of reach", &items), ["beta · web"]);
+        // one session: its workspaces' names alone
+        let one = session_workspace_items(&[session("/tmp/alpha", false)]);
+        assert_eq!(one.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["web"]);
+    }
+
+    #[test]
+    fn the_agents_panel_goes_to_an_agent_in_any_session() {
+        let pane = one_workspace().panes[0].clone();
+        let row = |key: &str, workspace: &str, waited: Option<&str>, out_of_reach: bool| AgentRow {
+            key: key.into(),
+            pane: pane.clone(),
+            workspace: workspace.into(),
+            waited: waited.map(str::to_string),
+            out_of_reach,
+        };
+        let items = agent_items(vec![row("/tmp/alpha", "alpha · web", None, false), row("/tmp/beta", "beta · web", Some("5m"), false), row("machine:m", "box · web", None, true)]);
+        let rows: Vec<_> = items.iter().map(|i| (i.key.as_str(), i.label.as_str(), i.hint.as_deref())).collect();
+        assert_eq!(
+            rows,
+            [
+                ("agent:/tmp/alpha\np1", "Fix tabs", Some("alpha · web")),
+                ("agent:/tmp/beta\np1", "Fix tabs", Some("5m · beta · web")),
+                ("agent:machine:m\np1", "Fix tabs", Some("out of reach · box · web")),
+            ],
+            "pane ids repeat across sessions: the session's key tells them apart"
+        );
+        assert_eq!(items[1].run, Run::Go("/tmp/beta".into(), crate::shell::Goal::Pane { tab: "t1".into(), pane: "p1".into() }));
+        assert_eq!(items[1].status, Some(AgentStatus::Blocked));
+        assert_eq!(ranked("beta", &items), ["Fix tabs"]);
+        assert_eq!(items[rank("beta", &items)[0]].key, "agent:/tmp/beta\np1");
+        // one session: no session in the hint
+        let one = agent_items(vec![row("/tmp/alpha", "web", None, false)]);
+        assert_eq!(one[0].hint.as_deref(), Some("web"));
     }
 
     fn shortcut(label: &str, chords: &[&str]) -> Item {
