@@ -528,34 +528,43 @@ impl Shell {
             }
         }
         for (key, client, timeout, generation) in self.watchers.due(now, activity) {
-            let call = self.rt.spawn(async move {
-                match tokio::time::timeout(timeout, client.call("session.snapshot", json!({}))).await {
-                    Ok(answer) => answer,
-                    Err(_) => Err(anyhow::anyhow!("no answer in {} s", timeout.as_secs())),
-                }
-            });
-            cx.spawn(async move |this, cx| {
-                let answer = call.await.map_err(anyhow::Error::from).and_then(|r| r);
-                let parsed = cx.background_executor().spawn(async move { answer.and_then(|r| Snapshot::from_result(&r)) }).await;
-                let _ = this.update(cx, |s, cx| {
-                    let applied = s.watchers.answer(&key, generation, parsed, Instant::now());
-                    s.tell_elsewhere(&key, &applied.alerts, cx);
-                    // its parked panes follow it: all go when it stopped, those it no longer backs when it changed
-                    let parked = match s.watchers.snapshot(&key) {
-                        _ if applied.stopped => s.views.drop_panes(&key),
-                        Some(snapshot) if applied.changed => s.views.prune_against(&key, snapshot),
-                        _ => Vec::new(),
-                    };
-                    s.retire_panes(parked, cx);
-                    if applied.stopped {
-                        s.refresh_places(cx);
-                    }
-                    if applied.changed {
-                        cx.notify();
-                    }
-                });
-            })
-            .detach();
+            self.fetch(key, client, timeout, generation, cx);
+        }
+    }
+
+    /// One poll: `session.snapshot` on the runtime within `timeout`, parsed off the main thread, then `fetched`.
+    fn fetch(&mut self, key: SessionKey, client: Client, timeout: Duration, generation: u64, cx: &mut Context<Self>) {
+        let call = self.rt.spawn(async move {
+            match tokio::time::timeout(timeout, client.call("session.snapshot", json!({}))).await {
+                Ok(answer) => answer,
+                Err(_) => Err(anyhow::anyhow!("no answer in {} s", timeout.as_secs())),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let answer = call.await.map_err(anyhow::Error::from).and_then(|r| r);
+            let parsed = cx.background_executor().spawn(async move { answer.and_then(|r| Snapshot::from_result(&r)) }).await;
+            let _ = this.update(cx, |s, cx| s.fetched(&key, generation, parsed, cx));
+        })
+        .detach();
+    }
+
+    /// A poll's answer, asked for at `generation`, applied, told and followed by the session's parked panes.
+    fn fetched(&mut self, key: &SessionKey, generation: u64, parsed: anyhow::Result<Snapshot>, cx: &mut Context<Self>) {
+        let s = self;
+        let applied = s.watchers.answer(key, generation, parsed, Instant::now());
+        s.tell_elsewhere(key, &applied.alerts, cx);
+        // its parked panes follow it: all go when it stopped, those it no longer backs when it changed
+        let parked = match s.watchers.snapshot(key) {
+            _ if applied.stopped => s.views.drop_panes(key),
+            Some(snapshot) if applied.changed => s.views.prune_against(key, snapshot),
+            _ => Vec::new(),
+        };
+        s.retire_panes(parked, cx);
+        if applied.stopped {
+            s.refresh_places(cx);
+        }
+        if applied.changed {
+            cx.notify();
         }
     }
 
