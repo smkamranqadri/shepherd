@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+mod attention;
 mod client_shell;
 mod divider;
 mod floating;
@@ -243,6 +244,8 @@ pub struct Shell {
     command_panel: Option<crate::ui::Popup<(Entity<crate::ui::command_panel::Panel>, Subscription)>>,
     /// Agents that started waiting or finished out of sight and have not been looked at since: the Dock badge.
     unseen: std::collections::HashSet<String>,
+    /// What was told of each agent in every session, so a change is told once.
+    attention: attention::Attention,
     /// The count on the Dock icon now.
     badge: usize,
     /// The window's frame not saved yet, and the save it waits for: half a second after the last move, closing or quitting.
@@ -396,18 +399,27 @@ impl Shell {
                     }
                 })
                 .detach();
-                // A click on a notification brings its agent's tab up; Approve answers the agent and leaves Shepherd
-                // where it is.
+                // A click on a notification brings its agent's tab up, in its own session; Approve answers the agent
+                // and leaves Shepherd where it is. Pane ids repeat across sessions: the tag names the session too.
                 let (this, handle) = (cx.entity().downgrade(), window.window_handle());
                 cx.on_system_notification_response(move |response, cx| {
                     let approve = response.action_id.as_deref() == Some(crate::notify::APPROVE);
                     let _ = this.update(cx, |s, cx| {
-                        let pane = s.snapshot.as_ref().and_then(|snap| snap.panes.iter().find(|p| p.pane_id == crate::notify::tag_pane(&response.tag)));
-                        match pane.map(|p| (p.tab_id.clone(), p.pane_id.clone(), p.agent_status)) {
-                            // only while it still waits: a late press must not type Enter into an agent at work
-                            Some((_, pane_id, AgentStatus::Blocked)) if approve => s.send(Command::Approve { pane_id }, cx, |_, _, _| {}),
-                            Some((tab, pane, _)) if !approve => s.show_agent(tab, pane, cx),
-                            _ => {}
+                        let shown = s.shown_key();
+                        match attention::route(&response.tag, shown.as_ref(), |k| s.watchers.get(k).is_some()) {
+                            attention::Route::Shown(pane_id) => {
+                                let pane = s.snapshot.as_ref().and_then(|snap| snap.panes.iter().find(|p| p.pane_id == pane_id));
+                                match pane.map(|p| (p.tab_id.clone(), p.pane_id.clone(), p.agent_status)) {
+                                    // only while it still waits: a late press must not type Enter into an agent at work
+                                    Some((_, pane_id, AgentStatus::Blocked)) if approve => s.send(Command::Approve { pane_id }, cx, |_, _, _| {}),
+                                    Some((tab, pane, _)) if !approve => s.show_agent(tab, pane, cx),
+                                    _ => {}
+                                }
+                            }
+                            attention::Route::Other(key, pane_id) if approve => s.approve_elsewhere(key, pane_id, cx),
+                            attention::Route::Other(key, pane_id) => s.open_elsewhere(key, pane_id, cx),
+                            attention::Route::Gone if !approve => crate::ui::toast::error(cx, "That session is no longer there"),
+                            attention::Route::Gone => {}
                         }
                     });
                     if !approve {
@@ -585,6 +597,7 @@ impl Shell {
                     pane_spring_back: None,
                     command_panel: None,
                     unseen: Default::default(),
+                    attention: Default::default(),
                     badge: 0,
                     frame: None,
                     frame_save: gpui::Task::ready(()),
@@ -890,28 +903,21 @@ impl Shell {
         (window_active && self.settings.is_none() && self.shown_file_tab().is_none()).then(|| self.shown_tab()).flatten().map(|t| t.tab_id)
     }
 
-    /// Agents that just started waiting or finished out of sight: a notification each, and a place in the Dock count.
+    /// Agents of the session shown that just started waiting or finished out of sight: a notification each, and a
+    /// place in the Dock count.
     fn agents_changed(&mut self, next: &Snapshot, cx: &mut Context<Self>) {
         let in_view = self.tab_in_view(cx.active_window().is_some());
-        let settings = &SettingsGlobal::of(cx).settings;
-        let (notify, sound) = (settings.notify_agents, settings.notify_sound);
         let Some(old) = self.snapshot.as_ref() else { return };
-        for pane in crate::notify::arrivals(old, next) {
-            if in_view.as_deref() == Some(pane.tab_id.as_str()) {
-                continue;
+        let told: Vec<_> = attention::alerts(old, next)
+            .filter(|p| in_view.as_deref() != Some(p.tab_id.as_str()))
+            .map(|p| (p.clone(), attention::message(p, next, None)))
+            .collect();
+        let key = self.shown_key();
+        for (pane, message) in told {
+            if crate::notify::wants_attention(pane.agent_status) {
+                self.unseen.insert(pane.pane_id.clone());
             }
-            self.unseen.insert(pane.pane_id.clone());
-            if notify {
-                let agent = pane.agent.as_deref().unwrap_or("Agent");
-                let workspace = next.workspaces.iter().find(|w| w.workspace_id == pane.workspace_id).map(|w| w.label.as_str());
-                let title = workspace.map_or_else(|| agent.to_string(), |w| format!("{agent} · {w}"));
-                let status = if pane.agent_status == AgentStatus::Blocked { "Waiting for you" } else { "Done" };
-                let body = match pane.terminal_title_stripped.as_deref().filter(|t| !t.is_empty()) {
-                    Some(t) => format!("{status}: {t}"),
-                    None => status.to_string(),
-                };
-                crate::notify::show(cx, &pane.pane_id, title, body, sound, pane.agent_status == AgentStatus::Blocked);
-            }
+            self.tell(key.as_ref(), &pane, message, cx);
         }
     }
 

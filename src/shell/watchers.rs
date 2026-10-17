@@ -148,6 +148,9 @@ pub(super) struct Applied {
     pub changed: bool,
     /// The session turned out stopped: herdr's list is read again.
     pub stopped: bool,
+    /// The panes whose agents just started waiting or finished (`attention::alerts`): only from a session that was
+    /// live with a snapshot before, so its first answer, and one after it was unreachable or stopped, tell nothing.
+    pub alerts: Vec<String>,
 }
 
 /// Every place's watcher, in the tree's order.
@@ -255,16 +258,20 @@ impl Watchers {
                 let digest = digest(&snapshot);
                 snapshot.track(&mut w.since, now);
                 let changed = digest != w.digest || w.status != Status::Live || w.error.is_some() || w.snapshot.is_none();
+                let alerts = match (&w.snapshot, w.status) {
+                    (Some(old), Status::Live) => super::attention::alerts(old, &snapshot).map(|p| p.pane_id.clone()).collect(),
+                    _ => Vec::new(),
+                };
                 (w.digest, w.snapshot, w.status, w.error) = (digest, Some(snapshot), Status::Live, None);
                 (w.failures, w.fetched) = (0, Some(now));
                 w.next_due = now + interval(kind, activity, 0);
-                Applied { changed, stopped: false }
+                Applied { changed, stopped: false, alerts }
             }
             Err(e) if crate::herdr::no_server(&e) => {
                 let changed = w.status != Status::Stopped;
                 (w.status, w.snapshot, w.digest, w.error, w.failures) = (Status::Stopped, None, 0, None, 0);
                 w.next_due = now + Duration::from_secs(60);
-                Applied { changed, stopped: changed }
+                Applied { changed, stopped: changed, alerts: Vec::new() }
             }
             Err(e) => {
                 let before = (w.status, w.error.clone());
@@ -274,7 +281,7 @@ impl Watchers {
                 }
                 w.error = Some(format!("{e:#}"));
                 w.next_due = now + interval(kind, activity, w.failures);
-                Applied { changed: before != (w.status, w.error.clone()), stopped: false }
+                Applied { changed: before != (w.status, w.error.clone()), stopped: false, alerts: Vec::new() }
             }
         }
     }
@@ -506,6 +513,7 @@ impl Shell {
                 let parsed = cx.background_executor().spawn(async move { answer.and_then(|r| Snapshot::from_result(&r)) }).await;
                 let _ = this.update(cx, |s, cx| {
                     let applied = s.watchers.apply(&key, parsed, Instant::now());
+                    s.tell_elsewhere(&key, &applied.alerts, cx);
                     if applied.stopped {
                         s.refresh_places(cx);
                     }
@@ -615,7 +623,7 @@ mod tests {
         w.reconcile(&[session("menqal", true)], None, now);
         let k = key("menqal");
         w.due(now, Activity::Active);
-        assert_eq!(w.apply(&k, Ok(snapshot(&["w1"])), now), Applied { changed: true, stopped: false });
+        assert_eq!(w.apply(&k, Ok(snapshot(&["w1"])), now), Applied { changed: true, stopped: false, alerts: vec![] });
         assert_eq!(w.get(&k).unwrap().status, Status::Live);
         // the same snapshot again draws nothing new
         assert_eq!(w.apply(&k, Ok(snapshot(&["w1"])), now), Applied::default());
@@ -640,7 +648,7 @@ mod tests {
         w.reconcile(&[session("menqal", true)], None, now);
         let k = key("menqal");
         w.due(now, Activity::Active);
-        assert_eq!(w.apply(&k, Err(refused()), now), Applied { changed: true, stopped: true });
+        assert_eq!(w.apply(&k, Err(refused()), now), Applied { changed: true, stopped: true, alerts: vec![] });
         assert_eq!(w.get(&k).unwrap().status, Status::Stopped);
         assert_eq!(w.apply(&k, Err(refused()), now), Applied::default(), "told once");
         // herdr's list still says it runs: asked again a minute on, not every second
@@ -722,6 +730,49 @@ mod tests {
         assert_eq!(w.inactive_since, Some(now), "behind since the first time");
         w.set_active(true, later);
         assert_eq!(w.inactive_since, None);
+    }
+
+    fn agents(panes: &[(&str, &str)]) -> Snapshot {
+        let panes: Vec<_> = panes
+            .iter()
+            .map(|(id, status)| json!({"pane_id": id, "tab_id": "t1", "workspace_id": "w1", "terminal_id": id, "agent_status": status, "agent": "claude"}))
+            .collect();
+        Snapshot::from_result(&json!({"snapshot": {"focused_workspace_id": null, "focused_tab_id": null, "focused_pane_id": null, "workspaces": [], "tabs": [], "panes": panes, "layouts": []}})).unwrap()
+    }
+
+    #[test]
+    fn alerts_come_only_between_two_live_answers() {
+        let now = Instant::now();
+        let mut w = Watchers::new();
+        w.reconcile(&[session("menqal", true)], None, now);
+        let k = key("menqal");
+        assert!(w.apply(&k, Ok(agents(&[("p1", "blocked")])), now).alerts.is_empty(), "the first answer is a baseline");
+        assert!(w.apply(&k, Ok(agents(&[("p1", "working")])), now).alerts.is_empty());
+        assert_eq!(w.apply(&k, Ok(agents(&[("p1", "done")])), now).alerts, ["p1"]);
+        // one failure keeps it live; two make it unreachable, and the answer after that is a baseline again
+        w.apply(&k, Ok(agents(&[("p1", "working")])), now);
+        w.apply(&k, Err(anyhow::anyhow!("no answer in 2 s")), now);
+        assert_eq!(w.apply(&k, Ok(agents(&[("p1", "blocked")])), now).alerts, ["p1"], "still live after one failure");
+        w.apply(&k, Ok(agents(&[("p1", "working")])), now);
+        w.apply(&k, Err(anyhow::anyhow!("no answer in 2 s")), now);
+        w.apply(&k, Err(anyhow::anyhow!("no answer in 2 s")), now);
+        assert_eq!(w.get(&k).unwrap().status, Status::Unreachable);
+        assert!(w.apply(&k, Ok(agents(&[("p1", "blocked")])), now).alerts.is_empty(), "no burst after unreachable");
+        // stopped drops the snapshot: its first answer once started again tells nothing
+        w.apply(&k, Err(refused()), now);
+        assert!(w.apply(&k, Ok(agents(&[("p1", "done")])), now).alerts.is_empty(), "no burst after stopped");
+    }
+
+    #[test]
+    fn a_parked_session_alerts_against_the_snapshot_it_was_left_with() {
+        let now = Instant::now();
+        let mut w = Watchers::new();
+        w.reconcile(&[session("default", true), session("menqal", true)], Some(&key("default")), now);
+        w.park(&key("default"), Some(agents(&[("p1", "working"), ("p2", "working")])), Default::default(), now);
+        assert_eq!(w.apply(&key("default"), Ok(agents(&[("p1", "blocked"), ("p2", "working")])), now).alerts, ["p1"]);
+        // the shown session's answers are the sync loop's: nothing comes of them here
+        w.unpark(&key("default"));
+        assert!(w.apply(&key("default"), Ok(agents(&[("p1", "working"), ("p2", "done")])), now).alerts.is_empty());
     }
 
     #[test]

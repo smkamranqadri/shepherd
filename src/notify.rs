@@ -1,6 +1,6 @@
 //! Agents that need you: a system notification when one starts waiting or finishes out of sight, and on macOS a
 //! Dock badge counting those not looked at yet.
-use crate::model::{AgentStatus, Pane, Snapshot};
+use crate::model::AgentStatus;
 use gpui::{App, SystemNotification, SystemNotificationAction};
 #[cfg(target_os = "macos")]
 use objc2::{AllocAnyThread, MainThreadMarker, runtime::Bool};
@@ -16,33 +16,42 @@ pub fn wants_attention(status: AgentStatus) -> bool {
     matches!(status, AgentStatus::Blocked | AgentStatus::Done)
 }
 
-/// Panes of `new` whose agent just started waiting or finished. A pane `old` did not have is no arrival, so a
-/// reconnect or a new pane never sets off a burst.
-pub fn arrivals<'a>(old: &'a Snapshot, new: &'a Snapshot) -> impl Iterator<Item = &'a Pane> {
-    new.panes.iter().filter(|p| {
-        wants_attention(p.agent_status)
-            && old.panes.iter().any(|o| o.pane_id == p.pane_id && o.agent_status != p.agent_status)
-    })
-}
+/// Between the session's key and the pane in a notification's tag: a control character, so no socket path or
+/// `machine:<id>` holds it.
+const KEY_SEP: char = '\u{1f}';
 
 /// Between the pane and the post's time in a notification's tag.
 const TAG_SEP: char = '#';
 
-/// The pane a notification's tag names.
-pub fn tag_pane(tag: &str) -> &str {
-    tag.split(TAG_SEP).next().unwrap_or(tag)
+/// A notification's tag: the session's key (none for a post that names no session), the pane, and the post's time.
+/// The key is in it because pane ids repeat from one session to the next.
+pub fn tag(key: Option<&str>, pane_id: &str, millis: u128) -> String {
+    match key {
+        Some(key) => format!("{key}{KEY_SEP}{pane_id}{TAG_SEP}{millis}"),
+        None => format!("{pane_id}{TAG_SEP}{millis}"),
+    }
+}
+
+/// The session's key and the pane a notification's tag names. A tag from before keys were in it names none, which
+/// reads as the session shown.
+pub fn parse_tag(tag: &str) -> (Option<&str>, &str) {
+    let (key, rest) = match tag.rsplit_once(KEY_SEP) {
+        Some((key, rest)) => (Some(key), rest),
+        None => (None, tag),
+    };
+    (key, rest.split(TAG_SEP).next().unwrap_or(rest))
 }
 
 /// The id of a waiting agent's Approve button.
 pub const APPROVE: &str = "approve";
 
-/// Posts a notification tagged with the pane, so a click can bring that pane up; `approve` adds a button that
-/// answers the agent from the notification.
-pub fn show(cx: &App, pane_id: &str, title: String, body: String, sound: bool, approve: bool) {
+/// Posts a notification tagged with the session's key and the pane, so a click can bring that pane up; `approve`
+/// adds a button that answers the agent from the notification.
+pub fn show(cx: &App, key: Option<&str>, pane_id: &str, title: String, body: String, sound: bool, approve: bool) {
     if can_notify() {
         cx.show_system_notification(SystemNotification {
             // macOS replaces a delivered notification with the same tag without a banner: one tag per post
-            tag: format!("{pane_id}{TAG_SEP}{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()).into(),
+            tag: tag(key, pane_id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()).into(),
             title: title.into(),
             body: body.into(),
             actions: approve.then(|| SystemNotificationAction { id: APPROVE.into(), label: "Approve".into() }).into_iter().collect(),
@@ -202,19 +211,6 @@ pub fn set_app_icon() {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    fn snapshot(panes: &[(&str, &str)]) -> Snapshot {
-        let panes: Vec<_> = panes
-            .iter()
-            .map(|(id, status)| json!({"pane_id": id, "tab_id": "t1", "workspace_id": "w1", "terminal_id": id, "agent_status": status}))
-            .collect();
-        serde_json::from_value(json!({"workspaces": [], "tabs": [], "panes": panes, "layouts": []})).unwrap()
-    }
-
-    fn ids(old: &Snapshot, new: &Snapshot) -> Vec<String> {
-        arrivals(old, new).map(|p| p.pane_id.clone()).collect()
-    }
 
     #[test]
     #[cfg(target_os = "linux")]
@@ -240,27 +236,16 @@ mod tests {
     }
 
     #[test]
-    fn a_tag_names_its_pane() {
-        assert_eq!(tag_pane("w2:p1#1791794600123"), "w2:p1");
-        assert_eq!(tag_pane("w2:p1"), "w2:p1");
+    fn a_tag_names_its_session_and_pane() {
+        let key = "/tmp/herdr #2/api.sock";
+        assert_eq!(parse_tag(&tag(Some(key), "w2:p1", 1791794600123)), (Some(key), "w2:p1"));
+        assert_eq!(parse_tag(&tag(Some("machine:box"), "w1:p3", 5)), (Some("machine:box"), "w1:p3"));
+        assert_eq!(parse_tag(&tag(None, "w2:p1", 5)), (None, "w2:p1"));
     }
 
     #[test]
-    fn waiting_and_finishing_arrive_once() {
-        let old = snapshot(&[("p1", "working"), ("p2", "working"), ("p3", "idle")]);
-        let new = snapshot(&[("p1", "blocked"), ("p2", "done"), ("p3", "working")]);
-        assert_eq!(ids(&old, &new), ["p1", "p2"]);
-        assert!(ids(&new, &new).is_empty(), "a status that stays is no news");
+    fn a_tag_from_before_keys_names_no_session() {
+        assert_eq!(parse_tag("w2:p1#1791794600123"), (None, "w2:p1"));
+        assert_eq!(parse_tag("w2:p1"), (None, "w2:p1"));
     }
-
-    #[test]
-    fn answered_then_done_arrives_again() {
-        assert_eq!(ids(&snapshot(&[("p1", "blocked")]), &snapshot(&[("p1", "done")])), ["p1"]);
-    }
-
-    #[test]
-    fn panes_new_to_the_snapshot_do_not_arrive() {
-        assert!(ids(&snapshot(&[]), &snapshot(&[("p1", "done")])).is_empty());
-    }
-
 }

@@ -418,8 +418,6 @@ impl Shell {
 
     /// The Agents section's entries from every session: the shown one's live snapshot, the others' from their
     /// watchers; and whether any session has an agent at all.
-    // TODO(L2): notifications still come from the shown session alone; another session's agents that start
-    // waiting are listed here but notify nothing.
     pub(super) fn agents_everywhere(&self, attention: bool, cx: &App) -> (Vec<AgentEntry>, bool) {
         let shown = self.shown_key();
         let mut sessions: Vec<SessionAgents> = Vec::new();

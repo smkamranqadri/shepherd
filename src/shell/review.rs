@@ -86,7 +86,8 @@ impl Shell {
             }
         } else {
             let sound = SettingsGlobal::of(cx).settings.notify_sound;
-            crate::notify::show(cx, pane.unwrap_or_default(), title.into(), branch.into(), sound, false);
+            let key = self.shown_key();
+            crate::notify::show(cx, key.as_ref().map(|k| k.0.as_str()), pane.unwrap_or_default(), title.into(), branch.into(), sound, false);
         }
     }
 

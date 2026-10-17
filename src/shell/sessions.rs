@@ -299,6 +299,8 @@ impl Shell {
                     s.watchers.disabled = disabled;
                     let shown = s.shown_key();
                     s.watchers.reconcile(&s.places, shown.as_ref(), Instant::now());
+                    let listed: Vec<watchers::SessionKey> = s.places.iter().map(watchers::SessionKey::of).collect();
+                    s.attention.keep_sessions(|k| listed.contains(k) || shown.as_ref() == Some(k));
                     if changed {
                         cx.notify();
                     }
