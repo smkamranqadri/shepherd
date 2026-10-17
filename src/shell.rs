@@ -190,6 +190,8 @@ pub struct Shell {
     agent_sort: AgentSort,
     /// Saved in the settings when a drag ends.
     agents_height: Option<f32>,
+    /// The Agents section folded to its header; saved in the settings on every toggle.
+    agents_collapsed: bool,
     /// The Agents section's top edge is being dragged: the pointer's y and the list's height at the press.
     agents_drag: Option<(f32, f32)>,
     /// The sidebar's `…` menu, open where it was clicked.
@@ -556,6 +558,7 @@ impl Shell {
                     review_body_h: Default::default(),
                     agent_sort: SettingsGlobal::of(cx).settings.agent_sort,
                     agents_height: SettingsGlobal::of(cx).settings.agents_height,
+                    agents_collapsed: SettingsGlobal::of(cx).settings.agents_collapsed,
                     agents_drag: None,
                     view_menu: None,
                     focus_next: None,

@@ -75,6 +75,8 @@ pub struct Settings {
     pub attention_agents: bool,
     /// The Agents list's height cap; dragging the section's top edge sets it, `None` is 40 % of the sidebar.
     pub agents_height: Option<f32>,
+    /// The Agents section folded to its header at the sidebar's foot; a click on the header opens it again.
+    pub agents_collapsed: bool,
     /// What the command panel ran last, newest first: an action's name, `workspace:<id>` or `tab:<id>`.
     pub recent_commands: Vec<String>,
     /// A macOS notification when an agent out of sight starts waiting or finishes.
@@ -315,6 +317,7 @@ impl Default for Settings {
             status_icons: crate::theme::StatusIcons::Dots,
             attention_agents: false,
             agents_height: None,
+            agents_collapsed: false,
             recent_commands: Vec::new(),
             notify_agents: true,
             notify_sound: true,
@@ -491,6 +494,16 @@ mod tests {
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert!(s.window_buttons);
         assert!(!serde_json::from_str::<Settings>(r#"{"window_buttons": false}"#).unwrap().window_buttons);
+    }
+
+    #[test]
+    fn the_agents_section_starts_open_and_an_older_file_without_the_fold_loads() {
+        let old: Settings = serde_json::from_str(r#"{"agents_height": 180}"#).unwrap();
+        assert!(!old.agents_collapsed);
+        assert_eq!(old.agents_height, Some(180.));
+        let folded: Settings = serde_json::from_str(r#"{"agents_collapsed": true, "agents_height": 180}"#).unwrap();
+        assert!(folded.agents_collapsed);
+        assert_eq!(folded.agents_height, Some(180.), "the height it opens again at is kept");
     }
 
     fn tmp() -> (tempfile::TempDir, std::path::PathBuf) {

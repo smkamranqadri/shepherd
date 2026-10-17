@@ -165,6 +165,15 @@ impl Shell {
         }
     }
 
+    /// Folds the Agents section to its header, or opens it again at the height it had.
+    pub(super) fn toggle_agents_collapsed(&mut self, cx: &mut Context<Self>) {
+        self.agents_collapsed = !self.agents_collapsed;
+        self.agents_drag = None;
+        let collapsed = self.agents_collapsed;
+        save_from_sidebar(cx, |s| s.agents_collapsed = collapsed);
+        cx.notify();
+    }
+
     /// Brings the agent's tab up and its pane to the keyboard.
     pub(super) fn show_agent(&mut self, tab_id: String, pane_id: String, cx: &mut Context<Self>) {
         self.show_herdr_tab(Some(tab_id), true, cx);
@@ -508,9 +517,15 @@ impl Shell {
             .when(SettingsGlobal::of(cx).settings.show_agents && any_agents, |el| {
                 let seam = theme.accent;
                 let dragging = self.agents_drag.is_some();
+                let collapsed = self.agents_collapsed;
+                // A click on the header folds the section to it, at the sidebar's foot (the tree above takes the
+                // room), and opens it again at the height it had.
                 el.child(
                     div()
+                        .id("agents-header")
                         .relative()
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_agents_collapsed(cx)))
                         .px(px(16.))
                         .pt(px(12.))
                         // the list's top fade starts just under the label
@@ -524,7 +539,15 @@ impl Shell {
                         .flex()
                         .items_center()
                         .justify_between()
-                        .child("Agents")
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .ml(px(-4.))
+                                .child(fold_chevron(theme, "agents", !collapsed, 1., None))
+                                .child("Agents"),
+                        )
                         .child(
                             icon_button(theme, "agents-view", "")
                                 .tooltip(tip("Sort agents", None))
@@ -542,8 +565,9 @@ impl Shell {
                                     cx.notify();
                                 })),
                         )
-                        // The section's top edge: drag to resize the list, double-click for the default height.
-                        .child(
+                        // The section's top edge: drag to resize the list, double-click for the default height. Folded,
+                        // there is no list to size, so the edge is only its resting line.
+                        .when(!collapsed, |el| el.child(
                             div()
                                 .id("agents-resize")
                                 .on_hover(cx.listener(|this, on: &bool, _, cx| this.hover_seam("agents-resize", *on, cx)))
@@ -570,9 +594,9 @@ impl Shell {
                                         cx.notify();
                                     }
                                 })),
-                        ),
+                        )),
                 )
-                .child(
+                .when(!collapsed, |el| el.child(
                     div()
                         .relative()
                         .flex_none()
@@ -605,7 +629,7 @@ impl Shell {
                             .child(div().flex_none().h(px(4.)))),
                     )
                     .child(crate::ui::scrollbar("agents-scrollbar", &self.agents_scroll, theme)),
-                )
+                ))
             }),
             ))
             .children(strip)
