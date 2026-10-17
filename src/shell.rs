@@ -708,6 +708,12 @@ impl Shell {
         cx.set_global(PaneQueries(client.clone(), rt.clone()));
         self.sync = cx.spawn(async move |this, cx| sync_loop(this, rt, client, cx).await);
         self.floating = None;
+        // the last session's popup watch stops with its loop, which never gets to clear its surface: done here,
+        // before keys could go through it to the same pane id in the last session
+        self.popup_surface = None;
+        if cx.has_global::<crate::terminal::pane::TypingShell>() {
+            cx.remove_global::<crate::terminal::pane::TypingShell>();
+        }
         self.popup_watch = if crate::herdr::client_shell::enabled() {
             cx.spawn(async move |this, cx| client_shell::shell_loop(this, cx).await)
         } else {

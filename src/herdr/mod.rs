@@ -12,7 +12,7 @@ mod wire;
 pub use wire::Rgb;
 pub use client::{Client, EVENT_TYPES};
 pub use config::{HerdrConfig, config_path};
-pub use session::{Mode, Session, SessionEvent, SessionInfo, current_session, delete_session, new_session, no_server, sessions, valid_session_name, set_binary, set_socket, start_server, start_session_server, api_socket};
+pub use session::{Mode, Session, SessionEvent, SessionInfo, Sockets, client_socket, current_session, delete_session, new_session, no_server, sessions, valid_session_name, set_binary, set_socket, start_server, start_session_server, api_socket};
 pub use wire::PaneInput;
 pub use remote::{Machine, add_machine, git, locate, locate_on, machines, quote, relay, remove_machine, rename_machine, show_machine, split, ssh};
 

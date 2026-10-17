@@ -73,12 +73,30 @@ pub struct ShellConnection(pub std::sync::Arc<crate::herdr::client_shell::Client
 
 impl gpui::Global for ShellConnection {}
 
-/// The window's popup watch, which also carries typing to the panes it shows (see [`Surface::type_into`]).
+/// The window's popup watch, which also carries typing to the panes it shows (see [`Surface::type_into`]), and the
+/// client socket it was made on: pane ids repeat across sessions, so it types only into the session it watches.
 ///
 /// [`Surface::type_into`]: crate::herdr::popup::Surface::type_into
-pub struct TypingShell(pub std::sync::Arc<crate::herdr::popup::Surface>);
+pub struct TypingShell(pub std::sync::Arc<crate::herdr::popup::Surface>, pub PathBuf);
 
 impl gpui::Global for TypingShell {}
+
+impl TypingShell {
+    /// Whether it watches the session on `client` (the window's client socket now).
+    pub fn serves(&self, client: &Path) -> bool {
+        watches(&self.1, client)
+    }
+}
+
+/// A typing shell made on the client socket `made_on` types into the session on `client` only when they are one.
+fn watches(made_on: &Path, client: &Path) -> bool {
+    made_on == client
+}
+
+/// The window's typing shell, while it watches the session the window shows.
+fn typing_shell(cx: &App) -> Option<&crate::herdr::popup::Surface> {
+    cx.try_global::<TypingShell>().filter(|t| t.serves(&crate::herdr::client_socket())).map(|t| &*t.0)
+}
 
 /// herdr's socket for per-pane queries (scroll position); absent in tests.
 pub struct PaneQueries(pub Client, pub tokio::runtime::Handle);
@@ -250,6 +268,8 @@ pub struct PaneTerminal {
     images: Vec<PaneImage>,
     /// Its session was left for another (`park`): no stream, the grid kept as it was, attached again when shown.
     parked: bool,
+    /// Resumed with a grid measured before: the next measure attaches, as a new pane's first one does.
+    attach_on_measure: bool,
     /// Attaches begun, for the tests.
     #[cfg(test)]
     attaches: usize,
@@ -308,6 +328,7 @@ impl PaneTerminal {
             takes_over: false,
             images: Vec::new(),
             parked: false,
+            attach_on_measure: false,
             #[cfg(test)]
             attaches: 0,
         }
@@ -349,6 +370,7 @@ impl PaneTerminal {
     /// held for this pane must never land in it later, nor follow the keyboard elsewhere.
     pub fn park(&mut self, cx: &mut Context<Self>) {
         self.parked = true;
+        self.attach_on_measure = false;
         self.session = None;
         self._pump = None;
         self.held.clear();
@@ -373,9 +395,10 @@ impl PaneTerminal {
         if !std::mem::take(&mut self.parked) {
             return;
         }
-        if self.geometry.is_some() && self.ended.is_none() {
-            self.attach(false, cx);
-        }
+        // the next measure attaches, at the size the pane is drawn at now (not the one it was left at, which would
+        // resize the PTY twice); a pane not drawn (under a file tab) stays unattached until it is
+        self.attach_on_measure = self.geometry.is_some();
+        self.attaching = std::time::Instant::now();
         cx.notify();
     }
 
@@ -407,6 +430,8 @@ impl PaneTerminal {
         let (cols, rows) = (self.emulator.cols() as u16, self.emulator.rows() as u16);
         let px = self.geometry.map_or((0, 0), |g| g.cell_px);
         let pane_id = self.pane_id.clone();
+        // read here, on the main thread: by the time the background attach runs the window may show another session
+        let sockets = crate::herdr::Sockets::now();
         let mode = match (takeover || self.takes_over, yielded(cx)) {
             (true, _) => Mode::Takeover,
             (false, true) => Mode::Observe,
@@ -414,7 +439,7 @@ impl PaneTerminal {
         };
         self.observing = mode == Mode::Observe;
         self.attaching = std::time::Instant::now();
-        let spawn = cx.background_executor().spawn(async move { Session::spawn(&pane_id, cols, rows, px, mode) });
+        let spawn = cx.background_executor().spawn(async move { Session::spawn(&pane_id, cols, rows, px, mode, &sockets) });
         self._pump = Some(cx.spawn(async move |this, cx| {
             let result = spawn.await;
             let rx = this.update(cx, |pane, cx| {
@@ -484,7 +509,8 @@ impl PaneTerminal {
             self.emulator.resize(cols, rows);
             self.resized_at = Some(std::time::Instant::now());
         }
-        if first && self.session.is_none() && self.ended.is_none() && !self.parked {
+        let due = first || std::mem::take(&mut self.attach_on_measure);
+        if due && self.session.is_none() && self.ended.is_none() && !self.parked {
             self.attach(false, cx);
         } else if let (Some(session), true) = (&self.session, resized || rescaled) {
             session.resize(cols, rows, geometry.cell_px);
@@ -1011,7 +1037,7 @@ impl PaneTerminal {
     /// the app's keyboard protocol; false: the pane is not one to type into that way (see [`Self::input`]).
     fn type_key(&mut self, event: PaneInput, cx: &mut Context<Self>) -> bool {
         let controlled = self.session.is_some() && !self.observing;
-        if !controlled || !cx.try_global::<TypingShell>().is_some_and(|t| t.0.pane_input(&self.pane_id, vec![event])) {
+        if !controlled || !typing_shell(cx).is_some_and(|t| t.pane_input(&self.pane_id, vec![event])) {
             return false;
         }
         self.typed(cx);
@@ -1033,7 +1059,7 @@ impl PaneTerminal {
         self.typed(cx);
         match &self.session {
             Some(session) if !self.observing => {
-                if !cx.try_global::<TypingShell>().is_some_and(|t| t.0.type_into(&self.pane_id, bytes)) {
+                if !typing_shell(cx).is_some_and(|t| t.type_into(&self.pane_id, bytes)) {
                     session.input(bytes)
                 }
             }
@@ -1046,6 +1072,11 @@ impl PaneTerminal {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // its session is not shown: until the window takes the keyboard back, no key (a find reading herdr's history
+        // through the window's socket, a paste) may act on it
+        if self.parked {
+            return;
+        }
         if !self.focus.is_focused(window) {
             return; // typing in the search bar
         }
@@ -1859,7 +1890,7 @@ mod tests {
         pane.update(cx, |p, cx| p.on_grid_metrics(geometry(120, 40), cx));
         cx.run_until_parked();
         pane.read_with(cx, |p, _| assert_eq!(p.attaches, 1));
-        // measured: parked, a measure attaches nothing; shown again, it attaches at once, one time
+        // measured: parked, a measure attaches nothing; shown again, the next measure attaches, at its size, once
         pane.update(cx, |p, cx| {
             p.ended = None;
             p.park(cx);
@@ -1871,10 +1902,49 @@ mod tests {
             p.resume(cx);
         });
         cx.run_until_parked();
+        pane.read_with(cx, |p, _| assert_eq!(p.attaches, 1, "attached before it was drawn (under a file tab, say)"));
+        pane.update(cx, |p, cx| p.on_grid_metrics(geometry(110, 40), cx));
+        cx.run_until_parked();
         pane.read_with(cx, |p, _| {
             assert_eq!(p.attaches, 2);
-            assert_eq!((p.emulator.cols(), p.emulator.rows()), (100, 40), "the grid kept its size while parked");
+            assert_eq!((p.emulator.cols(), p.emulator.rows()), (110, 40), "attached at the size drawn now");
         });
+        pane.update(cx, |p, cx| p.on_grid_metrics(geometry(110, 40), cx));
+        pane.read_with(cx, |p, _| assert_eq!(p.attaches, 2, "one attach"));
+    }
+
+    #[gpui::test]
+    fn a_parked_pane_takes_no_keys_before_the_window_takes_them_back(cx: &mut gpui::TestAppContext) {
+        unsafe {
+            std::env::set_var("SHEPHERD_HERDR", "/nonexistent/herdr");
+            std::env::set_var("HERDR_CLIENT_SOCKET_PATH", "/nonexistent/herdr-client.sock");
+        }
+        cx.update(|cx| cx.set_global(crate::settings::Settings::default().theme(gpui::WindowAppearance::Dark)));
+        let (pane, cx) = cx.add_window_view(|_, cx| PaneTerminal::new("w1:p1".into(), cx));
+        cx.update(|window, cx| {
+            let focus = pane.read(cx).focus.clone();
+            window.focus(&focus, cx);
+        });
+        cx.run_until_parked();
+        // its attach failed (no herdr here), which draws the error in its place: drawn as attaching instead, it
+        // listens for keys
+        pane.update(cx, |p, cx| {
+            p.ended = None;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        pane.update(cx, |p, cx| p.park(cx));
+        // the find (which would read herdr's history through the other session's socket) and typing
+        let find = if cfg!(target_os = "macos") { "cmd-f" } else { "ctrl-shift-f" };
+        cx.simulate_keystrokes(&format!("{find} x"));
+        pane.read_with(cx, |p, _| assert!(p.search.is_none() && p.held.is_empty(), "a parked pane took keys: {:?}", p.held));
+    }
+
+    #[test]
+    fn the_typing_shell_of_the_last_session_types_into_no_other() {
+        let a = Path::new("/tmp/h/sessions/a/herdr-client.sock");
+        assert!(watches(a, a));
+        assert!(!watches(a, Path::new("/tmp/h/sessions/b/herdr-client.sock")), "same pane ids, another session");
     }
 
     #[test]

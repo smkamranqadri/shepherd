@@ -29,9 +29,24 @@ pub fn set_socket(path: Option<String>) {
     *SOCKET.write().unwrap() = path.filter(|p| !p.trim().is_empty());
 }
 
+/// Where a session connects, read on the main thread when it starts: the window's socket may name another session
+/// by the time a background attach runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sockets {
+    pub client: PathBuf,
+    /// The API socket set in the settings, for the CLI fallback's `HERDR_SOCKET_PATH`.
+    pub api: Option<String>,
+}
+
+impl Sockets {
+    pub fn now() -> Sockets {
+        Sockets { client: client_socket(), api: SOCKET.read().unwrap().clone() }
+    }
+}
+
 /// herdr's client socket, resolved as herdr does: `HERDR_CLIENT_SOCKET_PATH`, else `<api socket stem>-client.sock`
 /// next to the API socket.
-pub(super) fn client_socket() -> PathBuf {
+pub fn client_socket() -> PathBuf {
     if let Some(path) = std::env::var_os("HERDR_CLIENT_SOCKET_PATH") {
         return path.into();
     }
@@ -226,10 +241,11 @@ enum Transport {
 
 impl Session {
     /// `cell_px` is a cell in device pixels ((0, 0) while unknown): herdr gives the pane's app the pixel size from it.
-    pub fn spawn(pane: &str, cols: u16, rows: u16, cell_px: (u32, u32), mode: Mode) -> anyhow::Result<(Session, UnboundedReceiver<SessionEvent>)> {
-        match Self::spawn_socket(pane, cols, rows, cell_px, mode) {
+    /// `sockets` as read when the attach began ([`Sockets::now`]).
+    pub fn spawn(pane: &str, cols: u16, rows: u16, cell_px: (u32, u32), mode: Mode, sockets: &Sockets) -> anyhow::Result<(Session, UnboundedReceiver<SessionEvent>)> {
+        match Self::spawn_socket(pane, cols, rows, cell_px, mode, &sockets.client) {
             Some(session) => Ok(session),
-            None => Self::spawn_cli(pane, cols, rows, mode),
+            None => Self::spawn_cli(pane, cols, rows, mode, sockets.api.clone()),
         }
     }
 
@@ -251,8 +267,8 @@ impl Session {
     }
 
     /// `None` when the socket is not there or speaks another protocol version.
-    fn spawn_socket(pane: &str, cols: u16, rows: u16, cell_px: (u32, u32), mode: Mode) -> Option<(Session, UnboundedReceiver<SessionEvent>)> {
-        let mut stream = socket::connect(&client_socket()).ok()?;
+    fn spawn_socket(pane: &str, cols: u16, rows: u16, cell_px: (u32, u32), mode: Mode, client: &Path) -> Option<(Session, UnboundedReceiver<SessionEvent>)> {
+        let mut stream = socket::connect(client).ok()?;
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
         let hello = ClientMessage::TerminalHello {
             version: wire::PROTOCOL_VERSION,
@@ -279,10 +295,10 @@ impl Session {
         Some((Session { transport: Transport::Socket(Mutex::new(stream)) }, rx))
     }
 
-    fn spawn_cli(pane: &str, cols: u16, rows: u16, mode: Mode) -> anyhow::Result<(Session, UnboundedReceiver<SessionEvent>)> {
+    fn spawn_cli(pane: &str, cols: u16, rows: u16, mode: Mode, api: Option<String>) -> anyhow::Result<(Session, UnboundedReceiver<SessionEvent>)> {
         let herdr = binary();
         let mut child = crate::process::command(&herdr)
-            .envs(SOCKET.read().unwrap().clone().map(|p| ("HERDR_SOCKET_PATH", p)))
+            .envs(api.map(|p| ("HERDR_SOCKET_PATH", p)))
             .args(["terminal", "session", if mode == Mode::Observe { "observe" } else { "control" }, pane])
             .args(["--cols", &cols.to_string(), "--rows", &rows.to_string()])
             .args((mode == Mode::Takeover).then_some("--takeover"))

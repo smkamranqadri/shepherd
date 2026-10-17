@@ -529,7 +529,7 @@ mod probe {
         for spec in env("HOLD", "").split(',').filter(|s| !s.is_empty()) {
             let (pane, size) = spec.split_once('=').unwrap();
             let (c, r) = size.split_once('x').unwrap();
-            let (session, rx) = crate::herdr::Session::spawn(pane, c.parse().unwrap(), r.parse().unwrap(), (0, 0), crate::herdr::Mode::Control).unwrap();
+            let (session, rx) = crate::herdr::Session::spawn(pane, c.parse().unwrap(), r.parse().unwrap(), (0, 0), crate::herdr::Mode::Control, &crate::herdr::Sockets::now()).unwrap();
             held.push((session, rx));
             println!("holding {pane} at {size}");
         }
@@ -608,7 +608,7 @@ mod input_paths {
         let mut reader = stream.try_clone().unwrap();
         std::thread::spawn(move || while wire::read_message(&mut reader).is_ok() {});
         let shell = Mutex::new(stream);
-        let (session, mut frames) = Session::spawn(&pane, 80, 24, (0, 0), Mode::Control).unwrap();
+        let (session, mut frames) = Session::spawn(&pane, 80, 24, (0, 0), Mode::Control, &crate::herdr::Sockets::now()).unwrap();
         let mut emu = crate::terminal::emulator::Emulator::new(80, 24);
         // `RUN`: a command typed into the pane first, e.g. a program that echoes each key after a delay
         if let Ok(run) = std::env::var("RUN") {
@@ -617,7 +617,7 @@ mod input_paths {
             drain(&mut frames, &mut emu);
         }
         // what Shepherd types through: the popup watch, once its surface names the pane
-        let (_events, watch) = super::super::popup::watch(80, 24, (0, 0)).unwrap();
+        let (_events, watch) = super::super::popup::watch(&client_socket(), 80, 24, (0, 0)).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         println!("pane {pane}");
         for _ in 0..2 {

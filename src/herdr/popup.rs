@@ -4,7 +4,6 @@
 //!
 //! The same surfaces carry herdr's Kitty graphics, which attaches never get: the images on the panes of the shell's
 //! tab ([`super::graphics`]), sent once herdr knows the cell size in pixels.
-use super::session::client_socket;
 use super::wire::{self, ClientMessage, HostThemeUpdate, PaneInput, ServerMessage, SurfaceSize};
 pub use super::wire::{PopupSize, PopupSurface};
 use futures::channel::mpsc::{UnboundedReceiver, unbounded};
@@ -72,8 +71,9 @@ impl Surface {
 
 /// The client shell's [`Event`]s, and its [`Surface`] (`cols`×`rows` of `cell_px` at first, (0, 0) while unknown);
 /// the stream ends when herdr hangs up or refuses.
-pub fn watch(cols: u16, rows: u16, cell_px: (u32, u32)) -> anyhow::Result<(UnboundedReceiver<Event>, Surface)> {
-    let mut stream = socket::connect(&client_socket())?;
+/// `client`: the client socket, read on the main thread when the watch began.
+pub fn watch(client: &std::path::Path, cols: u16, rows: u16, cell_px: (u32, u32)) -> anyhow::Result<(UnboundedReceiver<Event>, Surface)> {
+    let mut stream = socket::connect(client)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let hello = serde_json::json!({
         "generation": 1,
@@ -172,6 +172,7 @@ pub fn size(width: Option<PopupSize>, height: Option<PopupSize>, cols: u16, rows
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::session::client_socket;
 
     #[test]
     fn sizes_like_herdr() {
@@ -191,7 +192,7 @@ mod tests {
     #[test]
     #[ignore]
     fn live() {
-        let (rx, _surface) = watch(120, 40, (0, 0)).unwrap();
+        let (rx, _surface) = watch(&client_socket(), 120, 40, (0, 0)).unwrap();
         for popup in futures::executor::block_on_stream(rx).take(4) {
             println!("{popup:?}");
         }
@@ -204,8 +205,8 @@ mod tests {
     #[ignore]
     fn live_images() {
         let pane = std::env::var("PANE").unwrap();
-        let _held = super::super::Session::spawn(&pane, 100, 30, (16, 34), super::super::Mode::Control).unwrap();
-        let (rx, _surface) = watch(120, 40, (16, 34)).unwrap();
+        let _held = super::super::Session::spawn(&pane, 100, 30, (16, 34), super::super::Mode::Control, &super::super::Sockets::now()).unwrap();
+        let (rx, _surface) = watch(&client_socket(), 120, 40, (16, 34)).unwrap();
         for event in futures::executor::block_on_stream(rx) {
             if let Event::Images(images) = event {
                 println!("{images:?}");

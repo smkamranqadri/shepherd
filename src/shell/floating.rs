@@ -16,13 +16,16 @@ pub(super) async fn popup_loop(this: gpui::WeakEntity<Shell>, cx: &mut gpui::Asy
     loop {
         // the shell's surface sizes herdr's focused tab while no other client does: make it the pane grid
         let Ok(((cols, rows), px)) = this.update(cx, |s, cx| (s.grid_cells(cx).unwrap_or((120, 40)), s.cell_px(cx))) else { return };
-        let watch = cx.background_executor().spawn(async move { popup::watch(cols, rows, px) });
+        // the socket now, on the main thread: the window may move to another session while the watch connects
+        let client = crate::herdr::client_socket();
+        let socket = client.clone();
+        let watch = cx.background_executor().spawn(async move { popup::watch(&socket, cols, rows, px) });
         if let Ok((mut rx, surface)) = watch.await {
             // at once: a shell in front without a theme blanks herdr's (as in `client_shell::shell_loop`)
             let started = this.update(cx, |s, cx| {
                 surface.theme(client_shell::host_theme(Theme::of(cx)));
                 let surface = std::sync::Arc::new(surface);
-                cx.set_global(crate::terminal::pane::TypingShell(surface.clone()));
+                cx.set_global(crate::terminal::pane::TypingShell(surface.clone(), client));
                 s.popup_surface = Some((surface, ((cols, rows), px)));
             });
             if started.is_err() {
