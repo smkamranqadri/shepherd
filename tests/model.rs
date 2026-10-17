@@ -334,3 +334,12 @@ fn worktrees_group_under_their_repo() {
         .collect();
     assert_eq!(groups, [("mochi", vec!["mochi-a", "mochi-b"]), ("plain", vec![])]);
 }
+
+#[test]
+fn workspaces_keep_herdrs_list_order_not_their_numbers() {
+    let mut s = fixture();
+    // a drag's order shown before herdr answers: the list reordered, the numbers as they were
+    s.workspaces = vec![ws("plain", 2, None), ws("mochi-a", 4, Some(("m", true))), ws("mochi", 1, Some(("m", false))), ws("mochi-b", 3, Some(("m", true)))];
+    let tree: Vec<_> = s.workspace_tree().into_iter().map(|(w, _)| w.workspace_id.as_str()).collect();
+    assert_eq!(tree, ["plain", "mochi", "mochi-a", "mochi-b"]);
+}

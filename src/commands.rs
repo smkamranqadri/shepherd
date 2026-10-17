@@ -40,6 +40,9 @@ pub enum Command {
     /// Opens a worktree of the workspace's repo at `path` as its own workspace.
     OpenWorktree { workspace_id: String, path: String },
     RenameWorkspace { workspace_id: String, label: String },
+    /// Moves workspaces, in this order, before `before` (to the end with `None`); herdr takes ids that aren't next to
+    /// each other, gathers them, and renumbers every workspace to its new place. It refuses a `before` among them.
+    MoveWorkspaces { workspace_ids: Vec<String>, before: Option<String> },
     Split { pane_id: String, down: bool },
     ClosePane { pane_id: String },
     FocusPane { pane_id: String, direction: Direction },
@@ -100,6 +103,9 @@ impl Command {
             }
             Command::RenameWorkspace { workspace_id, label } => {
                 ("workspace.rename", json!({"workspace_id": workspace_id, "label": label}))
+            }
+            Command::MoveWorkspaces { workspace_ids, before } => {
+                ("workspace.move_block", json!({"workspace_ids": workspace_ids, "before_workspace_id": before}))
             }
             Command::Split { pane_id, down } => (
                 "pane.split",
@@ -238,6 +244,14 @@ mod tests {
             ("worktree.create", json!({"workspace_id": "w1", "branch": "fix/login", "focus": false}))
         );
         assert_eq!(req(Command::ListWorktrees { workspace_id: "w1".into() }), ("worktree.list", json!({"workspace_id": "w1"})));
+        assert_eq!(
+            req(Command::MoveWorkspaces { workspace_ids: vec!["w3".into(), "w5".into()], before: Some("w1".into()) }),
+            ("workspace.move_block", json!({"workspace_ids": ["w3", "w5"], "before_workspace_id": "w1"}))
+        );
+        assert_eq!(
+            req(Command::MoveWorkspaces { workspace_ids: vec!["w2".into()], before: None }),
+            ("workspace.move_block", json!({"workspace_ids": ["w2"], "before_workspace_id": null}))
+        );
         assert_eq!(
             req(Command::OpenWorktree { workspace_id: "w1".into(), path: "/wt/fix".into() }),
             ("worktree.open", json!({"workspace_id": "w1", "path": "/wt/fix", "focus": false}))

@@ -221,8 +221,9 @@ impl Snapshot {
     /// Workspaces in sidebar order: linked worktrees right under their repo's checkout workspace, with
     /// `Some(is_last_child)`; roots (and worktrees whose checkout has no workspace) get `None`.
     pub fn workspace_tree(&self) -> Vec<(&Workspace, Option<bool>)> {
-        let mut all: Vec<_> = self.workspaces.iter().collect();
-        all.sort_by_key(|w| w.number);
+        // herdr's list order: `workspace.move` and `move_block` reorder the list and renumber every workspace to
+        // its place, and Shepherd shows a drag's order before herdr's answer by reordering the list alone
+        let all: Vec<_> = self.workspaces.iter().collect();
         let repo = |w: &Workspace| w.worktree.as_ref().map(|t| (t.repo_key.clone(), t.is_linked_worktree));
         let is_checkout = |key: &str| all.iter().any(|w| repo(w) == Some((key.to_string(), false)));
         let mut tree = Vec::new();
