@@ -30,9 +30,11 @@ pub(super) struct Alert {
 /// when its `completion_seq` grew: herdr reports a finish as idle, not done, when a client shows the tab, while an
 /// Esc or a blip at the start turns an agent idle with no finish, and done → idle is it being seen. A pane `old` did
 /// not have is no alert, so a reconnect or a new pane never sets off a burst; a pane with no agent never alerts.
+/// Nor does a pane whose id now names another terminal: herdr gave a closed pane's id to a new one, whose status
+/// and counters are its own, not news of the old agent.
 pub(super) fn alerts<'a>(old: &'a Snapshot, new: &'a Snapshot) -> impl Iterator<Item = (&'a Pane, bool)> {
     new.panes.iter().filter(|p| p.agent.is_some()).filter_map(|p| {
-        let o = old.panes.iter().find(|o| o.pane_id == p.pane_id)?;
+        let o = old.panes.iter().find(|o| o.pane_id == p.pane_id && o.terminal_id == p.terminal_id)?;
         let finished = p.completion_seq > o.completion_seq;
         let again = o.agent_status == p.agent_status && p.state_change_seq > o.state_change_seq;
         let alert = match p.agent_status {
@@ -321,6 +323,14 @@ mod tests {
         assert!(ids(&snapshot(&[]), &snapshot(&[("p1", "done", 1, Some(1)), ("p2", "idle", 1, Some(1))])).is_empty());
         let old = snapshot(&[("sh1", "working", 1, None), ("sh2", "working", 1, Some(1))]);
         assert!(ids(&old, &snapshot(&[("sh1", "done", 2, Some(2)), ("sh2", "idle", 2, Some(2))])).is_empty());
+    }
+
+    #[test]
+    fn a_pane_id_given_to_another_terminal_does_not_alert() {
+        let old = snapshot(&[("p1", "working", 1, None), ("p2", "working", 1, None)]);
+        let mut new = snapshot(&[("p1", "done", 2, Some(2)), ("p2", "blocked", 2, None)]);
+        new.panes[0].terminal_id = "term-new".into();
+        assert_eq!(ids(&old, &new), ["p2"], "p1 is another agent now");
     }
 
     #[test]
