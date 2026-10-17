@@ -329,6 +329,41 @@ impl Shell {
         .detach();
     }
 
+    /// Reads herdr's list again when a session starts or stops (`session_watch`): a burst of events waits a moment
+    /// (`DEBOUNCE`) and is one read, then one more read follows `SETTLE` later, since a server makes its socket
+    /// before it listens on it and the first read may still find it not running. The watch lives with this task, as
+    /// long as the window; without one the 15 s read is all there is, as before.
+    pub(super) fn start_session_watch(&mut self, cx: &mut Context<Self>) {
+        use crate::herdr::session_watch::{SessionWatch, gather};
+        use futures::StreamExt;
+        /// Events this close are one read.
+        const DEBOUNCE: Duration = Duration::from_millis(250);
+        /// The second read after a burst: a socket just made is listened on by then.
+        const SETTLE: Duration = Duration::from_millis(1500);
+        let Some((mut watch, mut seen)) = SessionWatch::start() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            while let Some(first) = seen.next().await {
+                let mut burst = vec![first];
+                for pause in [DEBOUNCE, SETTLE] {
+                    cx.background_executor().timer(pause).await;
+                    while let Ok(more) = seen.try_recv() {
+                        burst.push(more);
+                    }
+                    // only a change or a new folder is ever sent, so both reads happen; a new folder is watched first
+                    for dir in gather(burst.drain(..)).1 {
+                        watch.add(&dir);
+                    }
+                    if this.update(cx, |s, cx| s.refresh_places(cx)).is_err() {
+                        return; // window closed
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
     pub(super) fn switch_to(&mut self, place: Place, cx: &mut Context<Self>) {
         match place {
             Place::Session(s) => self.switch_session(s, cx),

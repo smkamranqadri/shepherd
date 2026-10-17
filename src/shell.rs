@@ -663,6 +663,7 @@ impl Shell {
                 shell.connect(cx);
                 shell.refresh_places(cx);
                 shell.start_watching(cx);
+                shell.start_session_watch(cx);
                 shell.refresh_plugin_actions(cx);
                 shell.load_kept_tabs(cx);
                 shell.load_kept_views(cx);
