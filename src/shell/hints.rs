@@ -20,7 +20,7 @@ pub(super) enum HintMode {
 
 /// How long the modifier is held alone before the chips show. Short: what keeps a chord from flashing them is its
 /// key, which puts them away at once (`cancel`), not the wait.
-const HOLD: Duration = Duration::from_millis(250);
+const HOLD: Duration = Duration::from_millis(150);
 const FADE_IN: Duration = Duration::from_millis(120);
 const FADE_OUT: Duration = Duration::from_millis(80);
 
@@ -345,15 +345,15 @@ mod tests {
     fn holding_ctrl_shows_the_tabs_after_the_hold() {
         let (mut h, t0) = (linux(), Instant::now());
         assert!(press(&mut h, CTRL, t0));
-        assert_eq!(h.deadline(), Some(t0 + ms(250)));
-        assert!(!h.tick(t0 + ms(249)), "not before the hold is up");
-        assert_eq!(h.shown(t0 + ms(249)), None);
-        assert!(h.tick(t0 + ms(250)));
+        assert_eq!(h.deadline(), Some(t0 + ms(150)));
+        assert!(!h.tick(t0 + ms(149)), "not before the hold is up");
+        assert_eq!(h.shown(t0 + ms(149)), None);
+        assert!(h.tick(t0 + ms(150)));
         assert_eq!(h.deadline(), None);
-        assert_eq!(mode(&h, t0 + ms(260)), Some(HintMode::Tabs));
-        assert!(h.fading(t0 + ms(300)));
-        assert_eq!(h.shown(t0 + ms(250) + FADE_IN), Some((HintMode::Tabs, 1.)));
-        assert!(!h.fading(t0 + ms(250) + FADE_IN));
+        assert_eq!(mode(&h, t0 + ms(160)), Some(HintMode::Tabs));
+        assert!(h.fading(t0 + ms(200)));
+        assert_eq!(h.shown(t0 + ms(150) + FADE_IN), Some((HintMode::Tabs, 1.)));
+        assert!(!h.fading(t0 + ms(150) + FADE_IN));
     }
 
     #[test]
@@ -362,16 +362,16 @@ mod tests {
         press(&mut h, SHIFT, t0);
         assert_eq!(h.deadline(), None, "Shift alone is on its way, not spent");
         press(&mut h, CTRL_SHIFT, t0 + ms(10));
-        assert!(h.tick(t0 + ms(260)));
-        assert_eq!(mode(&h, t0 + ms(300)), Some(HintMode::Workspaces));
+        assert!(h.tick(t0 + ms(160)));
+        assert_eq!(mode(&h, t0 + ms(200)), Some(HintMode::Workspaces));
         // Ctrl first: the tabs' wait, then the workspaces' from the Shift on
         press(&mut h, NONE, t0 + ms(600));
         press(&mut h, CTRL, t0 + ms(700));
-        assert_eq!(h.deadline(), Some(t0 + ms(950)), "Ctrl alone waits for the tabs");
+        assert_eq!(h.deadline(), Some(t0 + ms(850)), "Ctrl alone waits for the tabs");
         press(&mut h, CTRL_SHIFT, t0 + ms(710));
-        assert_eq!(h.deadline(), Some(t0 + ms(960)), "the hold starts anew for the workspaces");
-        assert!(!h.tick(t0 + ms(950)));
-        assert!(h.tick(t0 + ms(960)));
+        assert_eq!(h.deadline(), Some(t0 + ms(860)), "the hold starts anew for the workspaces");
+        assert!(!h.tick(t0 + ms(850)));
+        assert!(h.tick(t0 + ms(860)));
         assert_eq!(mode(&h, t0 + ms(1000)), Some(HintMode::Workspaces));
         // Shift let go with Ctrl still down: the tabs' numbers at once
         press(&mut h, CTRL, t0 + ms(1300));
@@ -408,14 +408,14 @@ mod tests {
     /// Ctrl+Shift+1 typed at any point inside the hold, even just before it is up, put them away for good.
     #[test]
     fn a_chord_inside_the_hold_never_shows_them() {
-        assert_eq!(HOLD, ms(250));
-        for key_at in [1, 30, 120, 249] {
+        assert_eq!(HOLD, ms(150));
+        for key_at in [1, 30, 100, 149] {
             for held in [CTRL, CTRL_SHIFT] {
                 let (mut h, t0) = (linux(), Instant::now());
                 press(&mut h, held, t0);
                 assert!(h.cancel(t0 + ms(key_at)), "the key at {key_at} ms puts them away");
                 assert_eq!(h.deadline(), None);
-                assert!(!h.tick(t0 + ms(250)) && !h.tick(t0 + ms(5000)));
+                assert!(!h.tick(t0 + ms(150)) && !h.tick(t0 + ms(5000)));
                 assert_eq!(h.shown(t0 + ms(5000)), None, "never shown for a key at {key_at} ms");
                 // the chord's key repeats or a second chord follows with the modifier still down: still nothing
                 assert!(!h.cancel(t0 + ms(400)));
@@ -429,7 +429,7 @@ mod tests {
     fn a_key_hides_them_until_the_modifiers_are_let_go() {
         let (mut h, t0) = (linux(), Instant::now());
         press(&mut h, CTRL, t0);
-        h.tick(t0 + ms(250));
+        h.tick(t0 + ms(150));
         assert!(h.cancel(t0 + ms(600)));
         assert!(h.fading(t0 + ms(620)));
         assert_eq!(h.shown(t0 + ms(600) + FADE_OUT), None, "faded out");
@@ -437,14 +437,14 @@ mod tests {
         assert!(!h.tick(t0 + ms(2000)));
         press(&mut h, NONE, t0 + ms(2100));
         press(&mut h, CTRL, t0 + ms(2200));
-        assert!(h.tick(t0 + ms(2450)), "held again, shown again");
+        assert!(h.tick(t0 + ms(2350)), "held again, shown again");
     }
 
     #[test]
     fn another_modifier_spends_them() {
         let (mut h, t0) = (linux(), Instant::now());
         press(&mut h, CTRL, t0);
-        press(&mut h, (true, false, true, false), t0 + ms(100));
+        press(&mut h, (true, false, true, false), t0 + ms(60));
         assert!(!h.tick(t0 + ms(600)));
         press(&mut h, CTRL, t0 + ms(700)); // Alt let go, Ctrl still down
         assert!(!h.tick(t0 + ms(1200)), "spent until Ctrl is let go too");
@@ -454,10 +454,10 @@ mod tests {
     fn switching_modes_while_shown_swaps_the_chips_and_while_waiting_restarts_the_hold() {
         let (mut h, t0) = (linux(), Instant::now());
         press(&mut h, CTRL, t0);
-        press(&mut h, CTRL_SHIFT, t0 + ms(100));
-        assert_eq!(h.deadline(), Some(t0 + ms(350)));
-        h.tick(t0 + ms(350));
-        assert_eq!(mode(&h, t0 + ms(400)), Some(HintMode::Workspaces));
+        press(&mut h, CTRL_SHIFT, t0 + ms(60));
+        assert_eq!(h.deadline(), Some(t0 + ms(210)));
+        h.tick(t0 + ms(210));
+        assert_eq!(mode(&h, t0 + ms(260)), Some(HintMode::Workspaces));
         press(&mut h, CTRL, t0 + ms(500));
         assert_eq!(mode(&h, t0 + ms(550)), Some(HintMode::Tabs));
     }
@@ -466,7 +466,7 @@ mod tests {
     fn blur_and_activation() {
         let (mut h, t0) = (linux(), Instant::now());
         press(&mut h, CTRL, t0);
-        h.tick(t0 + ms(250));
+        h.tick(t0 + ms(150));
         assert!(h.blur(t0 + ms(500)));
         assert_eq!(h.shown(t0 + ms(700)), None);
         // back with Ctrl still held: nothing until it is let go
@@ -475,7 +475,7 @@ mod tests {
         assert!(!h.tick(t0 + ms(1500)));
         h.activate(&Modifiers::default(), t0 + ms(1600));
         press(&mut h, CTRL, t0 + ms(1700));
-        assert!(h.tick(t0 + ms(1950)));
+        assert!(h.tick(t0 + ms(1850)));
     }
 
     #[test]
@@ -490,12 +490,12 @@ mod tests {
     fn mac_holds_cmd_for_tabs_and_ctrl_for_workspaces() {
         let (mut h, t0) = (mac(), Instant::now());
         press(&mut h, (false, false, false, true), t0);
-        assert_eq!(h.deadline(), Some(t0 + ms(250)));
-        h.tick(t0 + ms(250));
+        assert_eq!(h.deadline(), Some(t0 + ms(150)));
+        h.tick(t0 + ms(150));
         assert_eq!(mode(&h, t0 + ms(300)), Some(HintMode::Tabs));
         press(&mut h, NONE, t0 + ms(400));
         press(&mut h, CTRL, t0 + ms(500));
-        h.tick(t0 + ms(750));
+        h.tick(t0 + ms(650));
         assert_eq!(mode(&h, t0 + ms(800)), Some(HintMode::Workspaces));
         press(&mut h, NONE, t0 + ms(900));
         press(&mut h, (false, true, false, false), t0 + ms(1000));
@@ -507,12 +507,12 @@ mod tests {
     fn letting_go_fades_them_out() {
         let (mut h, t0) = (linux(), Instant::now());
         press(&mut h, CTRL, t0);
-        h.tick(t0 + ms(250));
-        press(&mut h, NONE, t0 + ms(250) + FADE_IN);
-        let mid = h.shown(t0 + ms(250) + FADE_IN + ms(40)).unwrap().1;
+        h.tick(t0 + ms(150));
+        press(&mut h, NONE, t0 + ms(150) + FADE_IN);
+        let mid = h.shown(t0 + ms(150) + FADE_IN + ms(40)).unwrap().1;
         assert!(mid > 0. && mid < 1., "{mid}");
-        assert_eq!(h.shown(t0 + ms(250) + FADE_IN + FADE_OUT), None);
-        assert!(!h.fading(t0 + ms(250) + FADE_IN + FADE_OUT));
+        assert_eq!(h.shown(t0 + ms(150) + FADE_IN + FADE_OUT), None);
+        assert!(!h.fading(t0 + ms(150) + FADE_IN + FADE_OUT));
     }
 
     /// What a chord's keys hold down: its modifiers, and Shift for the shifted digit Linux hears Ctrl+Shift+1 as.
