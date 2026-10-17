@@ -30,6 +30,7 @@ mod pane_drag;
 mod popups;
 mod review;
 mod right_panel;
+mod kept_views;
 mod session_views;
 mod sessions;
 mod sidebar;
@@ -80,12 +81,14 @@ pub struct Shell {
     views: session_views::SessionViews<Entity<PaneTerminal>>,
     /// The panes a view brought back, with their terminals: checked against the session's first snapshot of its own.
     parked_check: Option<Vec<(String, String)>>,
-    /// Every session's keyboard pane per tab.
+    /// Every session's keyboard pane per tab, kept for the next run (`kept_views`).
     keyboard: session_views::KeyboardMemory,
     /// The tab whose keyboard pane was last given back: another one shown gives its own back.
     keyboard_tab: Option<String>,
     /// The keyboard pane to give back once its tab and pane show.
     restore: Option<session_views::Restore>,
+    /// `session-views.json`'s reads and writes.
+    kept_views: kept_views::KeptState,
     own_pane: Option<String>,
     /// herdr's focused pane we last moved keyboard focus to; refocusing on every render would undo clicks.
     focused: Option<String>,
@@ -465,6 +468,7 @@ impl Shell {
                 cx.on_app_quit(|s: &mut Shell, cx| {
                     s.save_frame(cx);
                     let kept = s.flush_kept_tabs(cx);
+                    let views = s.flush_kept_views(cx);
                     // a quit that did not ask (the Dock's, logging out): unsaved tabs are saved as far as the quit
                     // waits, writes under way finished
                     // ponytail: E4's drafts keep what does not make it in time
@@ -472,7 +476,7 @@ impl Shell {
                     // the updater's relaunch, once the quit goes through
                     file_tabs::AfterQuit::run(cx);
                     async move {
-                        if let Some(write) = kept {
+                        for write in [kept, views].into_iter().flatten() {
                             write.await;
                         }
                         futures::future::join_all(edits).await;
@@ -507,8 +511,7 @@ impl Shell {
                     crate::ui::side_panel::SidePanelEvent::OpenMatch { path, line, cols, preview } => s.open_match(path.clone(), *line, cols.clone(), *preview, window, cx),
                     // the badge is in the Shell's tab strip
                     crate::ui::side_panel::SidePanelEvent::ChangesCounted => cx.notify(),
-                    // the side panel keeps it for the run
-                    crate::ui::side_panel::SidePanelEvent::FilesRemembered => {}
+                    crate::ui::side_panel::SidePanelEvent::FilesRemembered => s.save_kept_views(cx),
                     crate::ui::side_panel::SidePanelEvent::ChangesPolled => {
                         s.reload_shown_diff(true, cx);
                         // the editors' gutters too (W1's watch on .git calls `files_git_changed` as well)
@@ -533,6 +536,7 @@ impl Shell {
                     keyboard: Default::default(),
                     keyboard_tab: None,
                     restore: None,
+                    kept_views: Default::default(),
                     own_pane: std::env::var("HERDR_PANE_ID").ok(),
                     focused: None,
                     popup_closed: false,
@@ -658,6 +662,7 @@ impl Shell {
                 shell.start_watching(cx);
                 shell.refresh_plugin_actions(cx);
                 shell.load_kept_tabs(cx);
+                shell.load_kept_views(cx);
                 // Waiting times move on between snapshots.
                 // ponytail: a minute from launch, not from each wait, so a label can lag by up to a minute.
                 cx.spawn(async move |this, cx| loop {

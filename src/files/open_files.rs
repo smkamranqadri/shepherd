@@ -109,13 +109,24 @@ impl Writes {
     }
 }
 
-/// On a snapshot of `place` (its live workspaces and their `roots::fingerprint`s): the kept tabs of its workspaces
+/// An entry kept per workspace, made for the workspace that had this `roots::fingerprint`.
+pub trait Fingerprinted {
+    fn fingerprint(&mut self) -> &mut String;
+}
+
+impl Fingerprinted for Remembered {
+    fn fingerprint(&mut self) -> &mut String {
+        &mut self.fingerprint
+    }
+}
+
+/// On a snapshot of `place` (its live workspaces and their `roots::fingerprint`s): the kept entries of its workspaces
 /// that closed go. A workspace's entry is checked against its fingerprint the first time the workspace is seen this
 /// run (`seen`): a mismatch then is an id herdr gave to another workspace while Shepherd was not looking (or a rename
 /// meanwhile, which cannot be told apart, as for `workspace_roots`), and the entry goes. Once seen, the workspace is
 /// watched without a gap (a closed one leaves the snapshot, and this map, before herdr can give its id again), so a
 /// later change of fingerprint is a rename, and the entry follows it. True when the map changed.
-pub fn reconcile(map: &mut BTreeMap<String, Remembered>, place: &str, live: &[(&str, String)], seen: &mut std::collections::HashSet<String>) -> bool {
+pub fn reconcile<T: Fingerprinted>(map: &mut BTreeMap<String, T>, place: &str, live: &[(&str, String)], seen: &mut std::collections::HashSet<String>) -> bool {
     let prefix = format!("{place}\n");
     let is_live = |k: &str| k.strip_prefix(&prefix).is_none_or(|ws| live.iter().any(|(id, _)| *id == ws));
     let mut changed = false;
@@ -128,15 +139,15 @@ pub fn reconcile(map: &mut BTreeMap<String, Remembered>, place: &str, live: &[(&
     for (ws, fingerprint) in live {
         let key = format!("{prefix}{ws}");
         let first = seen.insert(key.clone());
-        let Some(entry) = map.get_mut(&key) else { continue };
-        if entry.fingerprint == *fingerprint {
+        let Some(entry) = map.get_mut(&key).map(Fingerprinted::fingerprint) else { continue };
+        if *entry == *fingerprint {
             continue;
         }
         changed = true;
-        if first && !entry.fingerprint.is_empty() {
+        if first && !entry.is_empty() {
             map.remove(&key);
         } else {
-            entry.fingerprint = fingerprint.clone();
+            *entry = fingerprint.clone();
         }
     }
     changed

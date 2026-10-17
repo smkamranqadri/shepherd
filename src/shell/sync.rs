@@ -83,6 +83,7 @@ pub(super) async fn sync_loop(this: gpui::WeakEntity<Shell>, rt: tokio::runtime:
                         s.after_snapshot(cx);
                         s.prune_roots(cx);
                         s.prune_file_tabs(cx);
+                        s.prune_kept_views(cx);
                         s.error = None;
                         s.connecting = None;
                     }

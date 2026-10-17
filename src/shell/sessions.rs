@@ -309,7 +309,11 @@ impl Shell {
                     s.retire_panes(gone.into_iter().chain(stopped), cx);
                     // and its keyboard panes; a machine turned off keeps them for when it is back
                     let off: Vec<String> = s.watchers.disabled.iter().map(|m| format!("machine:{}", m.id)).collect();
+                    let before = s.keyboard.len();
                     s.keyboard.retain(|k, _| listed.iter().any(|l| l.0 == *k) || shown.as_ref().is_some_and(|s| s.0 == *k) || off.contains(k));
+                    if s.keyboard.len() != before {
+                        s.save_kept_views(cx);
+                    }
                     if changed {
                         cx.notify();
                     }

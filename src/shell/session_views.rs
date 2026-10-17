@@ -197,8 +197,19 @@ pub(super) struct KeyPane {
     pub terminal: String,
 }
 
-/// Each session's keyboard pane per tab (by [`SessionKey`], then tab id).
+/// Each session's keyboard pane per tab (by [`SessionKey`], then tab id), kept for the next run.
 pub(super) type KeyboardMemory = BTreeMap<String, BTreeMap<String, KeyPane>>;
+
+/// The tabs of `memory` (one session's) that `snapshot` no longer backs: a tab gone, its pane gone or moved to
+/// another tab, or another terminal behind its id. True when any went.
+pub(super) fn prune_keyboard(memory: &mut BTreeMap<String, KeyPane>, snapshot: &Snapshot) -> bool {
+    let before = memory.len();
+    memory.retain(|tab, k| {
+        snapshot.tabs.iter().any(|t| &t.tab_id == tab)
+            && snapshot.panes.iter().any(|p| p.pane_id == k.pane && &p.tab_id == tab && (k.terminal.is_empty() || p.terminal_id == k.terminal))
+    });
+    memory.len() != before
+}
 
 impl super::Shell {
     /// Leaving the shown session `left` (before its snapshot goes to its watcher): its tab, workspace and herdr's
@@ -315,7 +326,7 @@ impl super::Shell {
         }
     }
 
-    /// The shown tab's pane with the keyboard is noted for the tab, unless a remembered one
+    /// The shown tab's pane with the keyboard is noted for the tab (and the next run), unless a remembered one
     /// waits to be given it back.
     pub(super) fn note_keyboard(&mut self, key: Option<&SessionKey>, tab: Option<&str>, shown: &[crate::model::PaneFrame], window: &gpui::Window, cx: &mut gpui::Context<Self>) {
         let (Some(key), Some(tab)) = (key, tab) else { return };
@@ -328,6 +339,7 @@ impl super::Shell {
         let tabs = self.keyboard.entry(key.0.clone()).or_default();
         if tabs.get(tab) != Some(&entry) {
             tabs.insert(tab.to_string(), entry);
+            self.save_kept_views(cx);
         }
     }
 }
@@ -482,5 +494,26 @@ mod tests {
         assert_eq!(restore_step(&r, Some("w1:t1"), true, true, false, t0), Step::Drop, "a goal wins");
         assert_eq!(restore_step(&r, Some("w1:t1"), true, false, false, t0 + RESTORE_EXPIRY + Duration::from_millis(1)), Step::Drop);
         assert_eq!(restore_step(&r, Some("w1:t1"), true, false, false, t0 + RESTORE_EXPIRY), Step::Apply);
+    }
+
+    #[test]
+    fn keyboard_memory_follows_the_snapshot() {
+        let k = |pane: &str, terminal: &str| KeyPane { pane: pane.into(), terminal: terminal.into() };
+        let mut memory: BTreeMap<String, KeyPane> = [
+            ("w1:t1".to_string(), k("w1:p2", "term-2")),
+            ("w1:t2".to_string(), k("w1:p3", "term-3")),
+            ("w1:t3".to_string(), k("w1:p4", "")),
+            ("w1:t4".to_string(), k("w1:p5", "term-5")),
+            ("w9:t1".to_string(), k("w9:p1", "term-9")),
+        ]
+        .into();
+        // t2's pane is another terminal now (a restart), t4's pane moved to t1, w9 closed
+        let snap = snapshot(&[("w1:p2", "w1:t1", "term-2"), ("w1:p5", "w1:t1", "term-5"), ("w1:p3", "w1:t2", "term-new"), ("w1:p4", "w1:t3", "x"), ("w1:p6", "w1:t4", "y")], None);
+        assert!(prune_keyboard(&mut memory, &snap));
+        assert_eq!(memory.keys().collect::<Vec<_>>(), ["w1:t1", "w1:t3"]);
+        assert!(!prune_keyboard(&mut memory, &snap));
+        // kept for the next run as written
+        let text = serde_json::to_string(&memory).unwrap();
+        assert_eq!(serde_json::from_str::<BTreeMap<String, KeyPane>>(&text).unwrap(), memory);
     }
 }

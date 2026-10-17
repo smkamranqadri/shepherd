@@ -31,7 +31,7 @@ use std::path::PathBuf;
 /// Views kept, each up to `content::MAX_TEXT` of text: showing a tab past this many reads its file again.
 const MAX_VIEWS: usize = 12;
 /// How long after the last change the kept tabs are written.
-const SAVE_AFTER: Duration = Duration::from_secs(1);
+pub(super) const SAVE_AFTER: Duration = Duration::from_secs(1);
 
 /// Paths resolved (`real_path`) kept for the run; past this many the cache starts over.
 const MAX_REAL_PATHS: usize = 4096;
