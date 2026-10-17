@@ -92,6 +92,9 @@ pub(super) struct TreeState {
     add_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
     /// Bare folded ids (an older Shepherd's) were moved under the shown session's key.
     folds_migrated: bool,
+    /// The agent Next agent that needs you last went to (session, pane), so the next press goes on from it while a
+    /// switch to its session is still landing, or after you looked elsewhere.
+    pub(super) needs_you_last: Option<(SessionKey, String)>,
 }
 
 impl TreeState {
@@ -429,6 +432,13 @@ impl Shell {
     /// The Agents section's entries from every session: the shown one's live snapshot, the others' from their
     /// watchers; and whether any session has an agent at all.
     pub(super) fn agents_everywhere(&self, attention: bool, cx: &App) -> (Vec<AgentEntry>, bool) {
+        cross_agents(&self.session_agents(cx), self.agent_sort, attention, Instant::now())
+    }
+
+    /// Every session's agents as the Agents section and Next agent that needs you read them, in the tree's order: a
+    /// socket of one's own first, the shown session's live snapshot, the others' from their watchers (a stopped one's
+    /// left out). One list for both, so the key never goes where the section does not show.
+    pub(super) fn session_agents(&self, cx: &App) -> Vec<SessionAgents<'_>> {
         let shown = self.shown_key();
         let mut sessions: Vec<SessionAgents> = Vec::new();
         let listed = |k: &SessionKey| self.places.iter().any(|p| SessionKey::of(p) == *k);
@@ -451,7 +461,7 @@ impl Shell {
                 sessions.push(SessionAgents { key, name, shown: false, snapshot, since: &w.since });
             }
         }
-        cross_agents(&sessions, self.agent_sort, attention, Instant::now())
+        sessions
     }
 
     /// The tree's elements, and whether it lists sessions (then the header leaves out the shown one's name).

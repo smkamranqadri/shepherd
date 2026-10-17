@@ -68,6 +68,7 @@ Shepherd needs macOS 14 or later (or Linux) and herdr. It talks to the herdr ser
 | `⌘S`, `⌥⌘S` | `Ctrl+S`, `Ctrl+Alt+S` | Save the file, save all (in a file tab) |
 | `⌘C`, `⌘V`, `⌘F` | `Ctrl+Shift+C`, `Ctrl+Shift+V`, `Ctrl+Shift+F` | Copy, paste, find in a pane |
 | `⌘K`, `⇧⌘A` | `Ctrl+Shift+P`, `Ctrl+Shift+A` | Command panel, agents panel |
+| `⇧⌘J` | `Ctrl+Shift+J` | Next agent that needs you: blocked first, then done, the longest wait first, in any session; again for the one after |
 | `⌘=`, `⌘-`, `⌘0` | `Ctrl+=`, `Ctrl+-`, `Ctrl+0` | Text size up, down, default |
 | `⌘,` | `Ctrl+,` | Settings |
 | `⌘/` | `Ctrl+Shift+/` | Keyboard shortcuts: every action and its keys, searchable by either |

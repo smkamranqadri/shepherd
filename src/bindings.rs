@@ -72,6 +72,7 @@ app_actions! {
     ToggleSecureInput: "Secure keyboard entry",
     CommandPanel: "Command panel",
     AgentsPanel: "Agents",
+    NextNeedsYou: "Next agent that needs you",
     WorkspacesPanel: "Workspaces",
     SaveFile: "Save file",
     SaveAllFiles: "Save all files",
@@ -195,6 +196,8 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("CommandPanel", "cmd-k"),
     ("CommandPanel", "cmd-shift-p"),
     ("AgentsPanel", "cmd-shift-a"),
+    // fork-only: the agent that has waited longest for you, in any session, then the next
+    ("NextNeedsYou", "cmd-shift-j"),
     ("SaveFile", "cmd-s"),
     ("SaveAllFiles", "cmd-alt-s"),
     ("Quit", "cmd-q"),
@@ -268,6 +271,9 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("OpenSettings", "ctrl-,"),
     ("CommandPanel", "ctrl-shift-p"),
     ("AgentsPanel", "ctrl-shift-a"),
+    // fork-only: the agent that has waited longest for you, in any session, then the next. Not Ctrl+Shift+U, IBus's
+    // Unicode entry
+    ("NextNeedsYou", "ctrl-shift-j"),
     // in the editor only (`context_of`): a pane's Ctrl+S is the terminal's
     ("SaveFile", "ctrl-s"),
     ("SaveAllFiles", "ctrl-alt-s"),
@@ -1129,6 +1135,20 @@ mod tests {
         assert_eq!(chord(&eff, "PreviousWorkspace"), normalize("ctrl-shift-up").as_deref());
         // a letter keeps shift on Linux: Ctrl+Shift+S arrives as ctrl-shift-s, and only the switcher fires
         assert_eq!(fired(&from_xkb("s", true, Some("S"))), ["SwitchSession"]);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn ctrl_shift_j_goes_to_the_next_agent_that_needs_you_and_ctrl_j_stays_the_shells() {
+        assert_eq!(chord(&effective(&user(&[])), "NextNeedsYou"), normalize("ctrl-shift-j").as_deref());
+        assert_eq!(fired(&from_xkb("j", true, Some("J"))), ["NextNeedsYou"]);
+        assert!(fired(&from_xkb("j", false, None)).is_empty(), "Ctrl+J is a newline to the pane");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_next_agent_that_needs_you_is_on_shift_cmd_j() {
+        assert_eq!(chord(&effective(&user(&[])), "NextNeedsYou"), normalize("cmd-shift-j").as_deref());
     }
 
     #[test]

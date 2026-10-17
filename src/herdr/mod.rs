@@ -3,6 +3,7 @@ pub mod client_shell;
 pub mod graphics;
 mod config;
 pub mod lifecycle;
+pub mod session_watch;
 pub mod keys;
 pub mod popup;
 mod remote;
