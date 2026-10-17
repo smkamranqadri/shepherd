@@ -112,6 +112,10 @@ pub(super) struct Watcher {
     dirty: bool,
     /// When the feed last closed to follow other agents.
     resubscribed: Option<Instant>,
+    /// The pane updates that came while a poll was out, the last of each pane, judged against its answer.
+    held: Vec<serde_json::Value>,
+    /// The poll interval in force when its last snapshot came: it is stale after three of those.
+    every: Duration,
 }
 
 impl Watcher {
@@ -135,6 +139,8 @@ impl Watcher {
             feed_failures: 0,
             dirty: false,
             resubscribed: None,
+            held: Vec::new(),
+            every: Duration::ZERO,
             place,
         }
     }
@@ -148,10 +154,11 @@ impl Watcher {
         self.starting_until.is_some_and(|until| now < until)
     }
 
-    /// Live, but nothing came for three of its intervals (its heartbeat's while fed): drawn as connecting.
-    pub(super) fn stale(&self, now: Instant, activity: Activity) -> bool {
-        let every = interval(self.kind(), activity, 0, self.fed());
-        self.status == Status::Live && self.fetched.is_some_and(|at| now.duration_since(at) > every * 3)
+    /// Live, but nothing came for three of the intervals in force when its last snapshot came (its heartbeat's
+    /// while fed): drawn as connecting. Judged by the answer's interval, not today's, so a feed that ends, which
+    /// drops the poll back to seconds, does not turn a session answered a minute ago stale before its next poll.
+    pub(super) fn stale(&self, now: Instant) -> bool {
+        self.status == Status::Live && self.fetched.is_some_and(|at| now.duration_since(at) > self.every * 3)
     }
 }
 
@@ -203,6 +210,8 @@ pub(super) struct Watchers {
     listed: Option<Instant>,
     /// Shepherd runs on Windows: machines are polled only, and slower.
     windows: bool,
+    /// Where the next round of polls starts in the tree's order: at the first the cap held back last time.
+    first: usize,
 }
 
 impl Watchers {
@@ -257,10 +266,14 @@ impl Watchers {
         self.activity = activity;
         let mut out = self.map.values().filter(|w| w.in_flight).count();
         let mut due = Vec::new();
-        for key in &self.order {
+        let n = self.order.len();
+        for i in 0..n {
             if out >= MAX_FETCHES {
+                // the ones held back go first next time, so none waits behind the tree's first ones for ever
+                self.first = (self.first + i) % n;
                 break;
             }
+            let key = &self.order[(self.first + i) % n];
             let Some(w) = self.map.get_mut(key) else { continue };
             let skip = match w.status {
                 Status::Shown => true,
@@ -289,7 +302,7 @@ impl Watchers {
             _ => self.apply(key, result, now),
         };
         if let Some(w) = self.map.get_mut(key)
-            && std::mem::take(&mut w.dirty)
+            && w.owed()
             && !matches!(w.status, Status::Shown | Status::Stopped)
         {
             w.next_due = now;
@@ -332,6 +345,7 @@ impl Watchers {
                 (w.failures, w.fetched) = (0, Some(now));
                 w.next_due = now + interval(kind, activity, 0, w.fed());
                 let resubscribe = w.follow_agents(&panes, now, interval(kind, activity, 0, false));
+                w.every = interval(kind, activity, 0, w.fed());
                 Applied { changed, alerts, resubscribe, ..Default::default() }
             }
             Err(e) if crate::herdr::no_server(&e) => {
@@ -345,7 +359,9 @@ impl Watchers {
                 let before = (w.status, w.error.clone());
                 w.failures += 1;
                 if w.failures >= 2 {
+                    // out of reach: no feed until it answers again
                     w.status = Status::Unreachable;
+                    w.close_feed();
                 }
                 w.error = Some(format!("{e:#}"));
                 w.next_due = now + interval(kind, activity, w.failures, w.fed());
@@ -363,6 +379,7 @@ impl Watchers {
         w.digest = snapshot.as_ref().map_or(0, digest);
         w.status = if snapshot.is_some() { Status::Live } else { Status::Connecting };
         w.fetched = snapshot.is_some().then_some(now);
+        w.every = interval(w.kind(), self.activity, 0, false);
         (w.snapshot, w.since, w.failures, w.error, w.next_due) = (snapshot, since, 0, None, now + interval(w.kind(), self.activity, 0, false));
     }
 
@@ -463,12 +480,8 @@ impl Watchers {
             .collect()
     }
 
-    /// The socket a machine's watcher asks on, once its relay runs: a feed on another socket is no news of this one.
     pub(super) fn set_client(&mut self, key: &SessionKey, client: Client) {
         if let Some(w) = self.map.get_mut(key) {
-            if w.client.as_ref().is_some_and(|c| c.path() != client.path()) {
-                w.close_feed();
-            }
             w.client = Some(client);
         }
     }
@@ -521,7 +534,7 @@ pub(super) fn interval(kind: Kind, activity: Activity, failures: u32, fed: bool)
 
 fn interval_on(kind: Kind, activity: Activity, failures: u32, fed: bool, windows: bool) -> Duration {
     if fed && failures == 0 {
-        return feeds::heartbeat(kind, windows);
+        return feeds::HEARTBEAT;
     }
     let (base, cap) = match (kind, activity) {
         (Kind::Local, Activity::Active) => (3, 60),

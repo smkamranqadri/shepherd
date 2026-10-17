@@ -35,6 +35,7 @@ mod session_views;
 mod sessions;
 mod sidebar;
 mod sidebar_tree;
+mod needs_you;
 mod watchers;
 mod sync;
 mod file_tabs;
@@ -296,6 +297,9 @@ pub struct Shell {
     place_edit: Option<crate::ui::Popup<sessions::PlaceEdit>>,
     /// The places not shown, each polled in the background for the sidebar's tree, with its last snapshot.
     watchers: watchers::Watchers,
+    /// herdr's sessions folder is watched (`start_session_watch`), or cannot be: no more tries. False while the
+    /// folder is not there yet, tried again as each read of herdr's list lands.
+    session_watch_settled: bool,
     /// Each live watcher's feed of herdr's events, with the `feed_gen` it was opened at: dropping one hangs it up.
     feeds: HashMap<watchers::SessionKey, (u64, gpui::Task<()>)>,
     /// The tree's goal after a switch and its machine menu.
@@ -650,6 +654,7 @@ impl Shell {
                     place_menu: None,
                     place_edit: None,
                     watchers: watchers::Watchers::new(),
+                    session_watch_settled: false,
                     feeds: HashMap::new(),
                     tree: Default::default(),
                     session_dialog: None,
@@ -664,6 +669,7 @@ impl Shell {
                 shell.connect(cx);
                 shell.refresh_places(cx);
                 shell.start_watching(cx);
+                shell.start_session_watch(cx);
                 shell.refresh_plugin_actions(cx);
                 shell.load_kept_tabs(cx);
                 shell.load_kept_views(cx);
@@ -1494,6 +1500,12 @@ impl Render for Shell {
         let shown_tab = tab.as_ref().map(|t| t.tab_id.clone());
         let sidebar_w = self.sidebar_now();
         let sliding = self.sidebar_motion.is_some_and(|m| m.animating());
+        let peek_on = SettingsGlobal::of(cx).settings.sidebar_peek;
+        if !peek_on {
+            // turned off in Settings while out: the card goes, rather than wait for a pointer that will not come back
+            self.sidebar_peek = None;
+            self.peek_hovered = false;
+        }
         let peek = self.peek_now();
         if sliding || self.sidebar_nudge().is_some() || self.sidebar_peek.is_some_and(|m| m.animating()) {
             window.request_animation_frame();
@@ -1795,6 +1807,7 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &CommandPanel, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Commands, w, cx)))
             .on_action(cx.listener(|this, _: &ChangeTheme, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Themes, w, cx)))
             .on_action(cx.listener(|this, _: &AgentsPanel, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Agents, w, cx)))
+            .on_action(cx.listener(|this, _: &NextNeedsYou, _, cx| this.next_needs_you(cx)))
             .on_action(cx.listener(|this, _: &WorkspacesPanel, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Workspaces, w, cx)))
             .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Shortcuts, w, cx)))
             .on_action(cx.listener(|this, c: &crate::herdr::keys::HerdrCommand, w, cx| this.run_herdr_command(c, w, cx)))
@@ -1841,7 +1854,7 @@ impl Render for Shell {
             })
             .children(panel.into_iter().flatten())
             // The sidebar closed: the window's left edge brings it out floating over the panes, as Arc's does.
-            .when(!self.sidebar_open && sidebar_w == 0. && !on_page, |el| {
+            .when(sidebar::peeks(self.sidebar_open, sidebar_w, on_page, peek_on), |el| {
                 el.child(
                     div()
                         .id("sidebar-peek-edge")

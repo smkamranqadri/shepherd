@@ -7,12 +7,11 @@ use crate::model::Pane;
 use serde_json::Value;
 
 /// The heartbeat poll while a feed is on: what herdr raises no event for (a folder an agent moved to, a workspace's
-/// summed status) is at most this late. Twice as long for a machine from Windows, which shares no SSH connection.
-const HEARTBEAT: Duration = Duration::from_secs(60);
-const HEARTBEAT_WINDOWS_REMOTE: Duration = Duration::from_secs(120);
+/// summed status) is at most this late.
+pub(super) const HEARTBEAT: Duration = Duration::from_secs(60);
 
-/// A herdr that refused the subscription (older, or without some event type) is polled only, and asked again this
-/// long after, or once its server starts again.
+/// A herdr that does not take the subscription (older, without some event type) is polled only, and asked again
+/// this long after, or once its server starts again.
 const UNSUPPORTED: Duration = Duration::from_secs(10 * 60);
 
 /// A feed follows another set of agents at most this often: agents coming and going quickly resubscribe once.
@@ -32,7 +31,7 @@ pub(in crate::shell) enum Feed {
     On { panes: Vec<String>, since: Instant },
     /// Failed or ended: opened again from `at`, once a poll answered since.
     Retry { at: Instant },
-    /// herdr refused it: polled only, until `until` or a restart of its server.
+    /// herdr does not take it (`herdr::unsupported`): polled only, until `until` or a restart of its server.
     Unsupported { until: Instant },
 }
 
@@ -72,6 +71,28 @@ impl Watcher {
         self.close_feed();
         self.next_due = self.next_due.min(now + unfed);
         true
+    }
+
+    /// Events that came while a poll was out, which may have caught a change they undo (A → B → A): pane updates are
+    /// kept, the last of each pane, to judge against its answer (`Watchers::answer`); any other event asks again
+    /// after it. Judging them against the snapshot before would lose the change back; asking again after every
+    /// poll a busy agent's updates landed in would poll it without end.
+    fn hold(&mut self, events: &[Value]) {
+        for e in events {
+            if !crate::herdr::event_is(e, "pane.updated") {
+                self.dirty = true;
+                continue;
+            }
+            let pane = &e["data"]["pane"]["pane_id"];
+            self.held.retain(|h| h["data"]["pane"]["pane_id"] != *pane);
+            self.held.push(e.clone());
+        }
+    }
+
+    /// The poll was answered: whether what came while it was out asks again (`hold`).
+    pub(super) fn owed(&mut self) -> bool {
+        let held = std::mem::take(&mut self.held);
+        std::mem::take(&mut self.dirty) || relevant(self.snapshot.as_ref(), &held)
     }
 
     /// News for the poll: asked now, or (a poll is out, whose snapshot may be older than the news) again as soon as it
@@ -119,8 +140,10 @@ impl Watchers {
     }
 
     /// The subscription answered, at `feed_gen`: on, the session is asked at once (what changed before it opened
-    /// came on no feed); refused, it is polled only for a while; failed, it is asked at once (that answer says what
-    /// became of it) and the feed waits out a backoff. News of a feed closed since changes nothing.
+    /// came on no feed); unsupported, it is polled only for a while; turned down for what it named (a pane closed
+    /// since the last poll), it is asked at once and opened again with that answer's panes; failed, it is asked at
+    /// once (that answer says what became of it) and the feed waits out a backoff. News of a feed closed since
+    /// changes nothing.
     pub(in crate::shell) fn feed_opened(&mut self, key: &SessionKey, feed_gen: u64, result: anyhow::Result<()>, now: Instant) {
         let Some(w) = self.map.get_mut(key).filter(|w| w.feed_gen == feed_gen) else { return };
         let kind = w.kind();
@@ -133,7 +156,11 @@ impl Watchers {
                 w.feed = Feed::On { panes, since: now };
                 w.wake(now);
             }
-            Err(e) if crate::herdr::refused(&e) => w.feed = Feed::Unsupported { until: now + UNSUPPORTED },
+            Err(e) if crate::herdr::unsupported(&e) => w.feed = Feed::Unsupported { until: now + UNSUPPORTED },
+            Err(e) if crate::herdr::api_error(&e).is_some() => {
+                w.feed = Feed::Off;
+                w.wake(now);
+            }
             Err(_) => {
                 w.feed_failures += 1;
                 w.feed = Feed::Retry { at: now + feed_backoff(kind, w.feed_failures) };
@@ -155,10 +182,18 @@ impl Watchers {
     }
 
     /// A burst of events from the feed at `feed_gen`: wakes the poll (true) when one of them may change what the
-    /// tree draws. News of a feed closed since, or of a session shown or stopped, is dropped.
+    /// tree draws, or holds them for the answer of the poll out (`hold`). News of a feed closed since, or of a
+    /// session shown or stopped, is dropped.
     pub(in crate::shell) fn burst(&mut self, key: &SessionKey, feed_gen: u64, events: &[Value], now: Instant) -> bool {
         let Some(w) = self.map.get_mut(key) else { return false };
-        if w.feed_gen != feed_gen || !w.fed() || matches!(w.status, Status::Shown | Status::Stopped) || !relevant(w.snapshot.as_ref(), events) {
+        if w.feed_gen != feed_gen || !w.fed() || matches!(w.status, Status::Shown | Status::Stopped) {
+            return false;
+        }
+        if w.in_flight {
+            w.hold(events);
+            return false;
+        }
+        if !relevant(w.snapshot.as_ref(), events) {
             return false;
         }
         w.wake(now);
@@ -168,13 +203,12 @@ impl Watchers {
     /// How long a feed waits after a burst before it takes the next: a busy session is asked a few times a second
     /// at most with the window in front, less behind it, and once in seconds while you are away.
     pub(in crate::shell) fn refetch_gap(&self, kind: Kind) -> Duration {
-        refetch_gap(kind, self.activity, self.windows)
+        refetch_gap(kind, self.activity)
     }
 }
 
-fn refetch_gap(kind: Kind, activity: Activity, windows: bool) -> Duration {
+fn refetch_gap(kind: Kind, activity: Activity) -> Duration {
     let ms = match (kind, activity) {
-        (Kind::Remote, _) if windows => 10_000,
         (Kind::Local, Activity::Active) => 300,
         (Kind::Remote, Activity::Active) => 1_000,
         (Kind::Local, Activity::Inactive) => 1_000,
@@ -183,11 +217,6 @@ fn refetch_gap(kind: Kind, activity: Activity, windows: bool) -> Duration {
         (Kind::Remote, Activity::Idle) => 5_000,
     };
     Duration::from_millis(ms)
-}
-
-/// The poll's interval while fed: the heartbeat.
-pub(super) fn heartbeat(kind: Kind, windows: bool) -> Duration {
-    if windows && kind == Kind::Remote { HEARTBEAT_WINDOWS_REMOTE } else { HEARTBEAT }
 }
 
 /// How long the events of one burst are gathered after its first. A busy agent's `pane.updated` (its title, scroll,
@@ -217,16 +246,11 @@ fn feed_backoff(kind: Kind, failures: u32) -> Duration {
     Duration::from_secs((base * 2u64.saturating_pow(failures.saturating_sub(1).min(16))).min(300))
 }
 
-/// herdr names an event `pane.updated` in a subscription and `pane_updated` in the events it sends.
-fn named(event: &Value, kind: &str) -> bool {
-    event["event"].as_str().is_some_and(|e| e == kind || e == kind.replace('.', "_"))
-}
-
 /// Whether a burst may change what the tree draws of the session, last seen as `old`: any event but `pane.updated`
 /// does; that one only when the pane is new to `old`, or moved, or its agent, status, folder or terminal changed.
 /// A busy agent sends it several times a second for its title, scroll and tokens alone.
 pub(in crate::shell) fn relevant(old: Option<&Snapshot>, events: &[Value]) -> bool {
-    events.iter().any(|e| !named(e, "pane.updated") || pane_changed(old, &e["data"]["pane"]))
+    events.iter().any(|e| !crate::herdr::event_is(e, "pane.updated") || pane_changed(old, &e["data"]["pane"]))
 }
 
 fn pane_changed(old: Option<&Snapshot>, pane: &Value) -> bool {
@@ -404,7 +428,7 @@ mod tests {
         let k = key("menqal");
         w.poll_now(&k, now);
         let generation = w.due(now, Active)[0].3;
-        assert!(w.burst(&k, feed_gen(&w, &k), &[event("pane_created")], now));
+        assert!(!w.burst(&k, feed_gen(&w, &k), &[event("pane_created")], now), "held for the answer");
         assert!(w.due(now, Active).is_empty(), "one poll out at a time");
         let applied = w.answer(&k, generation, Ok(agents(&[("p1", "working")])), now);
         assert!(applied.again, "the snapshot out may be older than the news");
@@ -434,14 +458,14 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_feed_is_polled_only_until_its_server_starts_again() {
+    fn an_unsupported_feed_is_polled_only_until_its_server_starts_again() {
         let now = Instant::now();
         let mut w = Watchers::new();
         w.reconcile(&[session("menqal", true)], None, now);
         let k = key("menqal");
         poll(&mut w, &k, agents(&[("p1", "working")]), now);
         let g = w.feeds_due(now).pop().unwrap().feed_gen;
-        let no = anyhow::Error::new(crate::herdr::ApiError { code: "invalid_request".into(), message: "unknown event type".into() });
+        let no = anyhow::Error::new(crate::herdr::ApiError { code: "invalid_request".into(), message: "invalid request: unknown variant".into() });
         w.feed_opened(&k, g, Err(no), now);
         assert!(matches!(w.get(&k).unwrap().feed, Feed::Unsupported { .. }));
         assert!(w.due(now, Active).is_empty(), "polled as before, nothing asked at once");
@@ -453,6 +477,23 @@ mod tests {
         w.reconcile(&[session("menqal", true)], None, now);
         poll(&mut w, &k, agents(&[("p1", "working")]), now);
         assert_eq!(w.feeds_due(now).len(), 1, "a new server is asked again");
+    }
+
+    #[test]
+    fn a_feed_naming_a_closed_pane_opens_again_with_the_next_answers_panes() {
+        let now = Instant::now();
+        let mut w = Watchers::new();
+        w.reconcile(&[session("menqal", true)], None, now);
+        let k = key("menqal");
+        poll(&mut w, &k, agents(&[("p1", "working"), ("p2", "working")]), now);
+        let g = w.feeds_due(now).pop().unwrap().feed_gen;
+        let gone = anyhow::Error::new(crate::herdr::ApiError { code: "pane_not_found".into(), message: "pane p2 not found".into() });
+        w.feed_opened(&k, g, Err(gone), now);
+        assert_eq!(w.get(&k).unwrap().feed, Feed::Off, "not unsupported: the request was fine, a pane in it was old");
+        assert!(w.feeds_due(now).is_empty(), "the poll first, for the panes there are now");
+        poll(&mut w, &k, agents(&[("p1", "working")]), now);
+        let order = w.feeds_due(now).pop().expect("opened again at once");
+        assert_eq!(order.panes, ["p1"]);
     }
 
     #[test]
@@ -484,17 +525,33 @@ mod tests {
         assert_eq!(interval_on(Kind::Local, Active, 0, true, false), HEARTBEAT);
         assert_eq!(interval_on(Kind::Local, Idle, 0, true, false), HEARTBEAT);
         assert_eq!(interval_on(Kind::Remote, Active, 0, true, false), HEARTBEAT);
-        assert_eq!(interval_on(Kind::Remote, Active, 0, true, true), Duration::from_secs(120));
         assert_eq!(interval_on(Kind::Local, Active, 1, true, false), Duration::from_secs(6), "failing: backing off as unfed");
         let now = Instant::now();
         let mut w = fed(now);
         let k = key("menqal");
         assert!(w.due(now + Duration::from_secs(59), Active).is_empty());
-        assert!(!w.get(&k).unwrap().stale(now + Duration::from_secs(20), Active), "fed: quiet is no news");
-        assert!(!w.get(&k).unwrap().stale(now + HEARTBEAT * 3, Active));
-        assert!(w.get(&k).unwrap().stale(now + HEARTBEAT * 3 + Duration::from_secs(1), Active));
-        w.feed_ended(&k, feed_gen(&w, &k), now);
-        assert!(w.get(&k).unwrap().stale(now + Duration::from_secs(10), Active), "unfed: three polls of 3 s");
+        assert!(!w.get(&k).unwrap().stale(now + Duration::from_secs(20)), "fed: quiet is no news");
+        assert!(!w.get(&k).unwrap().stale(now + HEARTBEAT * 3));
+        assert!(w.get(&k).unwrap().stale(now + HEARTBEAT * 3 + Duration::from_secs(1)));
+        // the feed ends 50 s on: the answer before it was owed a minute after, so nothing turns stale meanwhile
+        let ended = now + Duration::from_secs(50);
+        w.feed_ended(&k, feed_gen(&w, &k), ended);
+        assert!(!w.get(&k).unwrap().stale(ended), "no flicker to connecting while the poll after it is out");
+        poll(&mut w, &k, agents(&[("p1", "working")]), ended);
+        assert!(w.get(&k).unwrap().stale(ended + Duration::from_secs(10)), "unfed: three polls of 3 s");
+    }
+
+    #[test]
+    fn the_gaps_and_windows_are_the_tables() {
+        use Activity::*;
+        let gap = |kind, activity| refetch_gap(kind, activity).as_millis();
+        assert_eq!([gap(Kind::Local, Active), gap(Kind::Local, Inactive), gap(Kind::Local, Idle)], [300, 1_000, 3_000]);
+        assert_eq!([gap(Kind::Remote, Active), gap(Kind::Remote, Inactive), gap(Kind::Remote, Idle)], [1_000, 2_000, 5_000], "away, less often");
+        let mut w = Watchers::new();
+        w.activity = Idle;
+        assert_eq!(w.refetch_gap(Kind::Local), Duration::from_secs(3), "the watchers' own activity");
+        assert_eq!((burst_window(Kind::Local).as_millis(), burst_window(Kind::Remote).as_millis()), (100, 200));
+        assert_eq!((open_timeout(Kind::Local).as_secs(), open_timeout(Kind::Remote).as_secs()), (2, 15));
     }
 
     #[test]
@@ -624,20 +681,53 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_on_another_socket_closes_its_feed() {
+    fn a_change_undone_while_a_poll_was_out_asks_again() {
+        let now = Instant::now();
+        let mut w = fed(now);
+        let k = key("menqal");
+        // working → blocked → working: the poll out caught it blocked, the last update says working again
+        w.poll_now(&k, now);
+        let generation = w.due(now, Active)[0].3;
+        w.burst(&k, feed_gen(&w, &k), &[pane_updated("p1", "blocked")], now);
+        w.burst(&k, feed_gen(&w, &k), &[pane_updated("p1", "working")], now);
+        assert!(w.answer(&k, generation, Ok(agents(&[("p1", "blocked")])), now).again, "it is working again");
+        // a busy agent's updates that change nothing ask nothing after the poll they landed in
+        let generation = w.due(now, Active)[0].3;
+        w.burst(&k, feed_gen(&w, &k), &[pane_updated("p1", "working"), pane_updated("p1", "working")], now);
+        assert!(!w.answer(&k, generation, Ok(agents(&[("p1", "working")])), now).again);
+        assert!(w.due(now, Active).is_empty());
+    }
+
+    #[test]
+    fn polls_past_the_cap_take_turns() {
         let now = Instant::now();
         let mut w = Watchers::new();
-        w.windows = false;
-        let m = SessionKey("machine:box".into());
-        w.reconcile(&[machine("box")], None, now);
-        w.set_client(&m, Client::at("/tmp/box.sock".into()));
-        poll(&mut w, &m, agents(&[]), now);
-        let order = w.feeds_due(now).pop().unwrap();
-        w.feed_opened(&m, order.feed_gen, Ok(()), now);
-        w.set_client(&m, Client::at("/tmp/box.sock".into()));
-        assert!(w.get(&m).unwrap().fed(), "the same socket");
-        w.set_client(&m, Client::at("/tmp/box2.sock".into()));
-        assert!(!w.get(&m).unwrap().fed() && feed_gen(&w, &m) > order.feed_gen);
+        let places: Vec<Place> = (0..8).map(|i| session(&format!("s{i}"), true)).collect();
+        w.reconcile(&places, None, now);
+        let names = |due: &[(SessionKey, Client, Duration, u64)]| due.iter().map(|d| d.0.clone()).collect::<Vec<_>>();
+        let first = w.due(now, Active);
+        assert_eq!(names(&first), (0..6).map(|i| key(&format!("s{i}"))).collect::<Vec<_>>());
+        for d in &first {
+            w.answer(&d.0, d.3, Ok(agents(&[])), now);
+        }
+        // every one due again: the two left waiting go first
+        let later = now + Duration::from_secs(10);
+        let order: Vec<SessionKey> = [6, 7, 0, 1, 2, 3].iter().map(|i| key(&format!("s{i}"))).collect();
+        assert_eq!(names(&w.due(later, Active)), order);
+    }
+
+    #[test]
+    fn an_unreachable_session_has_no_feed() {
+        let now = Instant::now();
+        let mut w = fed(now);
+        let k = key("menqal");
+        for at in [now, now + Duration::from_secs(6)] {
+            w.poll_now(&k, at);
+            let generation = w.due(at, Active)[0].3;
+            w.answer(&k, generation, Err(anyhow::anyhow!("no answer in 2 s")), at);
+        }
+        assert_eq!((w.get(&k).unwrap().status, w.get(&k).unwrap().feed.clone()), (Status::Unreachable, Feed::Off));
+        assert!(w.feeding().is_empty());
     }
 
     #[test]

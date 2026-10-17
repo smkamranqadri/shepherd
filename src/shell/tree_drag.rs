@@ -281,7 +281,8 @@ pub(super) fn merged(now: Vec<String>, saved: &[String], keep: impl Fn(&str) -> 
 }
 
 /// Whether a saved name not listed now is kept: a machine turned off (`off`, by key or target), or any machine
-/// while herdr's list of them could not be read. A session not listed was deleted.
+/// while herdr's list of them could not be read (`TreeState::machines_known`, the rule `still_known` keeps views
+/// by). A session not listed was deleted.
 pub(super) fn kept_unlisted(name: &str, off: &[String], machines_known: bool, is_machine: bool) -> bool {
     off.iter().any(|o| o == name) || (!machines_known && is_machine)
 }

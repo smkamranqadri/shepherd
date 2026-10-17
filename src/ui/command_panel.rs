@@ -230,6 +230,7 @@ fn action_icon(name: &str) -> &'static str {
         "PreviousSession" => "icons/solar/double-alt-arrow-left.svg",
         "NextSession" => "icons/solar/double-alt-arrow-right.svg",
         "SwitchSession" => "icons/solar/round-transfer-horizontal.svg",
+        "NextNeedsYou" => "icons/bell.svg",
         "ToggleSidebar" => "icons/sidebar-minimalistic-left.svg",
         "ToggleReview" => "icons/sidebar-minimalistic-right.svg",
         "ShowFiles" => "icons/folder.svg",
