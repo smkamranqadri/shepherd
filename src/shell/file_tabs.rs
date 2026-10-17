@@ -187,6 +187,8 @@ impl Shell {
                 && self.file_tabs.get_mut(&key).is_some_and(|t| t.active.take().is_some())
             {
                 self.focused = None;
+                // back to the terminals: the pane the tab's keyboard was in takes it back
+                self.keyboard_tab = None;
                 self.remember_tabs(&key, cx);
             }
         }

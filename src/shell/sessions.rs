@@ -302,6 +302,14 @@ impl Shell {
                     s.watchers.reconcile(&s.places, shown.as_ref(), Instant::now());
                     let listed: Vec<watchers::SessionKey> = s.places.iter().map(watchers::SessionKey::of).collect();
                     s.attention.keep_sessions(|k| listed.contains(k) || shown.as_ref() == Some(k));
+                    // a session deleted takes its view along; one herdr says stopped keeps it, without its terminals
+                    let gone = s.views.keep_sessions(|k| listed.contains(k) || shown.as_ref() == Some(k));
+                    let stopped: Vec<watchers::SessionKey> = listed.iter().filter(|k| s.watchers.get(k).is_some_and(|w| w.status == watchers::Status::Stopped)).cloned().collect();
+                    let stopped: Vec<_> = stopped.iter().flat_map(|k| s.views.drop_panes(k)).collect();
+                    s.retire_panes(gone.into_iter().chain(stopped), cx);
+                    // and its keyboard panes; a machine turned off keeps them for when it is back
+                    let off: Vec<String> = s.watchers.disabled.iter().map(|m| format!("machine:{}", m.id)).collect();
+                    s.keyboard.retain(|k, _| listed.iter().any(|l| l.0 == *k) || shown.as_ref().is_some_and(|s| s.0 == *k) || off.contains(k));
                     if changed {
                         cx.notify();
                     }
@@ -378,6 +386,8 @@ impl Shell {
         // the place left keeps its last snapshot and its agents' clocks in its watcher, which polls it from now on, so
         // the tree shows its workspaces and coming back shows them before herdr answers
         if let Some(left) = self.shown_key() {
+            // before its snapshot goes: the view is read from it
+            self.park_view(&left, cx);
             self.watchers.park(&left, self.snapshot.take(), std::mem::take(&mut self.since), Instant::now());
         }
         save_from_sidebar(cx, |s| {
@@ -407,11 +417,14 @@ impl Shell {
         self.connecting = Some(Instant::now());
         self.panes.clear();
         self.recent_panes.clear();
+        self.parked_check = None;
         self.focused = None;
-        self.show_herdr_tab(None, false, cx);
-        self.shown_workspace = None;
         self.marked_seen = None;
         self.focus_next = None;
+        // the tab the session showed, with its parked panes (after `set_socket`: they attach there as they show)
+        self.restore = None;
+        self.keyboard_tab = None;
+        self.restore_view(&key, cx);
         self.renaming = None;
         self.settling = None;
         self.pending_worktrees.clear();

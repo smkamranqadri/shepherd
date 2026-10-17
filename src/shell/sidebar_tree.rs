@@ -102,6 +102,12 @@ impl TreeState {
         }
     }
 
+    /// A goal waits for the session switched to (its others are dropped on a switch): it wins over what the view
+    /// remembers.
+    pub(super) fn goal_waiting(&self) -> bool {
+        self.pending_goal.is_some()
+    }
+
     pub(super) fn menu_open(&self) -> bool {
         self.machine_menu.as_ref().is_some_and(|m| m.is_open()) || self.add_menu_open()
     }
@@ -374,6 +380,8 @@ impl Shell {
     /// The goal in the shown session's snapshot: false while it does not list it.
     fn apply_goal(&mut self, goal: &Goal, cx: &mut Context<Self>) -> bool {
         let Some(snapshot) = self.snapshot.as_ref() else { return false };
+        // the goal wins over the keyboard pane the view remembers
+        self.restore = None;
         match goal {
             Goal::Workspace(id) => {
                 let Some(w) = snapshot.workspaces.iter().find(|w| &w.workspace_id == id) else { return false };
@@ -394,6 +402,8 @@ impl Shell {
     /// The shown session sent a snapshot of its own: a goal waiting for it is shown, and folds an older Shepherd
     /// kept by bare id move under its key.
     pub(super) fn after_snapshot(&mut self, cx: &mut Context<Self>) {
+        // before a goal: the panes a view brought back that this snapshot no longer backs go first
+        self.check_parked(cx);
         let shown = self.shown_key();
         if !self.tree.folds_migrated && let Some(key) = &shown {
             self.tree.folds_migrated = true;

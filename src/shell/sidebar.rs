@@ -178,6 +178,7 @@ impl Shell {
     pub(super) fn show_agent(&mut self, tab_id: String, pane_id: String, cx: &mut Context<Self>) {
         self.show_herdr_tab(Some(tab_id), true, cx);
         self.focus_next = Some(pane_id);
+        self.restore = None;
     }
 
     pub(super) fn set_agent_sort(&mut self, sort: AgentSort, cx: &mut Context<Self>) {

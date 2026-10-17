@@ -540,6 +540,13 @@ impl Shell {
                 let _ = this.update(cx, |s, cx| {
                     let applied = s.watchers.answer(&key, generation, parsed, Instant::now());
                     s.tell_elsewhere(&key, &applied.alerts, cx);
+                    // its parked panes follow it: all go when it stopped, those it no longer backs when it changed
+                    let parked = match s.watchers.snapshot(&key) {
+                        _ if applied.stopped => s.views.drop_panes(&key),
+                        Some(snapshot) if applied.changed => s.views.prune_against(&key, snapshot),
+                        _ => Vec::new(),
+                    };
+                    s.retire_panes(parked, cx);
                     if applied.stopped {
                         s.refresh_places(cx);
                     }

@@ -30,6 +30,7 @@ mod pane_drag;
 mod popups;
 mod review;
 mod right_panel;
+mod session_views;
 mod sessions;
 mod sidebar;
 mod sidebar_tree;
@@ -75,6 +76,16 @@ pub struct Shell {
     panes: HashMap<String, Entity<PaneTerminal>>,
     /// The panes shown last, most recent first: their views (and herdr sessions) outlive a tab switch.
     recent_panes: Vec<String>,
+    /// The sessions not shown, as they were left: their tab and workspace, and their panes' grids, parked.
+    views: session_views::SessionViews<Entity<PaneTerminal>>,
+    /// The panes a view brought back, with their terminals: checked against the session's first snapshot of its own.
+    parked_check: Option<Vec<(String, String)>>,
+    /// Every session's keyboard pane per tab.
+    keyboard: session_views::KeyboardMemory,
+    /// The tab whose keyboard pane was last given back: another one shown gives its own back.
+    keyboard_tab: Option<String>,
+    /// The keyboard pane to give back once its tab and pane show.
+    restore: Option<session_views::Restore>,
     own_pane: Option<String>,
     /// herdr's focused pane we last moved keyboard focus to; refocusing on every render would undo clicks.
     focused: Option<String>,
@@ -517,6 +528,11 @@ impl Shell {
                     connecting: Some(Instant::now()),
                     panes: HashMap::new(),
                     recent_panes: Vec::new(),
+                    views: Default::default(),
+                    parked_check: None,
+                    keyboard: Default::default(),
+                    keyboard_tab: None,
+                    restore: None,
                     own_pane: std::env::var("HERDR_PANE_ID").ok(),
                     focused: None,
                     popup_closed: false,
@@ -1403,6 +1419,15 @@ impl Render for Shell {
         // a file tab shown in the grid's place keeps the keyboard from herdr's focused pane, as an overlay does
         let file_shown = self.shown_file_tab().is_some();
         let overlaid = self.settings.is_some() || self.command_panel.as_ref().is_some_and(|p| p.is_open()) || self.floating_open() || file_shown;
+        // a session was left: the keyboard leaves its parked panes (out of `panes`) for the window, and herdr's
+        // focused pane here takes it next
+        if self.views.take_refocus() && self.settings.is_none() {
+            window.focus(&self.focus, cx);
+            self.focused = None;
+        }
+        let shown_key = self.shown_key();
+        let tab_id = tab.as_ref().map(|t| t.tab_id.clone());
+        self.note_tab_shown(shown_key.as_ref(), tab_id.as_deref(), now);
         for f in &shown {
             if !self.panes.contains_key(&f.pane_id) {
                 let id = f.pane_id.clone();
@@ -1413,6 +1438,10 @@ impl Render for Shell {
                     pane
                 }));
             }
+            // a parked pane shown again attaches, to the session the window's socket names by now
+            if let Some(pane) = self.panes.get(&f.pane_id).filter(|p| p.read(cx).is_parked()) {
+                pane.update(cx, |p, cx| p.resume(cx));
+            }
             // an open panel keeps its input's focus; a panel run from the command panel opens before this render
             if f.focused && !overlaid && self.focused.as_deref() != Some(f.pane_id.as_str()) {
                 let handle = self.panes[&f.pane_id].read(cx).focus_handle(cx);
@@ -1420,12 +1449,15 @@ impl Render for Shell {
                 self.focused = Some(f.pane_id.clone());
             }
         }
+        // an agent's pane asked for wins over the pane the tab remembers
+        let goal = self.focus_next.is_some() || self.tree.goal_waiting();
         // after herdr's focus, so the agent's pane wins; its tab is already the shown one
         // not a pane under a file tab, which is not drawn
         if let Some(id) = self.focus_next.take().filter(|id| self.settings.is_none() && !file_shown && shown.iter().any(|f| &f.pane_id == id)) {
             let handle = self.panes[&id].read(cx).focus_handle(cx);
             window.focus(&handle, cx);
         }
+        self.restore_keyboard(&shown, tab_id.as_deref(), goal, overlaid, now, window, cx);
 
         // A pane of a tab no longer shown keeps focus, and gpui then dispatches keys to the root, past our actions.
         let hidden = self
@@ -1435,6 +1467,9 @@ impl Render for Shell {
         if (window.focused(cx).is_none() || hidden) && self.settings.is_none() {
             window.focus(&self.focus, cx);
             self.focused = None;
+        }
+        if !overlaid {
+            self.note_keyboard(shown_key.as_ref(), tab_id.as_deref(), &shown, window, cx);
         }
         if let Some(viewer) = &viewer {
             self.view_takes_keys(viewer, window, cx);
