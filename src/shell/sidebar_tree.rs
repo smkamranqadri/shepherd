@@ -194,6 +194,52 @@ pub(super) fn session_waiting(w: &Watchers, key: &SessionKey, shown: Option<&Sna
     tree_snapshot(w, key, shown).map_or(0, waiting)
 }
 
+/// Every agent waiting or done that the Dock counts and the sidebar's Agents toggle shows: the shown session's live
+/// snapshot and every other's watcher's, but for those out of reach, whose last word may be long over (the tree's ●N
+/// keeps them).
+pub(super) fn waiting_everywhere(shown: Option<&Snapshot>, w: &Watchers) -> usize {
+    super::attention::badge(shown.into_iter().chain(w.snapshots()))
+}
+
+/// A row of the sidebar's Agents view: the tree's machine and session headers and notices, and under each session
+/// its agents in place of its workspaces.
+#[derive(Clone, Debug)]
+pub(super) enum ViewRow {
+    Tree(TreeRow),
+    /// The session's agents, in the sort's order within it.
+    Agents(Vec<AgentEntry>),
+    /// A session with no agent to list, and why.
+    Empty(&'static str),
+}
+
+/// The Agents view's rows from the tree's (`rows`, a folded session's already without its workspaces): each session's
+/// workspaces give way to its agents (`sessions`, as the Agents section reads them), sorted by `sort` within it, those
+/// that need you alone when `attention`. An unreachable session's are its last snapshot's, as its workspaces are.
+pub(super) fn agents_view(rows: Vec<TreeRow>, sessions: &[SessionAgents], sort: AgentSort, attention: bool, now: Instant) -> Vec<ViewRow> {
+    rows.into_iter()
+        .map(|row| {
+            let TreeRow::Workspaces { key } = row else { return ViewRow::Tree(row) };
+            let Some(n) = sessions.iter().position(|s| s.key == key) else { return ViewRow::Empty("No agents") };
+            let (mut entries, any) = cross_agents(&sessions[n..=n], sort, attention, now);
+            // their place in the whole list keeps the rows' ids apart: pane ids repeat across sessions
+            for e in &mut entries {
+                e.n = n;
+            }
+            match (entries.is_empty(), any) {
+                (false, _) => ViewRow::Agents(entries),
+                (true, true) => ViewRow::Empty("Nothing needs you"),
+                (true, false) => ViewRow::Empty("No agents"),
+            }
+        })
+        .collect()
+}
+
+/// Whether a row of the Agents view gets a divider over it, as [`divider_above`] has it for the tree.
+pub(super) fn view_divider_above(rows: &[ViewRow], i: usize) -> bool {
+    let header = |r: &ViewRow| matches!(r, ViewRow::Tree(TreeRow::Session { .. } | TreeRow::Machine { .. }));
+    i > 0 && header(&rows[i]) && !matches!(rows[i - 1], ViewRow::Tree(TreeRow::Machine { .. }))
+}
+
 /// Folds the session `key` when it is open, opens it when it is folded.
 pub(super) fn toggle_in(collapsed: &mut Vec<String>, key: &str) {
     match collapsed.iter().position(|k| k == key) {
@@ -528,6 +574,11 @@ impl Shell {
         }
     }
 
+    /// [`waiting_everywhere`] now: the Dock's count and the Agents toggle's.
+    pub(super) fn waiting_everywhere(&self) -> usize {
+        waiting_everywhere(self.snapshot.as_ref(), &self.watchers)
+    }
+
     /// The Agents section's entries from every session: the shown one's live snapshot, the others' from their
     /// watchers; and whether any session has an agent at all.
     pub(super) fn agents_everywhere(&self, attention: bool, cx: &App) -> (Vec<AgentEntry>, bool) {
@@ -593,10 +644,10 @@ impl Shell {
             let edge = line.filter(|(at, _)| *at == i).map(|(_, edge)| edge);
             let start = out.len();
             match row.clone() {
-                TreeRow::Machine { id, label, status, enabled } => out.push(self.machine_row(theme, id, label, status, enabled, cx)),
+                TreeRow::Machine { id, label, status, enabled } => out.push(self.machine_row(theme, id, label, status, enabled, true, cx)),
                 TreeRow::Session { key, collapsed, waiting, status } => {
                     if let Some(place) = self.places.iter().find(|p| SessionKey::of(p) == key).cloned() {
-                        out.push(self.session_row(theme, place, key, collapsed, waiting, status, cx));
+                        out.push(self.session_row(theme, place, key, collapsed, waiting, status, true, cx));
                     }
                 }
                 TreeRow::Notice { key, text, action } => out.push(self.notice_row(theme, key, text, action, cx)),
@@ -635,8 +686,54 @@ impl Shell {
         (out, listed)
     }
 
-    /// A machine's header: its icon, its name in small caps, a dot for whether it answers, and ⋯ on hover.
-    fn machine_row(&self, theme: &Theme, id: String, label: String, status: Status, enabled: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// The Agents view's elements, uherdr's: the tree's machine and session headers with their ●N (a click on a
+    /// session's folds it, in the tree too: one fold per session) and notices, each session's agents under it in
+    /// place of its workspaces, nothing to drag; and whether it lists sessions, as [`Self::tree_rows`] says.
+    pub(super) fn agents_view_rows(&self, theme: &Theme, shown_tab: Option<&str>, cx: &mut Context<Self>) -> (Vec<gpui::AnyElement>, bool) {
+        let (rows, _) = self.tree_model(cx);
+        let listed = rows.iter().any(|r| matches!(r, TreeRow::Session { .. }));
+        let settings = &SettingsGlobal::of(cx).settings;
+        let (attention, compact) = (settings.attention_agents, settings.compact_agents);
+        let rows = agents_view(rows, &self.session_agents(cx), self.agent_sort, attention, Instant::now());
+        // indented under their session's header, a faint guide down their left, as its workspaces are in the tree
+        let under = |children: Vec<gpui::AnyElement>| {
+            div().flex_none().flex().flex_col().gap(px(2.)).ml(px(15.)).pl(px(5.)).border_l_1().border_color(theme.border.opacity(0.6)).children(children).into_any_element()
+        };
+        let mut out = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            if view_divider_above(&rows, i) {
+                out.push(div().flex_none().mx(px(6.)).mt(px(6.)).mb(px(4.)).h(px(1.)).bg(theme.border.opacity(0.6)).into_any_element());
+            }
+            match row.clone() {
+                ViewRow::Tree(TreeRow::Machine { id, label, status, enabled }) => out.push(self.machine_row(theme, id, label, status, enabled, false, cx)),
+                ViewRow::Tree(TreeRow::Session { key, collapsed, waiting, status }) => {
+                    if let Some(place) = self.places.iter().find(|p| SessionKey::of(p) == key).cloned() {
+                        out.push(self.session_row(theme, place, key, collapsed, waiting, status, false, cx));
+                    }
+                }
+                ViewRow::Tree(TreeRow::Notice { key, text, action }) => out.push(self.notice_row(theme, key, text, action, cx)),
+                ViewRow::Tree(TreeRow::Workspaces { .. }) => {}
+                ViewRow::Agents(entries) => {
+                    let agents = super::sidebar::agent_rows(entries, self.agent_sort, compact, shown_tab, theme, |row, e| {
+                        let (key, tab, pane) = (e.key.clone(), e.pane.tab_id.clone(), e.pane.pane_id.clone());
+                        let goal = Goal::Pane { tab, pane };
+                        row.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.go_to(key.clone(), goal.clone(), cx)))
+                    });
+                    out.push(if listed { under(agents) } else { div().flex_none().flex().flex_col().gap(px(2.)).children(agents).into_any_element() });
+                }
+                ViewRow::Empty(text) => {
+                    let line = div().flex_none().px(px(8.)).py(px(6.)).text_size(px(11.)).text_color(theme.text_faint).child(text).into_any_element();
+                    out.push(if listed { under(vec![line]) } else { line });
+                }
+            }
+        }
+        (out, listed)
+    }
+
+    /// A machine's header: its icon, its name in small caps, a dot for whether it answers, and ⋯ on hover. `drags`:
+    /// it is dragged and dropped on (the tree; the Agents view has no drags).
+    #[allow(clippy::too_many_arguments)]
+    fn machine_row(&self, theme: &Theme, id: String, label: String, status: Status, enabled: bool, drags: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         let hover_bg = theme.hover;
         let menu_id = id.clone();
         let group = SharedString::from(format!("tree-machine-group-{id}"));
@@ -652,7 +749,7 @@ impl Shell {
         // an SSH machine's group moves among the others; this computer's stays first
         let mut targets: Vec<&str> = self.places.iter().map(machine_of).filter(|m| *m != LOCAL).collect();
         targets.dedup();
-        let movable = enabled && id != LOCAL && targets.len() > 1;
+        let movable = drags && enabled && id != LOCAL && targets.len() > 1;
         let dragged = DraggedTreeItem { from: SessionKey::default(), item: Item::Machine(id.clone()), label: label.clone(), theme: theme.clone() };
         let over = id.clone();
         div()
@@ -670,7 +767,7 @@ impl Shell {
             .child(gpui::svg().path(icon).size(px(13.)).flex_none().text_color(ink))
             .child(div().flex_1().min_w_0().truncate().child(if enabled { label.to_uppercase() } else { format!("{} · OFF", label.to_uppercase()) }))
             .when(movable, |el| el.on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone())))
-            .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<DraggedTreeItem>, _, cx| this.tree_drag_over(Over::Machine(over.clone()), e, cx)))
+            .when(drags, |el| el.on_drag_move(cx.listener(move |this, e: &DragMoveEvent<DraggedTreeItem>, _, cx| this.tree_drag_over(Over::Machine(over.clone()), e, cx))))
             .child(div().size(px(6.)).flex_none().rounded_full().bg(dot))
             .child(
                 div()
@@ -693,8 +790,9 @@ impl Shell {
             .into_any_element()
     }
 
+    /// A session's header; `drags` as [`Self::machine_row`]'s.
     #[allow(clippy::too_many_arguments)]
-    fn session_row(&self, theme: &Theme, place: Place, key: SessionKey, collapsed: bool, waiting: usize, status: Status, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn session_row(&self, theme: &Theme, place: Place, key: SessionKey, collapsed: bool, waiting: usize, status: Status, drags: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         let idx = self.watchers.index_of(&key).unwrap_or(0);
         let hover_bg = theme.hover;
         let stale = self.watchers.get(&key).is_some_and(|w| w.stale(Instant::now()));
@@ -733,7 +831,7 @@ impl Shell {
         });
         let toggle_key = key.clone();
         // a session moves among its machine's others
-        let movable = self.places.iter().filter(|p| machine_of(p) == machine_of(&place)).count() > 1;
+        let movable = drags && self.places.iter().filter(|p| machine_of(p) == machine_of(&place)).count() > 1;
         let dragged = DraggedTreeItem { from: key.clone(), item: Item::Session(key.clone()), label: name.clone(), theme: theme.clone() };
         let over = key.clone();
         let chevron = fold_chevron(theme, &format!("session-{idx}"), !collapsed, 1., None);
@@ -774,7 +872,7 @@ impl Shell {
             .child(more)
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_collapsed(&toggle_key, cx)))
             .when(movable, |el| el.on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone())))
-            .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<DraggedTreeItem>, _, cx| this.tree_drag_over(Over::Session(over.clone()), e, cx)))
+            .when(drags, |el| el.on_drag_move(cx.listener(move |this, e: &DragMoveEvent<DraggedTreeItem>, _, cx| this.tree_drag_over(Over::Session(over.clone()), e, cx))))
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, _, cx| this.open_place_menu(right_place.clone(), e.position, cx)))
             .into_any_element()
     }
@@ -1425,6 +1523,82 @@ mod tests {
             })
             .collect();
         assert_eq!(counts, [("/tmp/default.sock".to_string(), 1), ("/tmp/menqal.sock".to_string(), 2), ("machine:a".to_string(), 1)]);
+    }
+
+    fn view_kinds(rows: &[ViewRow]) -> Vec<String> {
+        rows.iter()
+            .map(|r| match r {
+                ViewRow::Tree(TreeRow::Workspaces { key }) => format!("W {}", key.0),
+                ViewRow::Tree(t) => kinds(std::slice::from_ref(t)).remove(0),
+                ViewRow::Agents(e) => format!("A {}", e.iter().map(|e| e.pane.pane_id.as_str()).collect::<Vec<_>>().join(",")),
+                ViewRow::Empty(text) => format!("E {text}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_agents_view_lists_each_session_s_agents_under_its_header() {
+        let (places, w) = counted();
+        let shown = agents_snapshot(&[("p2", "working"), ("p1", "blocked")]);
+        let since = crate::model::Since::new();
+        fn listed<'a>(shown: &'a Snapshot, w: &'a Watchers, since: &'a crate::model::Since) -> Vec<SessionAgents<'a>> {
+            let m = SessionKey("machine:a".into());
+            vec![
+                SessionAgents { key: key("default"), name: "default".into(), shown: true, snapshot: shown, since },
+                SessionAgents { key: key("menqal"), name: "menqal".into(), shown: false, snapshot: w.snapshot(&key("menqal")).unwrap(), since },
+                SessionAgents { key: m.clone(), name: "a".into(), shown: false, snapshot: w.snapshot(&m).unwrap(), since },
+            ]
+        }
+        let sessions = |shown| listed(shown, &w, &since);
+        let now = Instant::now();
+        let rows = |collapsed: &HashSet<String>| tree(&places, &w, collapsed, Some(&shown));
+        let view = agents_view(rows(&HashSet::new()), &sessions(&shown), AgentSort::Status, false, now);
+        assert_eq!(
+            view_kinds(&view),
+            [
+                "M This computer",
+                "S /tmp/default.sock",
+                "A p1,p2",
+                "S /tmp/menqal.sock",
+                "A q1,q2,q3",
+                "M you@box",
+                "S machine:a",
+                "N Can't reach host",
+                "A p1",
+            ],
+            "the sort within each session; one out of reach from its last snapshot"
+        );
+        // each row's session's place in the list, so the rows' ids stay apart
+        let ns: Vec<usize> = view.iter().filter_map(|r| if let ViewRow::Agents(e) = r { Some(e[0].n) } else { None }).collect();
+        assert_eq!(ns, [0, 1, 2]);
+        assert!(matches!(&view[3], ViewRow::Tree(TreeRow::Session { waiting: 2, .. })), "the header keeps its ●N");
+        let dividers: Vec<usize> = (0..view.len()).filter(|i| view_divider_above(&view, *i)).collect();
+        assert_eq!(dividers, [3, 5], "between session groups, not under a machine's header");
+
+        // a folded session keeps its header alone, as in the tree
+        let folded: HashSet<String> = ["/tmp/menqal.sock".to_string()].into();
+        let view = agents_view(rows(&folded), &sessions(&shown), AgentSort::Status, false, now);
+        assert_eq!(view_kinds(&view)[3..5], ["S /tmp/menqal.sock", "M you@box"]);
+
+        // those that need you alone: a session with none says so
+        let working = agents_snapshot(&[("p2", "working")]);
+        let view = agents_view(tree(&places, &w, &HashSet::new(), Some(&working)), &sessions(&working), AgentSort::Status, true, now);
+        assert_eq!(view_kinds(&view)[2..5], ["E Nothing needs you", "S /tmp/menqal.sock", "A q1,q2"]);
+
+        // one session alone: no header, its agents straight away; none read yet says there are none
+        let one = vec![TreeRow::Workspaces { key: key("default") }];
+        assert_eq!(view_kinds(&agents_view(one.clone(), &sessions(&shown)[..1], AgentSort::Status, false, now)), ["A p1,p2"]);
+        assert_eq!(view_kinds(&agents_view(one, &[], AgentSort::Status, false, now)), ["E No agents"]);
+    }
+
+    #[test]
+    fn the_toggle_and_the_dock_count_every_session_but_those_out_of_reach() {
+        let (_, w) = counted();
+        let shown = agents_snapshot(&[("p1", "blocked"), ("p2", "working")]);
+        assert_eq!(waiting_everywhere(Some(&shown), &w), 3, "the shown one's 1 and menqal's 2, not the machine's last 1");
+        assert_eq!(waiting_everywhere(None, &w), 2);
+        // the tree's ●N still counts the one out of reach
+        assert_eq!(session_waiting(&w, &SessionKey("machine:a".into()), Some(&shown)), 1);
     }
 
     #[test]

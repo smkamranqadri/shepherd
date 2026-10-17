@@ -238,6 +238,7 @@ fn action_icon(name: &str) -> &'static str {
         "ToggleSessionCollapsed" => "icons/alt-arrow-down.svg",
         "NextNeedsYou" => "icons/bell.svg",
         "ToggleSidebar" => "icons/sidebar-minimalistic-left.svg",
+        "ToggleAgentsView" => "icons/bot.svg",
         "ToggleReview" => "icons/sidebar-minimalistic-right.svg",
         "ShowFiles" => "icons/folder.svg",
         "ShowChanges" => "icons/git-branch.svg",

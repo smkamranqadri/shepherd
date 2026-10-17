@@ -57,6 +57,7 @@ app_actions! {
     Workspace8: "Go to workspace 8",
     Workspace9: "Go to workspace 9",
     ToggleSidebar: "Toggle sidebar",
+    ToggleAgentsView: "Sidebar: workspaces or agents",
     ToggleReview: "Toggle right panel",
     ShowFiles: "Files",
     ShowChanges: "Changes",
@@ -1207,6 +1208,13 @@ mod tests {
         assert!(fired(&from_xkb("/", false, None)).is_empty(), "Ctrl+/ goes to the pane");
         // Ctrl+Shift+1 arrives the same way, as ctrl-!
         assert_eq!(from_xkb("!", true, Some("!")).unparse(), "ctrl-!");
+    }
+
+    #[test]
+    fn the_sidebar_s_view_toggle_has_no_default_chord() {
+        assert!(known("ToggleAgentsView"));
+        assert!(!DEFAULTS.iter().any(|(a, _)| *a == "ToggleAgentsView"));
+        assert_eq!(chord(&effective(&user(&[])), "ToggleAgentsView"), None);
     }
 
     #[test]

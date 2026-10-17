@@ -8,7 +8,7 @@ use crate::ui::divider::{Throttle, drag_ratio};
 use gpui_base::input::{Input, InputEvent, InputState};
 use crate::model::{AgentSort, AgentStatus, PaneFrame, Snapshot, SplitFrame, attachable};
 use crate::terminal::PaneTerminal;
-use crate::settings::{SIDEBAR_MAX, SIDEBAR_MIN, SIDEBAR_WIDTH, SettingsGlobal, WindowFrame};
+use crate::settings::{SIDEBAR_MAX, SIDEBAR_MIN, SIDEBAR_WIDTH, SettingsGlobal, SidebarView, WindowFrame};
 use crate::theme::Theme;
 use gpui::{
     linear_color_stop, linear_gradient, AnimationExt, App, Bounds, ClickEvent, Context, Div, Entity, Focusable, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
@@ -246,6 +246,8 @@ pub struct Shell {
     /// The status bar's right-click menu of its labels, where it was clicked.
     statusbar_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
     agents_scroll: gpui::ScrollHandle,
+    /// The sidebar's Agents view's scroll.
+    agents_view_scroll: gpui::ScrollHandle,
     tab_bar: tab_bar::TabBar,
     /// Holds keyboard focus when no pane can (renames ended, a tab of only Shepherd's own pane), so the app's
     /// actions still dispatch.
@@ -628,6 +630,7 @@ impl Shell {
                     remove_confirm: None,
                     pending_worktrees: Vec::new(),
                     agents_scroll: gpui::ScrollHandle::new(),
+                    agents_view_scroll: gpui::ScrollHandle::new(),
                     tab_bar: Default::default(),
                     focus: cx.focus_handle(),
                     confirm_focus: cx.focus_handle(),
@@ -995,7 +998,8 @@ impl Shell {
     /// The Dock count: every agent waiting or finished, in the session shown and in every other one its watcher
     /// keeps, so a switch of session leaves it as it is. Agents in the tab in view count too: they still wait.
     fn sync_badge(&mut self, cx: &App) {
-        let count = if SettingsGlobal::of(cx).settings.dock_badge { attention::badge(self.snapshot.iter().chain(self.watchers.snapshots())) } else { 0 };
+        // ponytail: the sidebar's Agents toggle counts with the same rule (`waiting_everywhere`)
+        let count = if SettingsGlobal::of(cx).settings.dock_badge { self.waiting_everywhere() } else { 0 };
         if count != self.badge {
             self.badge = count;
             crate::notify::set_badge(count);
@@ -1821,6 +1825,7 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &Workspace8, _, cx| this.go_to_workspace(7, cx)))
             .on_action(cx.listener(|this, _: &Workspace9, _, cx| this.go_to_workspace(8, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &ToggleAgentsView, _, cx| this.toggle_agents_view(cx)))
             .on_action(cx.listener(|this, _: &ToggleReview, w, cx| this.toggle_review(w, cx)))
             .on_action(cx.listener(|this, _: &ShowFiles, w, cx| this.show_panel_tab(crate::settings::PanelTab::Files, w, cx)))
             .on_action(cx.listener(|this, _: &ShowChanges, w, cx| this.show_panel_tab(crate::settings::PanelTab::Changes, w, cx)))

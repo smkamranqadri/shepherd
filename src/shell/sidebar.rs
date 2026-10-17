@@ -178,6 +178,78 @@ impl Shell {
         cx.notify();
     }
 
+    /// The sidebar's view, Workspaces or Agents, kept in the settings. A drop being aimed in the tree goes: its rows
+    /// are not there to take it in the Agents view.
+    pub(super) fn set_sidebar_view(&mut self, view: SidebarView, cx: &mut Context<Self>) {
+        self.tree.drop = None;
+        save_from_sidebar(cx, |s| s.sidebar_view = view);
+        cx.notify();
+    }
+
+    /// The ToggleAgentsView action: the other view, while the toggle shows (the Agents section is on).
+    pub(super) fn toggle_agents_view(&mut self, cx: &mut Context<Self>) {
+        let settings = &SettingsGlobal::of(cx).settings;
+        if !settings.show_agents {
+            return;
+        }
+        let next = if settings.sidebar_view == SidebarView::Agents { SidebarView::Workspaces } else { SidebarView::Agents };
+        self.set_sidebar_view(next, cx);
+    }
+
+    /// The agents' `…`: their sort and filter menu, opened under it, or closed when it is open.
+    fn agents_sort_button(&self, theme: &Theme, id: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
+        icon_button(theme, id, "")
+            .tooltip(tip("Sort agents", None))
+            .size(px(20.))
+            .child(gpui::svg().path("icons/more-horizontal.svg").size(px(14.)).text_color(theme.text_faint))
+            .when(self.agents_menu.as_ref().is_some_and(|m| m.is_open()), |el| el.bg(theme.hover))
+            // capture, like the sidebar's `…`: a press on the open menu's trigger closes it
+            .capture_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                match this.agents_menu.as_mut() {
+                    Some(menu) if menu.is_open() => menu.close(),
+                    _ => this.agents_menu = Some(crate::ui::Popup::new(e.position)),
+                }
+                cx.notify();
+            }))
+    }
+
+    /// The toggle at the sidebar's top, uherdr's: Workspaces | Agents with ●N of the agents waiting everywhere (the
+    /// Dock's count), two equal segments drawn as the right panel's tabs; in the Agents view, its sort menu beside.
+    fn view_toggle(&self, theme: &Theme, agents: bool, n: usize, cx: &mut Context<Self>) -> Div {
+        let hover = theme.hover;
+        let segment = |id: &'static str, label: &'static str, on: bool, view: SidebarView| {
+            div()
+                .id(id)
+                .flex_1()
+                .min_w_0()
+                .h(px(26.))
+                .px(px(6.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(5.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .text_size(px(12.))
+                .text_color(if on { theme.text } else { theme.text_muted })
+                .when(on, |el| el.bg(theme.selected).font_weight(gpui::FontWeight::MEDIUM))
+                .when(!on, |el| el.hover(move |s| s.bg(hover)))
+                .child(div().min_w_0().truncate().child(label))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_sidebar_view(view, cx)))
+        };
+        div()
+            .flex_none()
+            .px(px(8.))
+            .pb(px(6.))
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .child(segment("sidebar-view-workspaces", "Workspaces", !agents, SidebarView::Workspaces))
+            .child(segment("sidebar-view-agents", "Agents", agents, SidebarView::Agents).when(n > 0, |el| el.child(waiting_pill(theme, n))))
+            .when(agents, |el| el.child(self.agents_sort_button(theme, "agents-view-sort", cx)))
+    }
+
     /// Brings the agent's tab up and its pane to the keyboard.
     pub(super) fn show_agent(&mut self, tab_id: String, pane_id: String, cx: &mut Context<Self>) {
         self.show_herdr_tab(Some(tab_id), true, cx);
@@ -503,8 +575,46 @@ impl Shell {
         let active = window.is_window_active();
 
         let strip = update_strip(theme, cx);
+        // a drag's line and drops herdr carried out are tidied whichever view shows
         self.tidy_tree_drag(cx);
-        let (tree, listed) = self.tree_rows(theme, snapshot, shown_ws, active, cx);
+        let settings = &SettingsGlobal::of(cx).settings;
+        let layout = sidebar_layout(settings.sidebar_view, settings.show_agents, any_agents);
+        let (body, listed) = if layout.tree {
+            let (tree, listed) = self.tree_rows(theme, snapshot, shown_ws, active, cx);
+            let body = div()
+                .id("workspaces")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .track_scroll(&self.tree.scroll)
+                // a row dragged in the tree: its rows find where it lands, a release anywhere on it drops it
+                .on_drag_move(cx.listener(|this, e: &gpui::DragMoveEvent<tree_drag::DraggedTreeItem>, _, cx| this.tree_drag_left(e, cx)))
+                .on_drop(cx.listener(|this, d: &tree_drag::DraggedTreeItem, window, cx| this.drop_tree_item(d, window.mouse_position(), cx)))
+                .px(px(8.))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .children(tree);
+            (body, listed)
+        } else {
+            // every session's agents under its header, the whole height: no drags here
+            let (rows, listed) = self.agents_view_rows(theme, shown_tab.as_deref(), cx);
+            let body = div()
+                .id("agents-view")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .track_scroll(&self.agents_view_scroll)
+                .px(px(8.))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .children(rows)
+                // the last row scrolls clear of the sidebar's foot
+                .child(div().flex_none().h(px(4.)));
+            (body, listed)
+        };
+        let toggle = layout.toggle.then(|| self.view_toggle(theme, layout.agents_view, self.waiting_everywhere(), cx));
         let waiting = self.error.is_none() && self.connecting.is_some_and(|at| crate::ui::loader::due(at, window));
         // Laid out at full width and clipped by its tweened box, so rows never reflow mid slide.
         div()
@@ -536,6 +646,7 @@ impl Shell {
                     // the place's own snapshot hasn't come yet: the list is its last, or none
                     .when(waiting, |el| el.child(crate::ui::loader::mini_spinner(2., theme.text_faint, window))),
             )
+            .children(toggle)
             .child(
                 div()
                     .relative()
@@ -544,24 +655,10 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .overflow_hidden()
-                    .child(
-                div()
-                    .id("workspaces")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.tree.scroll)
-                    // a row dragged in the tree: its rows find where it lands, a release anywhere on it drops it
-                    .on_drag_move(cx.listener(|this, e: &gpui::DragMoveEvent<tree_drag::DraggedTreeItem>, _, cx| this.tree_drag_left(e, cx)))
-                    .on_drop(cx.listener(|this, d: &tree_drag::DraggedTreeItem, window, cx| this.drop_tree_item(d, window.mouse_position(), cx)))
-                    .px(px(8.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.))
-                    .children(tree)
-            ),
+                    .child(body),
             )
-            .when(SettingsGlobal::of(cx).settings.show_agents && any_agents, |el| {
+            // in the Agents view the section hides, its fold and height kept for when Workspaces shows again
+            .when(layout.bottom, |el| {
                 let seam = theme.accent;
                 let dragging = self.agents_drag.is_some();
                 let collapsed = self.agents_collapsed;
@@ -595,23 +692,7 @@ impl Shell {
                                 .child(fold_chevron(theme, "agents", !collapsed, 1., None))
                                 .child("Agents"),
                         )
-                        .child(
-                            icon_button(theme, "agents-view", "")
-                                .tooltip(tip("Sort agents", None))
-                                .size(px(20.))
-                                .my(px(-4.))
-                                .child(gpui::svg().path("icons/more-horizontal.svg").size(px(14.)).text_color(theme.text_faint))
-                                .when(self.agents_menu.as_ref().is_some_and(|m| m.is_open()), |el| el.bg(theme.hover))
-                                // capture, like the sidebar's `…`: a press on the open menu's trigger closes it
-                                .capture_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, _, cx| {
-                                    cx.stop_propagation();
-                                    match this.agents_menu.as_mut() {
-                                        Some(menu) if menu.is_open() => menu.close(),
-                                        _ => this.agents_menu = Some(crate::ui::Popup::new(e.position)),
-                                    }
-                                    cx.notify();
-                                })),
-                        )
+                        .child(self.agents_sort_button(theme, "agents-view", cx).my(px(-4.)))
                         // The section's top edge: drag to resize the list, double-click for the default height. Folded,
                         // there is no list to size, so the edge is only its resting line.
                         .when(!collapsed, |el| el.child(
@@ -810,6 +891,23 @@ pub(super) fn agent_rows(
         .collect()
 }
 
+/// What the sidebar shows: the view toggle whenever the Agents section is on; the tree, or in the Agents view every
+/// session's agents in its place; and the Agents section at the foot only beside the tree, while any agent runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Layout {
+    pub toggle: bool,
+    pub tree: bool,
+    pub agents_view: bool,
+    pub bottom: bool,
+}
+
+/// The sidebar's [`Layout`] for its saved view: with the Agents section off it is Workspaces, the view saved left as
+/// it is for when the section comes back.
+pub(super) fn sidebar_layout(view: SidebarView, show_agents: bool, any_agents: bool) -> Layout {
+    let agents_view = show_agents && view == SidebarView::Agents;
+    Layout { toggle: show_agents, tree: !agents_view, agents_view, bottom: show_agents && any_agents && !agents_view }
+}
+
 /// The window's left edge brings the hidden sidebar out floating: only with it hidden all the way (not mid-fold),
 /// off a Settings page, and with the peek on in Settings.
 pub(super) fn peeks(sidebar_open: bool, sidebar_w: f32, on_page: bool, peek_on: bool) -> bool {
@@ -823,7 +921,26 @@ pub(super) fn hover_shows(peek_on: bool, on: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{hover_shows, peeks};
+    use super::{Layout, hover_shows, peeks, sidebar_layout};
+    use crate::settings::SidebarView;
+
+    #[test]
+    fn the_agents_view_takes_the_tree_s_place_and_hides_the_section() {
+        let layout = |toggle, tree, bottom| Layout { toggle, tree, agents_view: !tree, bottom };
+        for (view, show, any, want) in [
+            (SidebarView::Workspaces, true, true, layout(true, true, true)),
+            (SidebarView::Workspaces, true, false, layout(true, true, false)),
+            (SidebarView::Workspaces, false, true, layout(false, true, false)),
+            (SidebarView::Workspaces, false, false, layout(false, true, false)),
+            (SidebarView::Agents, true, true, layout(true, false, false)),
+            (SidebarView::Agents, true, false, layout(true, false, false)),
+            // the section off: Workspaces, whatever was saved
+            (SidebarView::Agents, false, true, layout(false, true, false)),
+            (SidebarView::Agents, false, false, layout(false, true, false)),
+        ] {
+            assert_eq!(sidebar_layout(view, show, any), want, "{view:?} show_agents {show} any {any}");
+        }
+    }
 
     #[test]
     fn with_the_peek_off_a_hover_holds_nothing_out() {

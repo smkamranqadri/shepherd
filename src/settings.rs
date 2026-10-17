@@ -77,6 +77,9 @@ pub struct Settings {
     pub agents_height: Option<f32>,
     /// The Agents section folded to its header at the sidebar's foot; a click on the header opens it again.
     pub agents_collapsed: bool,
+    /// The left sidebar's view: the workspaces tree, or every session's agents under its header. The Agents section's
+    /// fold and height are kept apart, so going back to Workspaces brings it back as it was.
+    pub sidebar_view: SidebarView,
     /// What the command panel ran last, newest first: an action's name, `workspace:<id>` or `tab:<id>`.
     pub recent_commands: Vec<String>,
     /// A macOS notification when an agent out of sight starts waiting or finishes.
@@ -118,6 +121,18 @@ pub struct Settings {
     pub machine_order: Vec<String>,
     /// Where the window was last; `None` opens it centered.
     pub window: Option<WindowFrame>,
+}
+
+/// The left sidebar's views, the toggle at its top. An unknown (future) value reads as Workspaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SidebarView {
+    /// Every session's agents under its machine's and its own header, as the tree heads its workspaces.
+    Agents,
+    // last: serde's catch-all must be
+    #[default]
+    #[serde(other)]
+    Workspaces,
 }
 
 /// The right panel's tabs. An unknown (future) value reads as Files.
@@ -326,6 +341,7 @@ impl Default for Settings {
             attention_agents: false,
             agents_height: None,
             agents_collapsed: false,
+            sidebar_view: SidebarView::default(),
             recent_commands: Vec::new(),
             notify_agents: true,
             notify_sound: true,
@@ -515,6 +531,21 @@ mod tests {
         let folded: Settings = serde_json::from_str(r#"{"agents_collapsed": true, "agents_height": 180}"#).unwrap();
         assert!(folded.agents_collapsed);
         assert_eq!(folded.agents_height, Some(180.), "the height it opens again at is kept");
+    }
+
+    #[test]
+    fn the_sidebar_opens_on_its_workspaces_unless_agents_was_left() {
+        let old: Settings = serde_json::from_str(r#"{"agents_collapsed": true}"#).unwrap();
+        assert_eq!(old.sidebar_view, SidebarView::Workspaces, "a file from before the toggle");
+        assert_eq!(Settings::default().sidebar_view, SidebarView::Workspaces);
+        let agents = Settings { sidebar_view: SidebarView::Agents, ..Settings::default() };
+        let text = serde_json::to_string(&agents).unwrap();
+        assert!(text.contains(r#""sidebar_view":"agents""#), "{text}");
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.sidebar_view, SidebarView::Agents);
+        assert!(back.agents_collapsed == agents.agents_collapsed && back.agents_height == agents.agents_height, "the section's own fold and height apart");
+        let future: Settings = serde_json::from_str(r#"{"sidebar_view": "files"}"#).unwrap();
+        assert_eq!(future.sidebar_view, SidebarView::Workspaces);
     }
 
     fn tmp() -> (tempfile::TempDir, std::path::PathBuf) {
