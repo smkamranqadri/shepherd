@@ -295,7 +295,8 @@ impl Shell {
                 let again = s.watchers.listed(Instant::now());
                 if let Ok((sessions, machines)) = listed {
                     let machines_known = machines.is_some();
-                    let (places, disabled) = sidebar_tree::tree_order(sessions, machines.unwrap_or_default());
+                    let settings = &SettingsGlobal::of(cx).settings;
+                    let (places, disabled) = sidebar_tree::tree_order(sessions, machines.unwrap_or_default(), &settings.session_order, &settings.machine_order);
                     let changed = places != s.places || disabled != s.watchers.disabled;
                     s.places = places;
                     s.watchers.disabled = disabled;

@@ -40,6 +40,7 @@ mod sync;
 mod file_tabs;
 mod hints;
 mod tab_bar;
+mod tree_drag;
 pub(crate) mod widgets;
 mod workspaces;
 use motion::*;

@@ -9,7 +9,9 @@ use super::watchers::{Kind, SessionKey, Status, Watchers};
 use super::*;
 use crate::files::roots::root_key;
 use crate::herdr::{Machine, SessionInfo};
+use gpui::DragMoveEvent;
 use std::collections::HashSet;
+use tree_drag::{DraggedTreeItem, Item, Over};
 
 /// How long another session's branch, read from its HEAD, is kept before it is read again.
 const HEAD_TTL: Duration = Duration::from_secs(60);
@@ -42,7 +44,7 @@ pub(super) fn head_branch(dir: &std::path::Path) -> Option<String> {
 }
 
 /// The machine id the tree gives this computer's sessions.
-const LOCAL: &str = "local";
+pub(super) const LOCAL: &str = "local";
 
 /// How long a goal waits for the session switched to (a stopped one being started) to list its workspace.
 const GOAL_EXPIRY: Duration = Duration::from_secs(15);
@@ -92,6 +94,12 @@ pub(super) struct TreeState {
     add_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
     /// Bare folded ids (an older Shepherd's) were moved under the shown session's key.
     folds_migrated: bool,
+    /// Where a row being dragged would land.
+    pub(super) drop: Option<tree_drag::TreeDrop>,
+    /// The tree's view while a row is dragged: rows scrolled out of it don't take a drop.
+    pub(super) view: Option<Bounds<Pixels>>,
+    /// Each session's drop that herdr hasn't answered yet, shown meanwhile.
+    pub(super) pending: HashMap<SessionKey, tree_drag::Pending>,
 }
 
 impl TreeState {
@@ -118,7 +126,7 @@ impl TreeState {
 }
 
 /// The machine a place runs on: this computer, or its SSH target.
-fn machine_of(place: &Place) -> &str {
+pub(super) fn machine_of(place: &Place) -> &str {
     match place {
         Place::Session(_) => LOCAL,
         Place::Machine(m) => &m.target,
@@ -126,8 +134,9 @@ fn machine_of(place: &Place) -> &str {
 }
 
 /// herdr's sessions and machines in the tree's order: this computer's sessions first, its default one leading, then
-/// each SSH target's enabled machines together, in the order herdr lists them. The disabled machines go apart.
-pub(super) fn tree_order(mut sessions: Vec<SessionInfo>, machines: Vec<Machine>) -> (Vec<Place>, Vec<Machine>) {
+/// each SSH target's enabled machines together, in the order herdr lists them, unless dragged elsewhere
+/// (`session_order`, `machine_order`). The disabled machines go apart.
+pub(super) fn tree_order(mut sessions: Vec<SessionInfo>, machines: Vec<Machine>, session_order: &[String], machine_order: &[String]) -> (Vec<Place>, Vec<Machine>) {
     sessions.sort_by_key(|s| !s.default); // stable: herdr's order otherwise
     let (enabled, disabled): (Vec<Machine>, Vec<Machine>) = machines.into_iter().partition(|m| m.enabled);
     let mut targets: Vec<&str> = Vec::new();
@@ -137,7 +146,8 @@ pub(super) fn tree_order(mut sessions: Vec<SessionInfo>, machines: Vec<Machine>)
         }
     }
     let grouped: Vec<Place> = targets.iter().flat_map(|t| enabled.iter().filter(move |m| m.target == *t).cloned().map(Place::Machine)).collect();
-    (sessions.into_iter().map(Place::Session).chain(grouped).collect(), disabled)
+    let places = sessions.into_iter().map(Place::Session).chain(grouped).collect();
+    (tree_drag::order_places(places, session_order, machine_order), disabled)
 }
 
 /// Agents of the snapshot that wait for you or finished.
@@ -310,6 +320,30 @@ pub(super) fn workspace_order<'a>(rows: &[TreeRow], snaps: impl Fn(&SessionKey) 
     order
 }
 
+/// The row a session or machine drag's line is drawn on, and its side: over the row the line names, or under the
+/// last row of its group (a session's workspaces and notice, a machine's sessions).
+pub(super) fn line_row(rows: &[TreeRow], line: &tree_drag::Line) -> Option<(usize, tree_drag::Edge)> {
+    use tree_drag::{Edge, Line};
+    let session_of = |r: &TreeRow| match r {
+        TreeRow::Session { key, .. } | TreeRow::Workspaces { key } | TreeRow::Notice { key, .. } => Some(key.clone()),
+        TreeRow::Machine { .. } => None,
+    };
+    let (head, edge) = match line {
+        Line::Session(key, edge) => (rows.iter().position(|r| matches!(r, TreeRow::Session { key: k, .. } if k == key))?, *edge),
+        Line::Machine(id, edge) => (rows.iter().position(|r| matches!(r, TreeRow::Machine { id: m, .. } if m == id))?, *edge),
+        Line::Group(..) | Line::Kid(..) => return None,
+    };
+    if edge == Edge::Above {
+        return Some((head, edge));
+    }
+    let belongs = |r: &TreeRow| match line {
+        Line::Session(key, _) => session_of(r).as_ref() == Some(key),
+        _ => !matches!(r, TreeRow::Machine { .. }),
+    };
+    let last = head + rows[head + 1..].iter().take_while(|r| belongs(r)).count();
+    Some((last, edge))
+}
+
 /// Moves an older Shepherd's folded workspaces (bare ids) under the shown session's key; true when any moved.
 pub(super) fn migrate_folds(folded: &mut HashSet<String>, shown: &str) -> bool {
     let bare: Vec<String> = folded.iter().filter(|f| !f.contains('\n')).cloned().collect();
@@ -333,9 +367,12 @@ impl Shell {
         (rows, shown)
     }
 
-    /// The workspaces Workspace1–9 go to, in the tree's order.
+    /// The workspaces Workspace1–9 go to, in the tree's order (a drop herdr hasn't answered yet already counted).
     fn numbered_workspaces(&self, rows: &[TreeRow], shown: &SessionKey) -> Vec<(SessionKey, String)> {
-        workspace_order(rows, |k| if k == shown { self.snapshot.as_ref() } else { self.watchers.snapshot(k) }, &self.folded)
+        let snap = |k: &SessionKey| if k == shown { self.snapshot.as_ref() } else { self.watchers.snapshot(k) };
+        let pending: HashMap<SessionKey, Snapshot> =
+            self.tree.pending.keys().filter_map(|k| Some((k.clone(), self.pending_order(k, snap(k)?)?))).collect();
+        workspace_order(rows, |k| pending.get(k).or_else(|| snap(k)), &self.folded)
     }
 
     /// Workspace1–9: the `index`th workspace the tree shows, in whichever session.
@@ -464,11 +501,15 @@ impl Shell {
             (opacity, order.into_iter().zip(WORKSPACE_ACTIONS).filter_map(|((k, w), a)| Some((k, w, chord_of(cx, a)?))).collect())
         });
         let mut out = Vec::new();
+        // a session or machine drag's line: over its row, or under the last row of its group
+        let line = self.tree_line().and_then(|l| line_row(&rows, l));
         for (i, row) in rows.iter().enumerate() {
             // a divider and 8 px or more between session groups
             if divider_above(&rows, i) {
                 out.push(div().flex_none().mx(px(6.)).mt(px(6.)).mb(px(4.)).h(px(1.)).bg(theme.border.opacity(0.6)).into_any_element());
             }
+            let edge = line.filter(|(at, _)| *at == i).map(|(_, edge)| edge);
+            let start = out.len();
             match row.clone() {
                 TreeRow::Machine { id, label, status, enabled } => out.push(self.machine_row(theme, id, label, status, enabled, cx)),
                 TreeRow::Session { key, collapsed, waiting, status } => {
@@ -504,6 +545,10 @@ impl Shell {
                     }
                 }
             }
+            if let Some(edge) = edge.filter(|_| out.len() == start + 1) {
+                let el = out.pop().expect("one row pushed");
+                out.push(tree_drag::with_line(el, theme, Some(edge)));
+            }
         }
         (out, listed)
     }
@@ -522,6 +567,12 @@ impl Shell {
             _ => theme.success,
         };
         let icon = if id == LOCAL { "icons/monitor.svg" } else { "icons/remote-server.svg" };
+        // an SSH machine's group moves among the others; this computer's stays first
+        let mut targets: Vec<&str> = self.places.iter().map(machine_of).filter(|m| *m != LOCAL).collect();
+        targets.dedup();
+        let movable = enabled && id != LOCAL && targets.len() > 1;
+        let dragged = DraggedTreeItem { from: SessionKey::default(), item: Item::Machine(id.clone()), label: label.clone(), theme: theme.clone() };
+        let over = id.clone();
         div()
             .id(SharedString::from(format!("tree-machine-{id}")))
             .group(group.clone())
@@ -536,6 +587,8 @@ impl Shell {
             .text_color(ink)
             .child(gpui::svg().path(icon).size(px(13.)).flex_none().text_color(ink))
             .child(div().flex_1().min_w_0().truncate().child(if enabled { label.to_uppercase() } else { format!("{} · OFF", label.to_uppercase()) }))
+            .when(movable, |el| el.on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone())))
+            .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<DraggedTreeItem>, _, cx| this.tree_drag_over(Over::Machine(over.clone()), e, cx)))
             .child(div().size(px(6.)).flex_none().rounded_full().bg(dot))
             .child(
                 div()
@@ -609,6 +662,10 @@ impl Shell {
                 }))
         });
         let toggle_key = key.clone();
+        // a session moves among its machine's others
+        let movable = self.places.iter().filter(|p| machine_of(p) == machine_of(&place)).count() > 1;
+        let dragged = DraggedTreeItem { from: key.clone(), item: Item::Session(key.clone()), label: name.clone(), theme: theme.clone() };
+        let over = key.clone();
         let chevron = fold_chevron(theme, &format!("session-{idx}"), !collapsed, 1., None);
         let group = SharedString::from(format!("tree-session-group-{idx}"));
         let open = self.place_menu.as_ref().is_some_and(|m| m.is_open() && m.value.0.key() == place.key());
@@ -646,6 +703,8 @@ impl Shell {
             .child(div().size(px(6.)).flex_none().rounded_full().bg(dot))
             .child(more)
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_collapsed(&toggle_key, cx)))
+            .when(movable, |el| el.on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone())))
+            .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<DraggedTreeItem>, _, cx| this.tree_drag_over(Over::Session(over.clone()), e, cx)))
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, _, cx| this.open_place_menu(right_place.clone(), e.position, cx)))
             .into_any_element()
     }
@@ -1033,10 +1092,54 @@ mod tests {
         let (places, off) = tree_order(
             vec![info("menqal", true), info("default", true)],
             vec![machine("a", "you@box", true), machine("b", "you@other", true), machine("c", "you@box", true), machine("d", "you@gone", false)],
+            &[],
+            &[],
         );
         let keys: Vec<String> = places.iter().map(|p| p.key()).collect();
         assert_eq!(keys, ["/tmp/default.sock", "/tmp/menqal.sock", "machine:a", "machine:c", "machine:b"]);
         assert_eq!(off.len(), 1);
+    }
+
+    #[test]
+    fn dragged_orders_lead_with_this_computer_first() {
+        let machines = vec![machine("a", "you@box", true), machine("b", "you@other", true), machine("c", "you@box", true)];
+        let (places, _) = tree_order(vec![info("default", true), info("menqal", true)], machines, &["/tmp/menqal.sock".into(), "machine:c".into()], &["you@other".into()]);
+        let keys: Vec<String> = places.iter().map(|p| p.key()).collect();
+        assert_eq!(keys, ["/tmp/menqal.sock", "/tmp/default.sock", "machine:b", "machine:c", "machine:a"]);
+        // the machine rows, and the numbering across them, follow
+        let mut w = watched(&places, "menqal");
+        let now = Instant::now();
+        for k in ["machine:a", "machine:b", "machine:c"] {
+            w.set_client(&SessionKey(k.into()), Client::at("/tmp/x".into()));
+        }
+        w.due(now, super::super::watchers::Activity::Active);
+        for k in ["machine:a", "machine:b", "machine:c"] {
+            w.apply(&SessionKey(k.into()), Ok(snapshot(&[("w1", None)])), now);
+        }
+        let shown = snapshot(&[("w1", None)]);
+        let rows = tree(&places, &w, &HashSet::new(), Some(&shown));
+        let machine_rows: Vec<String> = kinds(&rows).into_iter().filter(|r| r.starts_with("M ")).collect();
+        assert_eq!(machine_rows, ["M This computer", "M you@other", "M you@box"]);
+        let snaps = |k: &SessionKey| if *k == key("menqal") { Some(&shown) } else { w.snapshot(k) };
+        let order: Vec<String> = workspace_order(&rows, snaps, &HashSet::new()).into_iter().map(|(k, _)| k.0).collect();
+        assert_eq!(order, ["/tmp/menqal.sock", "machine:b", "machine:c", "machine:a"]);
+    }
+
+    #[test]
+    fn a_drag_line_goes_over_its_row_or_under_its_group() {
+        use super::super::tree_drag::{Edge, Line};
+        let session = |n: &str| TreeRow::Session { key: key(n), collapsed: false, waiting: 0, status: Status::Live };
+        let machine = |id: &str| TreeRow::Machine { id: id.into(), label: id.into(), status: Status::Live, enabled: true };
+        let notice = TreeRow::Notice { key: key("b"), text: "Stopped".into(), action: None };
+        let rows = vec![machine(LOCAL), session("a"), TreeRow::Workspaces { key: key("a") }, session("b"), notice, machine("you@box"), session("c")];
+        assert_eq!(line_row(&rows, &Line::Session(key("a"), Edge::Above)), Some((1, Edge::Above)));
+        assert_eq!(line_row(&rows, &Line::Session(key("a"), Edge::Below)), Some((2, Edge::Below)), "under its workspaces");
+        assert_eq!(line_row(&rows, &Line::Session(key("b"), Edge::Below)), Some((4, Edge::Below)), "under its notice");
+        assert_eq!(line_row(&rows, &Line::Machine(LOCAL.into(), Edge::Below)), Some((4, Edge::Below)), "under its last session");
+        assert_eq!(line_row(&rows, &Line::Machine("you@box".into(), Edge::Below)), Some((6, Edge::Below)));
+        assert_eq!(line_row(&rows, &Line::Machine("you@box".into(), Edge::Above)), Some((5, Edge::Above)));
+        assert_eq!(line_row(&rows, &Line::Session(key("gone"), Edge::Above)), None);
+        assert_eq!(line_row(&rows, &Line::Group("w1".into(), Edge::Above)), None, "drawn by the workspace rows");
     }
 
     #[test]
@@ -1058,7 +1161,7 @@ mod tests {
 
     #[test]
     fn machines_get_rows_and_collapsed_sessions_hide_their_workspaces() {
-        let (places, off) = tree_order(vec![info("default", true), info("menqal", true)], vec![machine("a", "you@box", true), machine("d", "you@gone", false)]);
+        let (places, off) = tree_order(vec![info("default", true), info("menqal", true)], vec![machine("a", "you@box", true), machine("d", "you@gone", false)], &[], &[]);
         let mut w = watched(&places, "default");
         w.disabled = off;
         let collapsed: HashSet<String> = ["/tmp/default.sock".to_string()].into();
@@ -1070,7 +1173,7 @@ mod tests {
 
     #[test]
     fn an_unreachable_machine_says_so_and_keeps_its_last_workspaces() {
-        let (places, _) = tree_order(vec![info("default", true)], vec![machine("a", "you@box", true)]);
+        let (places, _) = tree_order(vec![info("default", true)], vec![machine("a", "you@box", true)], &[], &[]);
         let mut w = watched(&places, "default");
         let k = SessionKey("machine:a".into());
         let now = Instant::now();

@@ -71,7 +71,9 @@ impl Shell {
                     || open(shell.view_menu.as_ref().map(|m| m.is_open()))
                     || open(shell.agents_menu.as_ref().map(|m| m.is_open()))
                     || open(shell.place_menu.as_ref().map(|m| m.is_open()))
-                    || shell.tree.menu_open();
+                    || shell.tree.menu_open()
+                    // a drag out of it would drop it mid-way
+                    || cx.has_active_drag();
                 if !shell.peek_hovered && !menu {
                     shell.set_peek(false, cx);
                 }
@@ -206,6 +208,10 @@ impl Shell {
         // folds are kept per session, and ids told apart by session: workspace ids repeat across sessions
         let (session, idx) = self.row_keys(&mode);
         let fold_key = |id: &str| crate::files::roots::root_key(&session, id);
+        // a drop herdr hasn't answered yet shows its order already
+        let key = watchers::SessionKey(session.clone());
+        let pending = snapshot.and_then(|s| self.pending_order(&key, s));
+        let snapshot = pending.as_ref().or(snapshot);
         // a workspace row's height, one line; a worktree's, which always has a branch line unless compact
         let (ws_h, kid_h) = if SettingsGlobal::of(cx).settings.compact_workspaces { (26., 26.) } else { (32., WS_TWO_LINES) };
         let groups: Vec<(crate::model::Workspace, Vec<crate::model::Workspace>)> = snapshot
@@ -217,9 +223,31 @@ impl Shell {
                     .collect()
             })
             .unwrap_or_default();
+        // a workspace moves with its worktrees among the others, a worktree among its siblings; not one being removed
+        let movable = self.can_drag_workspaces(&key);
+        let draggable: std::collections::HashSet<String> = groups
+            .iter()
+            .flat_map(|(w, kids)| {
+                let group = (groups.len() > 1).then_some(w);
+                let kids = kids.iter().filter(|_| kids.len() > 1);
+                group.into_iter().chain(kids).map(|w| w.workspace_id.clone())
+            })
+            .filter(|id| movable && !(live && self.removing.contains(id)))
+            .collect();
+        // this session's drag line, by the workspace it is drawn at
+        let line = self.tree.drop.as_ref().filter(|d| matches!(&d.over, tree_drag::Over::Workspace(k, _) if *k == key)).map(|d| d.line.clone());
+        let group_line = |id: &str| match &line {
+            Some(tree_drag::Line::Group(g, edge)) if g == id => Some(*edge),
+            _ => None,
+        };
+        let kid_line = |id: &str| match &line {
+            Some(tree_drag::Line::Kid(k, edge)) if k == id => Some(*edge),
+            _ => None,
+        };
         // held Ctrl+Shift (Ctrl on macOS): each of the first nine workspaces' chord, in `go_to_workspace`'s order
         let hint = hints;
-        let ws_row = |w: &crate::model::Workspace, nested: bool, chevron: Option<gpui::AnyElement>, folded: Option<usize>, cx: &mut Context<Self>| {
+        // `takes_drop`: the row takes a drop; a folded group's hidden worktrees keep their bounds under the rows after it
+        let ws_row = |w: &crate::model::Workspace, nested: bool, chevron: Option<gpui::AnyElement>, folded: Option<usize>, takes_drop: bool, cx: &mut Context<Self>| {
             let chip = hint.and_then(|(opacity, chords)| {
                 let (_, _, chord) = chords.iter().find(|(k, id, _)| k.0 == session && *id == w.workspace_id)?;
                 Some(hints::chip(theme, chord, *opacity))
@@ -355,6 +383,15 @@ impl Shell {
                 .children(chevron)
                 // over the row's right end (its status and chevron), so nothing in it moves
                 .when_some(chip, |el, chip| el.relative().child(chip))
+                .when(draggable.contains(&w.workspace_id), |el| {
+                    let item = if nested { tree_drag::Item::Kid(w.workspace_id.clone()) } else { tree_drag::Item::Group(w.workspace_id.clone()) };
+                    let dragged = tree_drag::DraggedTreeItem { from: key.clone(), item, label: w.label.clone(), theme: theme.clone() };
+                    el.on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone()))
+                })
+                .when(takes_drop, |el| {
+                    let over = tree_drag::Over::Workspace(key.clone(), w.workspace_id.clone());
+                    el.on_drag_move(cx.listener(move |this, e: &gpui::DragMoveEvent<tree_drag::DraggedTreeItem>, _, cx| this.tree_drag_over(over.clone(), e, cx)))
+                })
                 .when_some(match &mode {
                     sidebar_tree::RowMode::Other(key) => Some(key.clone()),
                     _ => None,
@@ -400,7 +437,7 @@ impl Shell {
                 .map(|(_, branch)| branch.clone())
                 .collect();
             if kids.is_empty() && pending.is_empty() {
-                return ws_row(&w, false, None, None, cx).into_any_element();
+                return tree_drag::with_line(ws_row(&w, false, None, None, true, cx), theme, group_line(&w.workspace_id));
             }
             // A folded group opens while one of its worktrees is being created.
             let fold = fold_key(&w.workspace_id);
@@ -417,7 +454,8 @@ impl Shell {
                     }
                 }))
             });
-            let header = ws_row(&w, false, Some(chevron.into_any_element()), (!open).then_some(kids.len()), cx);
+            let header = ws_row(&w, false, Some(chevron.into_any_element()), (!open).then_some(kids.len()), true, cx);
+            let kids_take_drops = open && tween.is_none();
             let body = div()
                 .w_full()
                 .flex_none()
@@ -426,7 +464,7 @@ impl Shell {
                 .flex_col()
                 .pt(px(2.))
                 .gap(px(2.))
-                .children(kids.iter().map(|k| ws_row(k, true, None, None, cx).into_any_element()).collect::<Vec<_>>())
+                .children(kids.iter().map(|k| tree_drag::with_line(ws_row(k, true, None, None, kids_take_drops, cx), theme, kid_line(&k.workspace_id))).collect::<Vec<_>>())
                 .children(pending.iter().map(|b| pending_worktree_row(theme, b).h(px(kid_h)).into_any_element()));
             let body = match tween {
                 None => body.h(px(if open { full } else { 0. })).into_any_element(),
@@ -443,7 +481,8 @@ impl Shell {
                     )
                     .into_any_element(),
             };
-            div().flex().flex_col().flex_none().child(header).child(body).into_any_element()
+            let group = div().flex().flex_col().flex_none().child(header).child(body);
+            tree_drag::with_line(group, theme, group_line(&w.workspace_id))
         }).collect::<Vec<_>>()
     }
 
@@ -462,6 +501,7 @@ impl Shell {
         let active = window.is_window_active();
 
         let strip = update_strip(theme, cx);
+        self.tidy_tree_drag(cx);
         let (tree, listed) = self.tree_rows(theme, snapshot, shown_ws, active, cx);
         let waiting = self.error.is_none() && self.connecting.is_some_and(|at| crate::ui::loader::due(at, window));
         // Laid out at full width and clipped by its tweened box, so rows never reflow mid slide.
@@ -508,6 +548,9 @@ impl Shell {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    // a row dragged in the tree: its rows find where it lands, a release anywhere on it drops it
+                    .on_drag_move(cx.listener(|this, e: &gpui::DragMoveEvent<tree_drag::DraggedTreeItem>, _, cx| this.tree_drag_left(e, cx)))
+                    .on_drop(cx.listener(|this, d: &tree_drag::DraggedTreeItem, _, cx| this.drop_tree_item(d, cx)))
                     .px(px(8.))
                     .flex()
                     .flex_col()
