@@ -104,8 +104,12 @@ pub(super) struct TreeState {
     pub(super) scroll: gpui::ScrollHandle,
     /// How fast that drag scrolls it, in px a frame; 0 when it doesn't.
     pub(super) scroll_speed: f32,
-    /// A scroll ticker runs (`scroll_while_dragging`): one at a time.
-    pub(super) ticking: bool,
+    /// The scroll ticker (`scroll_while_dragging`): one at a time.
+    pub(super) ticker: tree_drag::Ticker,
+    /// The tree's scroll offset its rows were last painted at: a drag move's row bounds are from that paint.
+    pub(super) painted_offset: Pixels,
+    /// What is being dragged, for a drop planned again after a scroll.
+    pub(super) dragged: Option<DraggedTreeItem>,
     /// Where the drag's pointer last moved over the tree: a scroll since must leave the drop's row under it.
     pub(super) pointer: Option<gpui::Point<Pixels>>,
     /// A drag was under way at the last frame: its end lets a peek it held out go.
@@ -223,7 +227,8 @@ pub(super) fn agents_view(rows: Vec<TreeRow>, sessions: &[SessionAgents], sort: 
     rows.into_iter()
         .map(|row| {
             let TreeRow::Workspaces { key } = row else { return ViewRow::Tree(row) };
-            let Some(n) = sessions.iter().position(|s| s.key == key) else { return ViewRow::Empty("No agents") };
+            // listed without a snapshot to read yet: the shown session's first is on its way
+            let Some(n) = sessions.iter().position(|s| s.key == key) else { return ViewRow::Empty("Connecting…") };
             let (mut entries, any) = cross_agents(&sessions[n..=n], sort, attention, now);
             // their place in the whole list keeps the rows' ids apart: pane ids repeat across sessions
             for e in &mut entries {
@@ -236,6 +241,52 @@ pub(super) fn agents_view(rows: Vec<TreeRow>, sessions: &[SessionAgents], sort: 
             }
         })
         .collect()
+}
+
+/// Whether any session has an agent at all: the Agents section stays while one does, so its menu can turn the filter
+/// off again.
+pub(super) fn any_agent(sessions: &[SessionAgents]) -> bool {
+    sessions.iter().any(|s| s.snapshot.panes.iter().any(|p| p.agent.is_some()))
+}
+
+/// Whether the session `key` is out of reach: what it shows is the last snapshot it sent.
+pub(super) fn out_of_reach(w: &Watchers, key: &SessionKey) -> bool {
+    w.get(key).is_some_and(|w| w.status == Status::Unreachable)
+}
+
+/// The agents panel's rows: every session's agents in the Agents section's order (never filtered to those that need
+/// you: the panel is searched), those of a session out of reach marked so.
+pub(super) fn panel_agent_rows(sessions: &[SessionAgents], sort: AgentSort, w: &Watchers, now: Instant) -> Vec<crate::ui::command_panel::AgentRow> {
+    let (entries, _) = cross_agents(sessions, sort, false, now);
+    entries
+        .into_iter()
+        .map(|e| crate::ui::command_panel::AgentRow { out_of_reach: out_of_reach(w, &e.key), key: e.key.0, pane: e.pane, workspace: e.workspace, waited: e.waited })
+        .collect()
+}
+
+/// The workspaces panel's sessions: each one's snapshot in `ordered`'s order where a drop herdr hasn't carried out
+/// gives one (as the tree shows it), one out of reach marked so.
+pub(super) fn panel_workspaces<'a>(sessions: &'a [SessionAgents], ordered: &'a [Option<Snapshot>], w: &Watchers) -> Vec<crate::ui::command_panel::SessionWorkspaces<'a>> {
+    sessions
+        .iter()
+        .zip(ordered)
+        .map(|(s, ordered)| crate::ui::command_panel::SessionWorkspaces {
+            key: s.key.0.clone(),
+            name: s.name.clone(),
+            snapshot: ordered.as_ref().unwrap_or(s.snapshot),
+            out_of_reach: out_of_reach(w, &s.key),
+        })
+        .collect()
+}
+
+/// The tree's rows as the sidebar draws them: [`tree`]'s, and a socket of one's own (no session of herdr's list), or
+/// the session shown before the list came, shows its workspaces first, without a header.
+pub(super) fn model_rows(places: &[Place], w: &Watchers, collapsed: &HashSet<String>, snapshot: Option<&Snapshot>, shown: &SessionKey) -> Vec<TreeRow> {
+    let mut rows = tree(places, w, collapsed, snapshot);
+    if !places.iter().any(|p| SessionKey::of(p) == *shown) {
+        rows.insert(0, TreeRow::Workspaces { key: shown.clone() });
+    }
+    rows
 }
 
 /// Whether a row of the Agents view gets a divider over it, as [`divider_above`] has it for the tree.
@@ -467,12 +518,8 @@ impl Shell {
     /// session shown before the list came, shows its workspaces first.
     fn tree_model(&self, cx: &App) -> (Vec<TreeRow>, SessionKey) {
         let collapsed: HashSet<String> = SettingsGlobal::of(cx).settings.collapsed_sessions.iter().cloned().collect();
-        let mut rows = tree(&self.places, &self.watchers, &collapsed, self.snapshot.as_ref());
         let shown = self.shown_key().unwrap_or_default();
-        if !self.places.iter().any(|p| SessionKey::of(p) == shown) {
-            rows.insert(0, TreeRow::Workspaces { key: shown.clone() });
-        }
-        (rows, shown)
+        (model_rows(&self.places, &self.watchers, &collapsed, self.snapshot.as_ref(), &shown), shown)
     }
 
     /// The workspaces Workspace1–9 go to and their hint chips sit on, in the tree's order.
@@ -564,6 +611,8 @@ impl Shell {
     }
 
     fn toggle_collapsed(&mut self, key: &SessionKey, cx: &mut Context<Self>) {
+        // a drop aimed mid drag: the rows under it fold away or come in
+        self.tree.drop = None;
         let key = key.0.clone();
         save_from_sidebar(cx, move |s| toggle_in(&mut s.collapsed_sessions, &key));
         cx.notify();
@@ -583,25 +632,9 @@ impl Shell {
         waiting_everywhere(self.snapshot.as_ref(), &self.watchers)
     }
 
-    /// The Agents section's entries from every session: the shown one's live snapshot, the others' from their
-    /// watchers; and whether any session has an agent at all.
-    pub(super) fn agents_everywhere(&self, attention: bool, cx: &App) -> (Vec<AgentEntry>, bool) {
-        cross_agents(&self.session_agents(cx), self.agent_sort, attention, Instant::now())
-    }
-
-    /// Whether the session `key` is out of reach: its rows show the last snapshot it sent.
-    pub(super) fn out_of_reach(&self, key: &SessionKey) -> bool {
-        self.watchers.get(key).is_some_and(|w| w.status == Status::Unreachable)
-    }
-
-    /// The agents panel's rows: every session's agents in the Agents section's order (never filtered to those that
-    /// need you: the panel is searched), those of a session out of reach marked so.
+    /// The agents panel's rows (`panel_agent_rows`).
     pub(super) fn panel_agents(&self, cx: &App) -> Vec<crate::ui::command_panel::AgentRow> {
-        let (entries, _) = cross_agents(&self.session_agents(cx), self.agent_sort, false, Instant::now());
-        entries
-            .into_iter()
-            .map(|e| crate::ui::command_panel::AgentRow { out_of_reach: self.out_of_reach(&e.key), key: e.key.0, pane: e.pane, workspace: e.workspace, waited: e.waited })
-            .collect()
+        panel_agent_rows(&self.session_agents(cx), self.agent_sort, &self.watchers, Instant::now())
     }
 
     /// Every session's agents as the Agents section and Next agent that needs you read them, in the tree's order: a
@@ -693,12 +726,12 @@ impl Shell {
     /// The Agents view's elements, uherdr's: the tree's machine and session headers with their ●N (a click on a
     /// session's folds it, in the tree too: one fold per session) and notices, each session's agents under it in
     /// place of its workspaces, nothing to drag; and whether it lists sessions, as [`Self::tree_rows`] says.
-    pub(super) fn agents_view_rows(&self, theme: &Theme, shown_tab: Option<&str>, cx: &mut Context<Self>) -> (Vec<gpui::AnyElement>, bool) {
+    pub(super) fn agents_view_rows(&self, theme: &Theme, sessions: &[SessionAgents], shown_tab: Option<&str>, cx: &mut Context<Self>) -> (Vec<gpui::AnyElement>, bool) {
         let (rows, _) = self.tree_model(cx);
         let listed = rows.iter().any(|r| matches!(r, TreeRow::Session { .. }));
         let settings = &SettingsGlobal::of(cx).settings;
         let (attention, compact) = (settings.attention_agents, settings.compact_agents);
-        let rows = agents_view(rows, &self.session_agents(cx), self.agent_sort, attention, Instant::now());
+        let rows = agents_view(rows, sessions, self.agent_sort, attention, Instant::now());
         // indented under their session's header, a faint guide down their left, as its workspaces are in the tree
         let under = |children: Vec<gpui::AnyElement>| {
             div().flex_none().flex().flex_col().gap(px(2.)).ml(px(15.)).pl(px(5.)).border_l_1().border_color(theme.border.opacity(0.6)).children(children).into_any_element()
@@ -1466,10 +1499,14 @@ mod tests {
         // one session alone: no header to fold
         let one = [Place::Session(info("default", true))];
         assert!(!foldable(&tree(&one, &watched(&one, "default"), &HashSet::new(), Some(&shown)), &key("default")));
-        // a socket of one's own, outside herdr's list: its workspaces lead without a header
-        let mut own = rows.clone();
-        own.insert(0, TreeRow::Workspaces { key: key("mine") });
+        // a socket of one's own, outside herdr's list: its workspaces lead without a header, as the sidebar draws them
+        let own = model_rows(&places, &w, &HashSet::new(), Some(&shown), &key("mine"));
+        assert_eq!(kinds(&own)[..2], ["W /tmp/mine.sock", "S /tmp/default.sock"]);
         assert!(!foldable(&own, &key("mine")));
+        // a listed session shown gets no second row
+        let listed = model_rows(&places, &w, &HashSet::new(), Some(&shown), &key("default"));
+        assert_eq!(listed, rows);
+        assert!(foldable(&listed, &key("default")));
     }
 
     #[test]
@@ -1592,7 +1629,33 @@ mod tests {
         // one session alone: no header, its agents straight away; none read yet says there are none
         let one = vec![TreeRow::Workspaces { key: key("default") }];
         assert_eq!(view_kinds(&agents_view(one.clone(), &sessions(&shown)[..1], AgentSort::Status, false, now)), ["A p1,p2"]);
-        assert_eq!(view_kinds(&agents_view(one, &[], AgentSort::Status, false, now)), ["E No agents"]);
+        assert_eq!(view_kinds(&agents_view(one, &[], AgentSort::Status, false, now)), ["E Connecting…"], "its first snapshot on its way");
+    }
+
+    #[test]
+    fn the_panels_mark_a_session_out_of_reach() {
+        let (_, w) = counted();
+        let m = SessionKey("machine:a".into());
+        assert!(out_of_reach(&w, &m));
+        assert!(!out_of_reach(&w, &key("menqal")) && !out_of_reach(&w, &key("default")) && !out_of_reach(&w, &key("gone")));
+        let shown = agents_snapshot(&[("p1", "blocked")]);
+        let since = crate::model::Since::new();
+        let sessions = [
+            SessionAgents { key: key("default"), name: "default".into(), shown: true, snapshot: &shown, since: &since },
+            SessionAgents { key: m.clone(), name: "a".into(), shown: false, snapshot: w.snapshot(&m).unwrap(), since: &since },
+        ];
+        let rows = panel_agent_rows(&sessions, AgentSort::Status, &w, Instant::now());
+        let marks: Vec<(String, bool)> = rows.iter().map(|r| (r.key.clone(), r.out_of_reach)).collect();
+        assert_eq!(marks, [("/tmp/default.sock".to_string(), false), ("machine:a".to_string(), true)]);
+        let ordered = vec![None, Some(snapshot(&[("w9", None)]))];
+        let ws = panel_workspaces(&sessions, &ordered, &w);
+        let marks: Vec<(&str, bool, &str)> = ws.iter().map(|s| (s.key.as_str(), s.out_of_reach, s.snapshot.workspaces[0].workspace_id.as_str())).collect();
+        assert_eq!(marks, [("/tmp/default.sock", false, "w1"), ("machine:a", true, "w9")], "a drop's order where one waits");
+        // the Agents section stays while any session has an agent
+        assert!(any_agent(&sessions));
+        let none = agents_snapshot(&[]);
+        assert!(!any_agent(&[SessionAgents { key: key("default"), name: "default".into(), shown: true, snapshot: &none, since: &since }]));
+        assert!(!any_agent(&[]));
     }
 
     #[test]

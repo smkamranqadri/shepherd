@@ -789,17 +789,7 @@ impl Shell {
                 let sessions = self.session_agents(cx);
                 // each session's workspaces in the order of drops herdr hasn't carried out yet, as the tree shows them
                 let ordered: Vec<Option<Snapshot>> = sessions.iter().map(|s| self.pending_order(&s.key, s.snapshot)).collect();
-                let rows: Vec<_> = sessions
-                    .iter()
-                    .zip(&ordered)
-                    .map(|(s, ordered)| crate::ui::command_panel::SessionWorkspaces {
-                        key: s.key.0.clone(),
-                        name: s.name.clone(),
-                        snapshot: ordered.as_ref().unwrap_or(s.snapshot),
-                        out_of_reach: self.out_of_reach(&s.key),
-                    })
-                    .collect();
-                crate::ui::command_panel::session_workspace_items(&rows)
+                crate::ui::command_panel::session_workspace_items(&sidebar_tree::panel_workspaces(&sessions, &ordered, &self.watchers))
             }
             Kind::Branches => match dir.as_deref() {
                 Some(d) => crate::ui::command_panel::branch_items(&crate::ui::statusbar::read_branches(d), crate::ui::statusbar::branch_of(d, cx).as_deref()),

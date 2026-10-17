@@ -446,7 +446,7 @@ fn menus(secure_input: bool) -> Vec<gpui::Menu> {
             I::action("Previous Session", PreviousSession),
             I::action("Next Session", NextSession),
             I::action("Switch Session…", SwitchSession),
-            I::action("Fold Session", ToggleSessionCollapsed),
+            I::action("Fold or Unfold Session", ToggleSessionCollapsed),
             I::action("Next Agent That Needs You", NextNeedsYou),
             I::submenu(Menu::new("Go to Workspace").items([
                 I::action("Workspace 1", Workspace1),

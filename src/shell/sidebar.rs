@@ -181,7 +181,13 @@ impl Shell {
     /// The sidebar's view, Workspaces or Agents, kept in the settings. A drop being aimed in the tree goes: its rows
     /// are not there to take it in the Agents view.
     pub(super) fn set_sidebar_view(&mut self, view: SidebarView, cx: &mut Context<Self>) {
+        // the segment already shown: nothing to save
+        if SettingsGlobal::of(cx).settings.sidebar_view == view {
+            return;
+        }
         self.tree.drop = None;
+        // a ticker scrolling the tree mid drag stops at its next frame: the tree is not shown
+        self.tree.scroll_speed = 0.;
         save_from_sidebar(cx, |s| s.sidebar_view = view);
         cx.notify();
     }
@@ -570,15 +576,16 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
-        // every session's agents; the section stays while any agent runs, so its menu can turn the filter off again
-        let (agents, any_agents) = self.agents_everywhere(SettingsGlobal::of(cx).settings.attention_agents, cx);
         let active = window.is_window_active();
-
         let strip = update_strip(theme, cx);
         // a drag's line and drops herdr carried out are tidied whichever view shows
         self.tidy_tree_drag(window, cx);
+        // every session's agents, read once for the section and the Agents view; the section stays while any agent
+        // runs, so its menu can turn the filter off again
+        let sessions = self.session_agents(cx);
         let settings = &SettingsGlobal::of(cx).settings;
-        let layout = sidebar_layout(settings.sidebar_view, settings.show_agents, any_agents);
+        let layout = sidebar_layout(settings.sidebar_view, settings.show_agents, sidebar_tree::any_agent(&sessions));
+        let agents = if layout.bottom { sidebar_tree::cross_agents(&sessions, self.agent_sort, settings.attention_agents, Instant::now()).0 } else { Vec::new() };
         let (body, listed) = if layout.tree {
             let (tree, listed) = self.tree_rows(theme, snapshot, shown_ws, active, cx);
             let body = div()
@@ -598,7 +605,7 @@ impl Shell {
             (body, listed)
         } else {
             // every session's agents under its header, the whole height: no drags here
-            let (rows, listed) = self.agents_view_rows(theme, shown_tab.as_deref(), cx);
+            let (rows, listed) = self.agents_view_rows(theme, &sessions, shown_tab.as_deref(), cx);
             let body = div()
                 .id("agents-view")
                 .flex_1()
