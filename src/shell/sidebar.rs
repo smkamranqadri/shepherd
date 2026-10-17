@@ -56,12 +56,8 @@ impl Shell {
     /// The pointer came onto the window's left edge or the floating sidebar (`on`), or left them. It shows at once
     /// and hides a moment after the pointer leaves, so crossing from the edge to the card doesn't flicker.
     pub(super) fn hover_peek(&mut self, on: bool, cx: &mut Context<Self>) {
-        if !SettingsGlobal::of(cx).settings.sidebar_peek {
-            // turned off in Settings: nothing slides out, and a card still out goes
-            self.peek_hovered = false;
-            self.set_peek(false, cx);
-            return;
-        }
+        // turned off in Settings: nothing slides out, and a card still out goes as the pointer leaving it would
+        let on = hover_shows(SettingsGlobal::of(cx).settings.sidebar_peek, on);
         self.peek_hovered = on;
         if on {
             self.set_peek(true, cx);
@@ -776,9 +772,21 @@ pub(super) fn peeks(sidebar_open: bool, sidebar_w: f32, on_page: bool, peek_on: 
     !sidebar_open && sidebar_w == 0. && !on_page && peek_on
 }
 
+/// Whether the pointer on the edge or the card (`on`) holds the floating sidebar out: never with the peek off.
+pub(super) fn hover_shows(peek_on: bool, on: bool) -> bool {
+    peek_on && on
+}
+
 #[cfg(test)]
 mod tests {
-    use super::peeks;
+    use super::{hover_shows, peeks};
+
+    #[test]
+    fn with_the_peek_off_a_hover_holds_nothing_out() {
+        assert!(hover_shows(true, true));
+        assert!(!hover_shows(true, false), "the pointer left");
+        assert!(!hover_shows(false, true), "turned off in Settings");
+    }
 
     #[test]
     fn the_edge_peeks_only_with_the_sidebar_hidden_and_the_peek_on() {
