@@ -10,7 +10,7 @@ mod session;
 mod socket;
 mod wire;
 pub use wire::Rgb;
-pub use client::{ApiError, Client, EVENT_TYPES, WATCH_TYPES, burst, refused};
+pub use client::{ApiError, Client, EVENT_TYPES, WATCH_TYPES, api_error, burst, event_is, unsupported};
 pub use config::{HerdrConfig, config_path};
 pub use session::{Mode, Session, SessionEvent, SessionInfo, Sockets, client_socket, current_session, delete_session, new_session, no_server, sessions, valid_session_name, set_binary, set_socket, start_server, start_session_server, api_socket};
 pub use wire::PaneInput;

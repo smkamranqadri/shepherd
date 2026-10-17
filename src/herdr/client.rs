@@ -28,8 +28,8 @@ pub const WATCH_TYPES: &[&str] = &[
     "pane.created", "pane.closed", "pane.updated", "pane.moved", "pane.exited", "pane.agent_detected",
 ];
 
-/// herdr answered, with an error: a running server that refused the request (an unknown method or event type on an
-/// older herdr), not one out of reach.
+/// herdr answered, with an error: a running server that turned the request down (`unsupported`, or ids it does
+/// not know), not one out of reach.
 #[derive(Debug)]
 pub struct ApiError {
     pub code: String,
@@ -44,9 +44,21 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
-/// herdr's server answered the request with an error: asking again the same way gets the same answer.
-pub fn refused(err: &anyhow::Error) -> bool {
-    err.chain().any(|e| e.downcast_ref::<ApiError>().is_some())
+/// herdr's answer, when it answered with an error.
+pub fn api_error(err: &anyhow::Error) -> Option<&ApiError> {
+    err.chain().find_map(|e| e.downcast_ref::<ApiError>())
+}
+
+/// herdr does not take the request at all: an unknown method or event type (an older herdr) answers
+/// `invalid_request`, and asking again the same way gets the same answer. An error about what the request named
+/// (`pane_not_found`: a pane closed since) is not this: the request is fine, its ids are old.
+pub fn unsupported(err: &anyhow::Error) -> bool {
+    api_error(err).is_some_and(|e| e.code == "invalid_request")
+}
+
+/// The event is a `kind` (as subscribed to, `pane.focused`): herdr names the events it sends `pane_focused`.
+pub fn event_is(event: &Value, kind: &str) -> bool {
+    event["event"].as_str().is_some_and(|e| e == kind || e == kind.replace('.', "_"))
 }
 
 /// The next burst of events: waits for one, then for `window()` (made only once the first came, so a timer that

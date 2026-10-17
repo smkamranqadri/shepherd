@@ -11,8 +11,8 @@ use serde_json::Value;
 const HEARTBEAT: Duration = Duration::from_secs(60);
 const HEARTBEAT_WINDOWS_REMOTE: Duration = Duration::from_secs(120);
 
-/// A herdr that refused the subscription (older, or without some event type) is polled only, and asked again this
-/// long after, or once its server starts again.
+/// A herdr that does not take the subscription (older, without some event type) is polled only, and asked again
+/// this long after, or once its server starts again.
 const UNSUPPORTED: Duration = Duration::from_secs(10 * 60);
 
 /// A feed follows another set of agents at most this often: agents coming and going quickly resubscribe once.
@@ -32,7 +32,7 @@ pub(in crate::shell) enum Feed {
     On { panes: Vec<String>, since: Instant },
     /// Failed or ended: opened again from `at`, once a poll answered since.
     Retry { at: Instant },
-    /// herdr refused it: polled only, until `until` or a restart of its server.
+    /// herdr does not take it (`herdr::unsupported`): polled only, until `until` or a restart of its server.
     Unsupported { until: Instant },
 }
 
@@ -119,8 +119,10 @@ impl Watchers {
     }
 
     /// The subscription answered, at `feed_gen`: on, the session is asked at once (what changed before it opened
-    /// came on no feed); refused, it is polled only for a while; failed, it is asked at once (that answer says what
-    /// became of it) and the feed waits out a backoff. News of a feed closed since changes nothing.
+    /// came on no feed); unsupported, it is polled only for a while; turned down for what it named (a pane closed
+    /// since the last poll), it is asked at once and opened again with that answer's panes; failed, it is asked at
+    /// once (that answer says what became of it) and the feed waits out a backoff. News of a feed closed since
+    /// changes nothing.
     pub(in crate::shell) fn feed_opened(&mut self, key: &SessionKey, feed_gen: u64, result: anyhow::Result<()>, now: Instant) {
         let Some(w) = self.map.get_mut(key).filter(|w| w.feed_gen == feed_gen) else { return };
         let kind = w.kind();
@@ -133,7 +135,11 @@ impl Watchers {
                 w.feed = Feed::On { panes, since: now };
                 w.wake(now);
             }
-            Err(e) if crate::herdr::refused(&e) => w.feed = Feed::Unsupported { until: now + UNSUPPORTED },
+            Err(e) if crate::herdr::unsupported(&e) => w.feed = Feed::Unsupported { until: now + UNSUPPORTED },
+            Err(e) if crate::herdr::api_error(&e).is_some() => {
+                w.feed = Feed::Off;
+                w.wake(now);
+            }
             Err(_) => {
                 w.feed_failures += 1;
                 w.feed = Feed::Retry { at: now + feed_backoff(kind, w.feed_failures) };
@@ -217,16 +223,11 @@ fn feed_backoff(kind: Kind, failures: u32) -> Duration {
     Duration::from_secs((base * 2u64.saturating_pow(failures.saturating_sub(1).min(16))).min(300))
 }
 
-/// herdr names an event `pane.updated` in a subscription and `pane_updated` in the events it sends.
-fn named(event: &Value, kind: &str) -> bool {
-    event["event"].as_str().is_some_and(|e| e == kind || e == kind.replace('.', "_"))
-}
-
 /// Whether a burst may change what the tree draws of the session, last seen as `old`: any event but `pane.updated`
 /// does; that one only when the pane is new to `old`, or moved, or its agent, status, folder or terminal changed.
 /// A busy agent sends it several times a second for its title, scroll and tokens alone.
 pub(in crate::shell) fn relevant(old: Option<&Snapshot>, events: &[Value]) -> bool {
-    events.iter().any(|e| !named(e, "pane.updated") || pane_changed(old, &e["data"]["pane"]))
+    events.iter().any(|e| !crate::herdr::event_is(e, "pane.updated") || pane_changed(old, &e["data"]["pane"]))
 }
 
 fn pane_changed(old: Option<&Snapshot>, pane: &Value) -> bool {
@@ -434,14 +435,14 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_feed_is_polled_only_until_its_server_starts_again() {
+    fn an_unsupported_feed_is_polled_only_until_its_server_starts_again() {
         let now = Instant::now();
         let mut w = Watchers::new();
         w.reconcile(&[session("menqal", true)], None, now);
         let k = key("menqal");
         poll(&mut w, &k, agents(&[("p1", "working")]), now);
         let g = w.feeds_due(now).pop().unwrap().feed_gen;
-        let no = anyhow::Error::new(crate::herdr::ApiError { code: "invalid_request".into(), message: "unknown event type".into() });
+        let no = anyhow::Error::new(crate::herdr::ApiError { code: "invalid_request".into(), message: "invalid request: unknown variant".into() });
         w.feed_opened(&k, g, Err(no), now);
         assert!(matches!(w.get(&k).unwrap().feed, Feed::Unsupported { .. }));
         assert!(w.due(now, Active).is_empty(), "polled as before, nothing asked at once");
@@ -453,6 +454,23 @@ mod tests {
         w.reconcile(&[session("menqal", true)], None, now);
         poll(&mut w, &k, agents(&[("p1", "working")]), now);
         assert_eq!(w.feeds_due(now).len(), 1, "a new server is asked again");
+    }
+
+    #[test]
+    fn a_feed_naming_a_closed_pane_opens_again_with_the_next_answers_panes() {
+        let now = Instant::now();
+        let mut w = Watchers::new();
+        w.reconcile(&[session("menqal", true)], None, now);
+        let k = key("menqal");
+        poll(&mut w, &k, agents(&[("p1", "working"), ("p2", "working")]), now);
+        let g = w.feeds_due(now).pop().unwrap().feed_gen;
+        let gone = anyhow::Error::new(crate::herdr::ApiError { code: "pane_not_found".into(), message: "pane p2 not found".into() });
+        w.feed_opened(&k, g, Err(gone), now);
+        assert_eq!(w.get(&k).unwrap().feed, Feed::Off, "not unsupported: the request was fine, a pane in it was old");
+        assert!(w.feeds_due(now).is_empty(), "the poll first, for the panes there are now");
+        poll(&mut w, &k, agents(&[("p1", "working")]), now);
+        let order = w.feeds_due(now).pop().expect("opened again at once");
+        assert_eq!(order.panes, ["p1"]);
     }
 
     #[test]

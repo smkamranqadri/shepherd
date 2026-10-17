@@ -138,17 +138,46 @@ async fn events_that_come_together_are_one_burst() {
 }
 
 #[tokio::test]
-async fn a_subscription_herdr_turns_down_is_refused_and_its_server_runs() {
+async fn a_subscription_herdr_does_not_know_is_unsupported_and_its_server_runs() {
+    // herdr 0.9.5's answer to an event type it does not have
     let dir = tempfile::tempdir().unwrap();
-    let path = fake_server(&dir, |req| vec![json!({"id": req["id"], "error": {"code": "invalid_request", "message": "unknown event type"}})]);
+    let path = fake_server(&dir, |req| {
+        vec![json!({"id": req["id"], "error": {"code": "invalid_request", "message": "invalid request: unknown variant `pane.no_such_event`"}})]
+    });
     let err = Client::at(path).subscribe(shepherd::herdr::WATCH_TYPES, &[]).await.unwrap_err();
-    assert!(shepherd::herdr::refused(&err), "{err:#}");
+    assert!(shepherd::herdr::unsupported(&err), "{err:#}");
     assert!(!shepherd::herdr::no_server(&err), "{err:#}");
-    assert_eq!(err.to_string(), "invalid_request: unknown event type");
+    assert_eq!(err.to_string(), "invalid_request: invalid request: unknown variant `pane.no_such_event`");
 }
 
 #[tokio::test]
-async fn a_server_that_hangs_up_is_neither_refused_nor_missing() {
+async fn a_subscription_to_a_closed_pane_is_not_found_not_unsupported() {
+    // herdr 0.9.5's answer when a followed pane closed before the subscription came
+    let dir = tempfile::tempdir().unwrap();
+    let path = fake_server(&dir, |req| {
+        let panes = req["params"]["subscriptions"].as_array().unwrap().iter().filter(|s| s["pane_id"].is_string()).count();
+        match panes {
+            0 => vec![json!({"id": req["id"], "result": {"type": "subscription_started"}})],
+            _ => vec![json!({"id": req["id"], "error": {"code": "pane_not_found", "message": "pane w9:p9 not found"}})],
+        }
+    });
+    let client = Client::at(path);
+    let err = client.subscribe(shepherd::herdr::WATCH_TYPES, &["w9:p9".into()]).await.unwrap_err();
+    assert_eq!(shepherd::herdr::api_error(&err).map(|e| e.code.as_str()), Some("pane_not_found"));
+    assert!(!shepherd::herdr::unsupported(&err) && !shepherd::herdr::no_server(&err), "{err:#}");
+    assert!(client.subscribe(shepherd::herdr::WATCH_TYPES, &[]).await.is_ok(), "the same request without the old pane");
+}
+
+#[test]
+fn events_are_named_either_way() {
+    assert!(shepherd::herdr::event_is(&json!({"event": "pane_focused"}), "pane.focused"), "as herdr sends it");
+    assert!(shepherd::herdr::event_is(&json!({"event": "pane.focused"}), "pane.focused"));
+    assert!(!shepherd::herdr::event_is(&json!({"event": "pane_focused"}), "pane.updated"));
+    assert!(!shepherd::herdr::event_is(&json!({"data": {}}), "pane.focused"));
+}
+
+#[tokio::test]
+async fn a_server_that_hangs_up_is_neither_unsupported_nor_missing() {
     // a machine's relay out of reach: the local socket takes the connection, the SSH behind it ends
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("herdr.sock");
@@ -159,9 +188,9 @@ async fn a_server_that_hangs_up_is_neither_refused_nor_missing() {
         }
     });
     let err = Client::at(path).subscribe(shepherd::herdr::WATCH_TYPES, &[]).await.unwrap_err();
-    assert!(!shepherd::herdr::refused(&err) && !shepherd::herdr::no_server(&err), "{err:#}");
+    assert!(!shepherd::herdr::unsupported(&err) && !shepherd::herdr::no_server(&err), "{err:#}");
     let missing = Client::at(dir.path().join("none.sock")).subscribe(shepherd::herdr::WATCH_TYPES, &[]).await.unwrap_err();
-    assert!(shepherd::herdr::no_server(&missing) && !shepherd::herdr::refused(&missing), "{missing:#}");
+    assert!(shepherd::herdr::no_server(&missing) && !shepherd::herdr::unsupported(&missing), "{missing:#}");
 }
 
 #[tokio::test]
