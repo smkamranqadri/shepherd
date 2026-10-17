@@ -101,6 +101,9 @@ pub struct Settings {
     pub window_buttons: bool,
     /// Holding Alt (Cmd on macOS) shows each tab's shortcut, and Ctrl+Shift (Ctrl on macOS) each workspace's.
     pub show_shortcut_hints: bool,
+    /// With the sidebar hidden, the pointer at the window's left edge slides it out floating over the panes. Off,
+    /// only `⌘B` brings it back; on by default, as before the switch, so an older file keeps it.
+    pub sidebar_peek: bool,
     /// The workspaces sidebar is shown; `⌘B` hides it.
     pub sidebar_open: bool,
     /// Worktree groups folded in the sidebar, by their session's key and workspace id (`roots::root_key`); a bare
@@ -328,6 +331,7 @@ impl Default for Settings {
             translucent_window: cfg!(target_os = "macos"),
             window_buttons: true,
             show_shortcut_hints: true,
+            sidebar_peek: true,
             sidebar_open: true,
             folded: Vec::new(),
             collapsed_sessions: Vec::new(),
@@ -678,6 +682,17 @@ mod tests {
         let (s, err) = Settings::load(&path);
         assert!(err.is_none());
         assert_eq!((s.window.unwrap().bounds_on(display), s.font_size), (None, 15.0));
+    }
+
+    #[test]
+    fn the_sidebar_peeks_unless_turned_off() {
+        let (_d, path) = tmp();
+        assert!(Settings::default().sidebar_peek, "on by default");
+        std::fs::write(&path, r#"{"show_shortcut_hints": false}"#).unwrap();
+        assert!(Settings::load(&path).0.sidebar_peek, "a file from before the switch keeps it on");
+        let off = Settings { sidebar_peek: false, ..Default::default() };
+        off.save(&path).unwrap();
+        assert!(!Settings::load(&path).0.sidebar_peek, "off is kept");
     }
 
     #[test]

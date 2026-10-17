@@ -1051,6 +1051,13 @@ impl Render for SettingsView {
                     )
                     .child(
                         card_row(&theme, false)
+                            .child(row_text(&theme, "Sidebar peek", "Slide the sidebar out at the window's left edge while it is hidden."))
+                            .child(toggle(&theme, "sidebar-peek", settings.sidebar_peek).on_click(cx.listener(
+                                |_, _: &ClickEvent, _, cx| update(cx, |s| s.sidebar_peek = !s.sidebar_peek),
+                            ))),
+                    )
+                    .child(
+                        card_row(&theme, false)
                             .child(row_text(&theme, "Copy on select", "A finished selection goes to the clipboard, then clears."))
                             .child(toggle(&theme, "copy-on-select", settings.copy_on_select).on_click(cx.listener(
                                 |_, _: &ClickEvent, _, cx| update(cx, |s| s.copy_on_select = !s.copy_on_select),

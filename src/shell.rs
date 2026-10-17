@@ -1494,6 +1494,12 @@ impl Render for Shell {
         let shown_tab = tab.as_ref().map(|t| t.tab_id.clone());
         let sidebar_w = self.sidebar_now();
         let sliding = self.sidebar_motion.is_some_and(|m| m.animating());
+        let peek_on = SettingsGlobal::of(cx).settings.sidebar_peek;
+        if !peek_on {
+            // turned off in Settings while out: the card goes, rather than wait for a pointer that will not come back
+            self.sidebar_peek = None;
+            self.peek_hovered = false;
+        }
         let peek = self.peek_now();
         if sliding || self.sidebar_nudge().is_some() || self.sidebar_peek.is_some_and(|m| m.animating()) {
             window.request_animation_frame();
@@ -1841,7 +1847,7 @@ impl Render for Shell {
             })
             .children(panel.into_iter().flatten())
             // The sidebar closed: the window's left edge brings it out floating over the panes, as Arc's does.
-            .when(!self.sidebar_open && sidebar_w == 0. && !on_page, |el| {
+            .when(sidebar::peeks(self.sidebar_open, sidebar_w, on_page, peek_on), |el| {
                 el.child(
                     div()
                         .id("sidebar-peek-edge")

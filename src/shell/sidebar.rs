@@ -56,6 +56,12 @@ impl Shell {
     /// The pointer came onto the window's left edge or the floating sidebar (`on`), or left them. It shows at once
     /// and hides a moment after the pointer leaves, so crossing from the edge to the card doesn't flicker.
     pub(super) fn hover_peek(&mut self, on: bool, cx: &mut Context<Self>) {
+        if !SettingsGlobal::of(cx).settings.sidebar_peek {
+            // turned off in Settings: nothing slides out, and a card still out goes
+            self.peek_hovered = false;
+            self.set_peek(false, cx);
+            return;
+        }
         self.peek_hovered = on;
         if on {
             self.set_peek(true, cx);
@@ -762,4 +768,24 @@ pub(super) fn agent_rows(
             heading.into_iter().chain([act(agent, &entry).into_any_element()])
         })
         .collect()
+}
+
+/// The window's left edge brings the hidden sidebar out floating: only with it hidden all the way (not mid-fold),
+/// off a Settings page, and with the peek on in Settings.
+pub(super) fn peeks(sidebar_open: bool, sidebar_w: f32, on_page: bool, peek_on: bool) -> bool {
+    !sidebar_open && sidebar_w == 0. && !on_page && peek_on
+}
+
+#[cfg(test)]
+mod tests {
+    use super::peeks;
+
+    #[test]
+    fn the_edge_peeks_only_with_the_sidebar_hidden_and_the_peek_on() {
+        assert!(peeks(false, 0., false, true));
+        assert!(!peeks(false, 0., false, false), "turned off in Settings");
+        assert!(!peeks(true, 240., false, true), "the sidebar is out");
+        assert!(!peeks(false, 120., false, true), "still folding away");
+        assert!(!peeks(false, 0., true, true), "on a Settings page");
+    }
 }
