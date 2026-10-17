@@ -583,8 +583,9 @@ impl Shell {
             .flex_col()
             .overflow_hidden()
             .bg(theme.wash(0.05))
+            // a resize edge: the pane dividers' resting line, the seam lit over it on hover or drag
             .border_l_1()
-            .border_color(theme.border)
+            .border_color(theme.border_strong)
             .child(header)
             .child(body)
             .children(footer)

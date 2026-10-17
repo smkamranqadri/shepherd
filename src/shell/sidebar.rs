@@ -515,8 +515,10 @@ impl Shell {
                         .pt(px(12.))
                         // the list's top fade starts just under the label
                         .pb(px(4.))
+                        // the resize edges' resting line (`border_strong`, as the pane dividers'), so the section
+                        // reads apart from the tree above while the seam lights only on hover or drag
                         .border_t_1()
-                        .border_color(theme.border)
+                        .border_color(theme.border_strong)
                         .text_size(px(11.))
                         .text_color(theme.text_faint)
                         .flex()
