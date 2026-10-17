@@ -31,12 +31,12 @@ const BADGE_POLL: Duration = Duration::from_secs(12);
 
 /// How long after a run that took `took` the next poll may start: the tab's pace (`POLL` while the Changes tab shows,
 /// `BADGE_POLL` while only its badge does, `SAFETY_POLL` either way while the root is `watched`), but never sooner
-/// than `floor(took)`.
+/// than `floor(took)`. The polls double on battery (`power::stretch`); the safety net is slow already.
 pub(super) fn poll_delay(took: Duration, tab_shown: bool, watched: bool) -> Duration {
     let pace = match (watched, tab_shown) {
         (true, _) => crate::files::watch::SAFETY_POLL,
-        (false, true) => super::files::POLL,
-        (false, false) => BADGE_POLL,
+        (false, true) => crate::power::stretch(super::files::POLL),
+        (false, false) => crate::power::stretch(BADGE_POLL),
     };
     pace.max(floor(took))
 }

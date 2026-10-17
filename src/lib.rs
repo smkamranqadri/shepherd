@@ -9,6 +9,7 @@ pub mod herdr;
 pub mod model;
 pub mod notify;
 pub mod platform;
+pub mod power;
 pub mod process;
 pub mod settings;
 pub mod shell;

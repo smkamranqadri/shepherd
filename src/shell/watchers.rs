@@ -210,6 +210,8 @@ pub(super) struct Watchers {
     listed: Option<Instant>,
     /// Shepherd runs on Windows: machines are polled only, and slower.
     windows: bool,
+    /// The machine runs on its battery (`power`), as read at the last tick: every interval doubles.
+    battery: bool,
     /// Where the next round of polls starts in the tree's order: at the first the cap held back last time.
     first: usize,
 }
@@ -315,7 +317,7 @@ impl Watchers {
     /// failure, which waits longer before the next poll and after two in a row calls the session unreachable. An
     /// answer for a session shown since is dropped: the sync loop has it.
     pub(super) fn apply(&mut self, key: &SessionKey, result: anyhow::Result<Snapshot>, now: Instant) -> Applied {
-        let activity = self.activity;
+        let (activity, battery) = (self.activity, self.battery);
         let Some(w) = self.map.get_mut(key) else { return Applied::default() };
         w.in_flight = false;
         if w.status == Status::Shown {
@@ -343,15 +345,15 @@ impl Watchers {
                 let panes = agent_panes(&snapshot);
                 (w.digest, w.snapshot, w.status, w.error) = (digest, Some(snapshot), Status::Live, None);
                 (w.failures, w.fetched) = (0, Some(now));
-                w.next_due = now + interval(kind, activity, 0, w.fed());
-                let resubscribe = w.follow_agents(&panes, now, interval(kind, activity, 0, false));
-                w.every = interval(kind, activity, 0, w.fed());
+                w.next_due = now + interval(kind, activity, 0, w.fed(), battery);
+                let resubscribe = w.follow_agents(&panes, now, interval(kind, activity, 0, false, battery));
+                w.every = interval(kind, activity, 0, w.fed(), battery);
                 Applied { changed, alerts, resubscribe, ..Default::default() }
             }
             Err(e) if crate::herdr::no_server(&e) => {
                 let changed = w.status != Status::Stopped;
                 (w.status, w.snapshot, w.digest, w.error, w.failures) = (Status::Stopped, None, 0, None, 0);
-                w.next_due = now + Duration::from_secs(60);
+                w.next_due = now + crate::power::stretch_on(Duration::from_secs(60), battery);
                 w.close_feed();
                 Applied { changed, stopped: changed, ..Default::default() }
             }
@@ -364,7 +366,7 @@ impl Watchers {
                     w.close_feed();
                 }
                 w.error = Some(format!("{e:#}"));
-                w.next_due = now + interval(kind, activity, w.failures, w.fed());
+                w.next_due = now + interval(kind, activity, w.failures, w.fed(), battery);
                 Applied { changed: before != (w.status, w.error.clone()), ..Default::default() }
             }
         }
@@ -379,8 +381,8 @@ impl Watchers {
         w.digest = snapshot.as_ref().map_or(0, digest);
         w.status = if snapshot.is_some() { Status::Live } else { Status::Connecting };
         w.fetched = snapshot.is_some().then_some(now);
-        w.every = interval(w.kind(), self.activity, 0, false);
-        (w.snapshot, w.since, w.failures, w.error, w.next_due) = (snapshot, since, 0, None, now + interval(w.kind(), self.activity, 0, false));
+        w.every = interval(w.kind(), self.activity, 0, false, self.battery);
+        (w.snapshot, w.since, w.failures, w.error, w.next_due) = (snapshot, since, 0, None, now + w.every);
     }
 
     /// The session switched to: its watcher's snapshot and clocks seed the window until the sync loop's own come.
@@ -504,11 +506,21 @@ impl Watchers {
         std::mem::take(&mut self.relist)
     }
 
-    /// herdr's list is due another read: 15 s on with the window in front, a minute behind.
+    /// herdr's list is due another read: 15 s on with the window in front, a minute behind (twice that on battery).
     pub(super) fn list_due(&self, now: Instant) -> bool {
-        let every = if self.active { LIST_ACTIVE } else { LIST_INACTIVE };
-        !self.listing && self.listed.is_none_or(|at| now.duration_since(at) >= every)
+        !self.listing && self.listed.is_none_or(|at| now.duration_since(at) >= list_every(self.active, self.battery))
     }
+
+    /// The power source, read at each tick: from the next answer on, the intervals follow it. A snapshot already in
+    /// is judged stale by the interval it came with (`Watcher::every`), so a change of power never flickers it.
+    pub(super) fn set_battery(&mut self, battery: bool) {
+        self.battery = battery;
+    }
+}
+
+/// How long between reads of herdr's list: 15 s with the window in front, a minute behind, doubled on battery.
+fn list_every(active: bool, battery: bool) -> Duration {
+    crate::power::stretch_on(if active { LIST_ACTIVE } else { LIST_INACTIVE }, battery)
 }
 
 /// Idle once the machine has been left alone for a while (macOS says so), its screen locked, or (anywhere) when
@@ -527,14 +539,15 @@ fn activity(active: bool, inactive_since: Option<Instant>, now: Instant, touched
 /// How long a watcher waits between polls: a session here every 3 s with the window in front, 5 s behind it and 15 s
 /// once the machine is left alone; a machine over SSH every 10 s, 20 s behind (a minute on Windows, which shares no
 /// SSH connection between them). Each failure in a row doubles it, up to a minute here and two over SSH. While `fed`
-/// and answering, the feed asks it when something changes, and the poll is a heartbeat.
-pub(super) fn interval(kind: Kind, activity: Activity, failures: u32, fed: bool) -> Duration {
-    interval_on(kind, activity, failures, fed, cfg!(windows))
+/// and answering, the feed asks it when something changes, and the poll is a heartbeat. On `battery` all of it,
+/// base, cap and heartbeat, doubles: the feed still brings changes at once, only the checks for nothing slow.
+pub(super) fn interval(kind: Kind, activity: Activity, failures: u32, fed: bool, battery: bool) -> Duration {
+    interval_on(kind, activity, failures, fed, cfg!(windows), battery)
 }
 
-fn interval_on(kind: Kind, activity: Activity, failures: u32, fed: bool, windows: bool) -> Duration {
+fn interval_on(kind: Kind, activity: Activity, failures: u32, fed: bool, windows: bool, battery: bool) -> Duration {
     if fed && failures == 0 {
-        return feeds::HEARTBEAT;
+        return crate::power::stretch_on(feeds::HEARTBEAT, battery);
     }
     let (base, cap) = match (kind, activity) {
         (Kind::Local, Activity::Active) => (3, 60),
@@ -544,6 +557,7 @@ fn interval_on(kind: Kind, activity: Activity, failures: u32, fed: bool, windows
         (Kind::Remote, Activity::Active) => (10, 120),
         (Kind::Remote, _) => (20, 120),
     };
+    let (base, cap) = if battery { (base * 2, cap * 2) } else { (base, cap) };
     Duration::from_secs((base * 2u64.saturating_pow(failures.min(16))).min(cap.max(base)))
 }
 
@@ -579,6 +593,7 @@ impl Shell {
     /// The scheduler: once a second, the watchers due a poll are asked, each on the runtime with its deadline; herdr's
     /// list is read again when due. Runs while the window lives.
     pub(super) fn start_watching(&mut self, cx: &mut Context<Self>) {
+        crate::power::start(&self.rt);
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(TICK).await;
             if this.update(cx, |s, cx| s.tick_watchers(cx)).is_err() {
@@ -591,6 +606,7 @@ impl Shell {
     fn tick_watchers(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
         let activity = self.watchers.activity_now(now, self.touched, mac_idle(), screen_locked());
+        self.watchers.set_battery(crate::power::on_battery());
         if self.watchers.list_due(now) {
             self.refresh_places(cx);
         }
@@ -702,16 +718,57 @@ mod tests {
     #[test]
     fn intervals_back_off_to_their_caps() {
         use Activity::*;
-        assert_eq!(interval_on(Kind::Local, Active, 0, false, false), Duration::from_secs(3));
-        assert_eq!(interval_on(Kind::Local, Inactive, 0, false, false), Duration::from_secs(5));
-        assert_eq!(interval_on(Kind::Local, Idle, 0, false, false), Duration::from_secs(15));
-        assert_eq!(interval_on(Kind::Remote, Active, 0, false, false), Duration::from_secs(10));
-        assert_eq!(interval_on(Kind::Remote, Inactive, 0, false, false), Duration::from_secs(20));
-        assert_eq!(interval_on(Kind::Remote, Active, 0, false, true), Duration::from_secs(60), "Windows shares no SSH connection");
-        assert_eq!(interval_on(Kind::Local, Active, 2, false, false), Duration::from_secs(12));
-        assert_eq!(interval_on(Kind::Local, Active, 9, false, false), Duration::from_secs(60));
-        assert_eq!(interval_on(Kind::Remote, Active, 9, false, false), Duration::from_secs(120));
-        assert_eq!(interval_on(Kind::Remote, Active, 99, false, true), Duration::from_secs(120));
+        assert_eq!(interval_on(Kind::Local, Active, 0, false, false, false), Duration::from_secs(3));
+        assert_eq!(interval_on(Kind::Local, Inactive, 0, false, false, false), Duration::from_secs(5));
+        assert_eq!(interval_on(Kind::Local, Idle, 0, false, false, false), Duration::from_secs(15));
+        assert_eq!(interval_on(Kind::Remote, Active, 0, false, false, false), Duration::from_secs(10));
+        assert_eq!(interval_on(Kind::Remote, Inactive, 0, false, false, false), Duration::from_secs(20));
+        assert_eq!(interval_on(Kind::Remote, Active, 0, false, true, false), Duration::from_secs(60), "Windows shares no SSH connection");
+        assert_eq!(interval_on(Kind::Local, Active, 2, false, false, false), Duration::from_secs(12));
+        assert_eq!(interval_on(Kind::Local, Active, 9, false, false, false), Duration::from_secs(60));
+        assert_eq!(interval_on(Kind::Remote, Active, 9, false, false, false), Duration::from_secs(120));
+        assert_eq!(interval_on(Kind::Remote, Active, 99, false, true, false), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn on_battery_every_interval_doubles() {
+        use Activity::*;
+        let on = |kind, activity, failures, fed| interval_on(kind, activity, failures, fed, false, true);
+        assert_eq!(on(Kind::Local, Active, 0, false), Duration::from_secs(6));
+        assert_eq!(on(Kind::Local, Inactive, 0, false), Duration::from_secs(10));
+        assert_eq!(on(Kind::Local, Idle, 0, false), Duration::from_secs(30));
+        assert_eq!(on(Kind::Local, Active, 9, false), Duration::from_secs(120), "the cap too");
+        assert_eq!(on(Kind::Remote, Active, 0, false), Duration::from_secs(20));
+        assert_eq!(on(Kind::Remote, Inactive, 0, false), Duration::from_secs(40));
+        assert_eq!(on(Kind::Remote, Active, 9, false), Duration::from_secs(240));
+        assert_eq!(on(Kind::Local, Active, 0, true), feeds::HEARTBEAT * 2, "the heartbeat too");
+        assert_eq!(on(Kind::Remote, Active, 0, true), Duration::from_secs(120));
+        assert_eq!(list_every(true, true), Duration::from_secs(30));
+        assert_eq!(list_every(false, true), Duration::from_secs(120));
+        assert_eq!(list_every(true, false), LIST_ACTIVE);
+    }
+
+    #[test]
+    fn a_change_of_power_never_turns_a_session_stale() {
+        let now = Instant::now();
+        let mut w = Watchers::new();
+        w.reconcile(&[session("agents", true)], None, now);
+        let k = key("agents");
+        // answered on battery: asked again 6 s on, stale only past three of those
+        w.set_battery(true);
+        w.due(now, Activity::Active);
+        w.apply(&k, Ok(snapshot(&["w1"])), now);
+        assert!(w.due(now + Duration::from_secs(5), Activity::Active).is_empty(), "6 s on battery");
+        w.set_battery(false);
+        assert!(!w.get(&k).unwrap().stale(now + Duration::from_secs(17)), "plugged in: judged by the answer's 6 s");
+        assert!(w.get(&k).unwrap().stale(now + Duration::from_secs(19)));
+        // answered on mains, then unplugged: its 3 s stand until the next answer
+        let later = now + Duration::from_secs(20);
+        assert_eq!(w.due(later, Activity::Active).len(), 1);
+        w.apply(&k, Ok(snapshot(&["w1"])), later);
+        w.set_battery(true);
+        assert_eq!(w.due(later + Duration::from_secs(3), Activity::Active).len(), 1, "due as asked at the answer");
+        assert!(!w.get(&k).unwrap().stale(later + Duration::from_secs(9)));
     }
 
     #[test]

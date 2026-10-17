@@ -9,7 +9,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub const HEIGHT: f32 = 24.0;
-/// How old a directory's git state may get before a render asks git again.
+/// How old a directory's git state may get before a render asks git again; this and the worktrees' changes and PR
+/// TTLs double on battery (`power::stretch`).
 const GIT_TTL: Duration = Duration::from_secs(5);
 /// How often a folder's repo is asked whether it has an `origin` (remotes rarely change).
 const ORIGIN_TTL: Duration = Duration::from_secs(30);
@@ -150,7 +151,7 @@ pub fn branch_of(dir: &str, cx: &mut App) -> Option<String> {
 
 /// `dir`'s branch and how far it is from its upstream, as the status bar shows them.
 pub fn git_of(dir: &str, cx: &mut App) -> Option<Git> {
-    cached(dir, GIT_TTL, read_git, cx)
+    cached(dir, crate::power::stretch(GIT_TTL), read_git, cx)
 }
 
 /// `dir`'s repo has an `origin` remote, so a PR or MR can be asked about: the right panel's PR tab shows. A local
@@ -269,13 +270,13 @@ fn read_pr(key: &str) -> Option<Pr> {
 /// key). It's cached per branch, so after a checkout the last branch's PR is not shown.
 pub fn pr_of(dir: &str, active: bool, cx: &mut App) -> Option<Pr> {
     let branch = branch_of(dir, cx)?;
-    cached(&format!("{dir}\n{branch}"), if active { PR_TTL } else { Duration::MAX }, read_pr, cx)
+    cached(&format!("{dir}\n{branch}"), if active { crate::power::stretch(PR_TTL) } else { Duration::MAX }, read_pr, cx)
 }
 
 /// The worktree at `dir`'s cached changes and PR state, asked again after their TTLs while `active` (the window
 /// is key); in the background only a first lookup runs.
 pub fn changes_of(dir: &str, active: bool, cx: &mut App) -> (Option<(u32, u32)>, Option<&'static str>) {
-    let ttl = if active { CHANGES_TTL } else { Duration::MAX };
+    let ttl = if active { crate::power::stretch(CHANGES_TTL) } else { Duration::MAX };
     (cached(dir, ttl, read_changes, cx), pr_of(dir, active, cx).map(|p| p.state))
 }
 
@@ -781,7 +782,7 @@ pub fn bar(
 ) -> gpui::AnyElement {
     let pane = snapshot.zip(pane_id).and_then(|(s, id)| s.panes.iter().find(|p| p.pane_id == id));
     let dir = pane_dir(snapshot, pane_id);
-    let git = dir.as_deref().filter(|_| show.branch).and_then(|d| cached(d, GIT_TTL, read_git, cx));
+    let git = dir.as_deref().filter(|_| show.branch).and_then(|d| cached(d, crate::power::stretch(GIT_TTL), read_git, cx));
     let usage = show.usage.then(|| usage_of(crate::settings::SettingsGlobal::of(cx).settings.usage_agent, cx)).flatten().filter(|l| !l.is_empty());
     let home = std::env::home_dir();
     let muted = theme.text_muted.opacity(0.7);

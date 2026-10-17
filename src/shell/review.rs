@@ -9,7 +9,7 @@ use crate::ui::statusbar::{branch_of, cached, fetching, pane_dir, refetch};
 const REVIEW_TTL: Duration = Duration::from_secs(120);
 /// How much of a description shows folded: about six lines.
 const FOLDED: f32 = 120.;
-/// How often while one of its checks runs or waits to.
+/// How often while one of its checks runs or waits to; twice that on battery (`power::stretch`).
 pub(super) const REVIEW_POLL: Duration = Duration::from_secs(10);
 /// Past this a swipe over the checks pages when the fingers lift; short of it, the page springs back.
 const PAGE_COMMIT: f32 = 60.;
