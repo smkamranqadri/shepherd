@@ -9,6 +9,7 @@
 //! root it was asked for (a root changed meanwhile drops it, and the run with it), and only a different answer
 //! redraws.
 use super::{SidePanel, SidePanelEvent};
+use crate::files::git_ops::{self, Op};
 use crate::files::icons::material_icon;
 use crate::files::runner::{self, Host, Limits, Output, RunError};
 use crate::files::status::{self, Change, GitError, Group, Status};
@@ -82,8 +83,22 @@ const ROW_HEIGHT: f32 = 22.;
 /// take off the paths git prints from the repository's top.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Answer {
-    status: Status,
-    prefix: String,
+    pub(super) status: Status,
+    pub(super) prefix: String,
+    /// What the commit box needs: a first commit, a merge or a rebase under way.
+    pub(super) repo: RepoState,
+}
+
+/// The repository's state beside its status, read with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct RepoState {
+    /// No commit yet: Amend has nothing to amend, and unstaging takes files out of the index.
+    pub(super) initial: bool,
+    /// A merge is under way: its `MERGE_MSG`, comments left out, is what the message starts from.
+    pub(super) merge_msg: Option<String>,
+    pub(super) merging: bool,
+    /// A rebase is under way: a commit here goes into it.
+    pub(super) rebasing: bool,
 }
 
 /// One row of the list.
@@ -190,6 +205,28 @@ fn change_rows(changes: &[Change], outside: usize, folded: &HashSet<Group>) -> V
     rows
 }
 
+/// What a row's hover buttons do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowAction {
+    Stage,
+    Unstage,
+    Discard,
+    MarkResolved,
+}
+
+/// A row's buttons, left to right: a conflict is marked resolved, a staged change unstaged, a change or an untracked
+/// file discarded (when `git_ops::discardable`) or staged. An untracked nested repository has none: git would embed
+/// it, and a discard would delete a whole repository.
+fn row_actions(change: &Change) -> Vec<RowAction> {
+    let discard = git_ops::discardable(change).is_ok().then_some(RowAction::Discard);
+    match change.group {
+        Group::Conflicts => vec![RowAction::MarkResolved],
+        Group::Staged => vec![RowAction::Unstage],
+        Group::Untracked if change.is_folder() => Vec::new(),
+        Group::Changes | Group::Untracked => discard.into_iter().chain([RowAction::Stage]).collect(),
+    }
+}
+
 /// `path` (from the repository's top) as the root sees it.
 fn relative<'a>(path: &'a str, prefix: &str) -> &'a str {
     path.strip_prefix(prefix).unwrap_or(path)
@@ -223,12 +260,35 @@ async fn git(root: &Path, args: &[&str], limits: Limits) -> Result<Output, GitEr
     }
 }
 
-/// The root's place in its repository, then its status.
+/// `path` is there, asked under a deadline (a hung mount answers no).
+async fn exists(path: &Path) -> bool {
+    matches!(tokio::time::timeout(Duration::from_secs(2), tokio::fs::metadata(path.to_path_buf())).await, Ok(Ok(_)))
+}
+
+/// The root's place in its repository and where a merge or rebase would keep its state, then its status.
 async fn read_status(root: PathBuf) -> Result<Answer, GitError> {
-    let prefix = git(&root, &["rev-parse", "--show-prefix"], PREFIX).await?;
-    let prefix = String::from_utf8_lossy(&prefix.stdout).trim_end_matches(['\n', '\r']).to_string();
+    let paths = ["MERGE_HEAD", "MERGE_MSG", "rebase-merge", "rebase-apply"];
+    let mut args = vec!["rev-parse", "--show-prefix"];
+    for p in paths {
+        args.extend(["--git-path", p]);
+    }
+    let out = git(&root, &args, PREFIX).await?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut lines = text.split('\n').map(|l| l.trim_end_matches('\r'));
+    let prefix = lines.next().unwrap_or_default().to_string();
+    // relative to the root (a linked worktree's are absolute)
+    let found: Vec<PathBuf> = lines.take(paths.len()).map(|l| root.join(l)).collect();
     let out = git(&root, &["-c", "status.renames=true", "status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all"], STATUS).await?;
-    Ok(Answer { status: status::parse_status_v2(&out.stdout, &prefix), prefix })
+    let mut repo = RepoState { initial: git_ops::initial_in_status(&out.stdout), ..Default::default() };
+    if let [merge_head, merge_msg, rebase_merge, rebase_apply] = &found[..] {
+        repo.merging = exists(merge_head).await;
+        repo.rebasing = exists(rebase_merge).await || exists(rebase_apply).await;
+        if repo.merging {
+            let text = tokio::time::timeout(Duration::from_secs(2), tokio::fs::read_to_string(merge_msg.clone())).await;
+            repo.merge_msg = text.ok().and_then(Result::ok).map(|t| git_ops::merge_message(&t)).filter(|m| !m.is_empty());
+        }
+    }
+    Ok(Answer { status: status::parse_status_v2(&out.stdout, &prefix), prefix, repo })
 }
 
 /// `git config --global --add safe.directory <path>`, quoted for a shell when the path needs it.
@@ -307,6 +367,18 @@ impl SidePanel {
     /// more, when a run is out).
     pub(super) fn want_changes(&mut self, cx: &mut Context<Self>) {
         if let Some(list) = self.changes.as_mut() {
+            list.wanted = true;
+            self.poll_changes(cx);
+        }
+    }
+
+    /// After a stage, discard or commit: git asked at once, past the pace, the floor and a halt (one more after the
+    /// run out, when one is). Its answer refreshes the shown diff and the gutters (`ChangesPolled`).
+    pub(super) fn refresh_changes_now(&mut self, cx: &mut Context<Self>) {
+        if let Some(list) = self.changes.as_mut() {
+            list.next_at = None;
+            list.ran = None;
+            list.halted = false;
             list.wanted = true;
             self.poll_changes(cx);
         }
@@ -433,8 +505,18 @@ impl SidePanel {
         self.rebuild_changes(cx);
     }
 
+    /// The shown list's root, while it has one.
+    pub(super) fn changes_root(&self) -> Option<PathBuf> {
+        self.changes.as_ref().map(|l| l.root.clone())
+    }
+
+    /// The shown list's last good answer.
+    pub(super) fn changes_answer(&self) -> Option<&Answer> {
+        self.changes.as_ref()?.answer()
+    }
+
     /// `change`'s file in the root.
-    fn change_path(&self, change: &Change) -> Option<PathBuf> {
+    pub(super) fn change_path(&self, change: &Change) -> Option<PathBuf> {
         let list = self.changes.as_ref()?;
         Some(list.root.join(relative(&change.path, &list.answer()?.prefix)))
     }
@@ -516,7 +598,8 @@ impl SidePanel {
                 .into_any_element()
         };
         let menu = self.change_menu(theme, cx);
-        div().relative().size_full().flex().flex_col().child(branch_line).child(body).children(menu).into_any_element()
+        let commit = self.render_commit(theme, window, cx);
+        div().relative().size_full().flex().flex_col().child(branch_line).children(commit).child(body).children(menu).into_any_element()
     }
 
     /// Why git gave no list, and what to do about it.
@@ -553,13 +636,33 @@ impl SidePanel {
         let Some(answer) = list.answer() else { return Vec::new() };
         let menu = self.change_menu.as_ref().filter(|m| m.is_open()).map(|m| (m.value.change.group, m.value.change.path.clone()));
         let hover = theme.hover;
+        let busy = self.git_busy();
+        let outside = answer.status.outside_root;
+        let untracked: Vec<String> = answer.status.changes.iter().filter(|c| c.group == Group::Untracked).map(|c| c.path.clone()).collect();
         range
             .filter_map(|ix| Some((ix, *list.rows.get(ix)?)))
             .map(|(ix, row)| match row {
                 ChangeRow::Header { group, count, folded } => {
                     let turn = gpui::Transformation::rotate(gpui::percentage(if folded { 0. } else { 0.25 }));
+                    let elsewhere = if outside > 0 { "; changes outside this folder are left alone" } else { "" };
+                    let action = match group {
+                        Group::Changes => Some(("icons/solar/add.svg", format!("Stage all changes in this folder{elsewhere}"), Op::StageTracked)),
+                        Group::Untracked => Some(("icons/solar/add.svg", format!("Stage all untracked files in this folder{elsewhere}"), Op::StageUntracked(untracked.clone()))),
+                        Group::Staged => Some(("icons/solar/minus.svg", format!("Unstage all in this folder{elsewhere}"), Op::UnstageAll)),
+                        Group::Conflicts => None,
+                    };
+                    let action = action.map(|(icon, label, op)| {
+                        super::commit::action_button(&theme, ("change-group-action", ix), icon, label, busy)
+                            .hidden()
+                            .group_hover("change-group", |s| s.flex())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.run_git_op(op.clone(), window, cx);
+                            }))
+                    });
                     div()
                         .id(("change-group", ix))
+                        .group("change-group")
                         .h(px(ROW_HEIGHT))
                         .w_full()
                         .pl(px(8.))
@@ -580,6 +683,7 @@ impl SidePanel {
                                 .child(gpui::svg().path("icons/alt-arrow-right.svg").size(px(12.)).text_color(theme.text_muted.opacity(0.6)).with_transformation(turn)),
                         )
                         .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).font_weight(gpui::FontWeight::MEDIUM).text_color(theme.text_muted).child(group.label()))
+                        .children(action)
                         .child(div().flex_none().text_size(px(11.)).text_color(theme.text_faint).child(count.to_string()))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_group(group, cx)))
                         .into_any_element()
@@ -613,8 +717,32 @@ impl SidePanel {
                         (None, None) => rel.to_string(),
                     };
                     let (click, menu_change) = (change.clone(), change.clone());
+                    let actions = row_actions(change).into_iter().enumerate().map(|(n, action)| {
+                        let (icon, label) = match action {
+                            RowAction::Stage => ("icons/solar/add.svg", "Stage"),
+                            RowAction::Unstage => ("icons/solar/minus.svg", "Unstage"),
+                            RowAction::Discard if change.group == Group::Untracked => ("icons/solar/undo-left.svg", "Delete file"),
+                            RowAction::Discard => ("icons/solar/undo-left.svg", "Discard changes"),
+                            RowAction::MarkResolved => ("icons/solar/check-circle.svg", "Mark resolved"),
+                        };
+                        let target = change.clone();
+                        super::commit::action_button(&theme, gpui::ElementId::NamedInteger(format!("change-action-{n}").into(), ix as u64), icon, label, busy).on_click(cx.listener(
+                            move |this, _: &ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                let target = target.clone();
+                                match action {
+                                    RowAction::Stage => this.run_git_op(Op::Stage(target), window, cx),
+                                    RowAction::Unstage => this.run_git_op(Op::Unstage(target), window, cx),
+                                    RowAction::Discard => this.ask_discard(target, window, cx),
+                                    RowAction::MarkResolved => this.mark_resolved(target, window, cx),
+                                }
+                            },
+                        ))
+                    });
+                    let actions = div().flex_none().gap(px(2.)).hidden().group_hover("change-row", |s| s.flex()).when(selected, |el| el.flex()).children(actions);
                     div()
                         .id(("change-row", ix))
+                        .group("change-row")
                         .h(px(ROW_HEIGHT))
                         .w_full()
                         .pl(px(28.))
@@ -638,6 +766,7 @@ impl SidePanel {
                                 .child(name.to_string()),
                         )
                         .child(div().flex_1().min_w_0().truncate().text_size(px(11.5)).text_color(theme.text_faint).child(dir.to_string()))
+                        .child(actions)
                         .child(
                             div()
                                 .w(px(12.))
@@ -990,6 +1119,211 @@ mod tests {
             .unwrap();
         let printed = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success() && printed.contains("1 passed"), "{printed}{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    // Stage, unstage, discard and commit through `git_ops::run`, as the tab runs them, in temp repositories. Their own
+    // config names a fictional author, turns signing off and points the hooks at the repository's own, so the
+    // machine's global config cannot change what they do.
+
+    fn ours(repo: &Path) {
+        let hooks = repo.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        for (k, v) in [("user.name", "Fictional Tester"), ("user.email", "tester@example.invalid"), ("commit.gpgsign", "false"), ("core.hooksPath", hooks.to_str().unwrap())] {
+            sh(repo, &["config", k, v]);
+        }
+    }
+
+    /// `repo()` with the tab's config.
+    fn our_repo(files: &[&str]) -> (tempfile::TempDir, PathBuf) {
+        let (dir, repo) = repo(files);
+        ours(&repo);
+        (dir, repo)
+    }
+
+    async fn find(repo: &Path, group: Group, path: &str) -> Change {
+        let answer = read_status(repo.to_path_buf()).await.unwrap();
+        answer.status.changes.iter().find(|c| c.group == group && c.path == path).cloned().unwrap_or_else(|| panic!("no {group:?} {path} in {:?}", listed(&answer)))
+    }
+
+    async fn run(repo: &Path, op: Op) -> Result<(), git_ops::Failure> {
+        git_ops::run(repo.to_path_buf(), op).await
+    }
+
+    async fn listing(repo: &Path) -> Vec<(Group, String, char)> {
+        listed(&read_status(repo.to_path_buf()).await.unwrap()).into_iter().map(|(g, p, c)| (g, p.to_string(), c)).collect()
+    }
+
+    fn rows(rows: &[(Group, &str, char)]) -> Vec<(Group, String, char)> {
+        rows.iter().map(|&(g, p, c)| (g, p.to_string(), c)).collect()
+    }
+
+    /// A file named like a glob is staged alone (literal pathspecs), one named like an option is a path (the `--`).
+    #[tokio::test]
+    async fn a_stage_takes_the_file_named_and_nothing_its_name_would_match() {
+        if !has_git() {
+            return;
+        }
+        let (_dir, repo) = our_repo(&["a.txt"]);
+        write(&repo, "a.txt", "edited\n");
+        write(&repo, "*.txt", "glob\n");
+        write(&repo, "-n.txt", "dash\n");
+        run(&repo, Op::Stage(find(&repo, Group::Untracked, "*.txt").await)).await.unwrap();
+        run(&repo, Op::Stage(find(&repo, Group::Untracked, "-n.txt").await)).await.unwrap();
+        assert_eq!(listing(&repo).await, rows(&[(Group::Staged, "*.txt", 'A'), (Group::Staged, "-n.txt", 'A'), (Group::Changes, "a.txt", 'M')]));
+        // Stage All in a subfolder root leaves the rest of the repository alone
+        write(&repo, "app/x.txt", "x\n");
+        let app = repo.join("app");
+        let answer = read_status(app.clone()).await.unwrap();
+        let untracked: Vec<String> = answer.status.changes.iter().filter(|c| c.group == Group::Untracked).map(|c| c.path.clone()).collect();
+        run(&app, Op::StageUntracked(untracked)).await.unwrap();
+        run(&app, Op::StageTracked).await.unwrap();
+        assert_eq!(listing(&repo).await, rows(&[(Group::Staged, "*.txt", 'A'), (Group::Staged, "-n.txt", 'A'), (Group::Staged, "app/x.txt", 'A'), (Group::Changes, "a.txt", 'M')]));
+    }
+
+    #[tokio::test]
+    async fn an_unstage_puts_a_file_and_both_sides_of_a_rename_back() {
+        if !has_git() {
+            return;
+        }
+        let (_dir, repo) = our_repo(&["a.txt", "old name.txt"]);
+        write(&repo, "a.txt", "edited\n");
+        sh(&repo, &["add", "a.txt"]);
+        sh(&repo, &["mv", "old name.txt", "new name.txt"]);
+        run(&repo, Op::Unstage(find(&repo, Group::Staged, "a.txt").await)).await.unwrap();
+        run(&repo, Op::Unstage(find(&repo, Group::Staged, "new name.txt").await)).await.unwrap();
+        assert_eq!(listing(&repo).await, rows(&[(Group::Changes, "a.txt", 'M'), (Group::Changes, "old name.txt", 'D'), (Group::Untracked, "new name.txt", 'U')]));
+        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "edited\n");
+        sh(&repo, &["add", "-A"]);
+        run(&repo, Op::UnstageAll).await.unwrap();
+        assert_eq!(listing(&repo).await.iter().filter(|r| r.0 == Group::Staged).count(), 0);
+    }
+
+    /// Before the first commit there is no HEAD to reset to: the file leaves the index and keeps its edits.
+    #[tokio::test]
+    async fn an_unstage_before_the_first_commit_keeps_the_file() {
+        if !has_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        sh(&repo, &["init", "-q"]);
+        ours(&repo);
+        write(&repo, "first.txt", "one\n");
+        write(&repo, "second.txt", "two\n");
+        sh(&repo, &["add", "-A"]);
+        write(&repo, "first.txt", "one, edited\n");
+        let answer = read_status(repo.clone()).await.unwrap();
+        assert!(answer.repo.initial);
+        run(&repo, Op::Unstage(find(&repo, Group::Staged, "first.txt").await)).await.unwrap();
+        assert_eq!(listing(&repo).await, rows(&[(Group::Staged, "second.txt", 'A'), (Group::Untracked, "first.txt", 'U')]));
+        assert_eq!(std::fs::read_to_string(repo.join("first.txt")).unwrap(), "one, edited\n");
+        run(&repo, Op::UnstageAll).await.unwrap();
+        assert_eq!(listing(&repo).await, rows(&[(Group::Untracked, "first.txt", 'U'), (Group::Untracked, "second.txt", 'U')]));
+        // and the first commit itself
+        run(&repo, Op::Stage(find(&repo, Group::Untracked, "second.txt").await)).await.unwrap();
+        run(&repo, Op::Commit { message: "Start the fictional project".into(), amend: false }).await.unwrap();
+        assert_eq!(sh(&repo, &["log", "--format=%s"]), "Start the fictional project");
+        assert!(!read_status(repo).await.unwrap().repo.initial);
+    }
+
+    /// A discard goes through its prompt: an edit back to the index's version, a delete back on disk, an untracked
+    /// file deleted.
+    #[tokio::test]
+    async fn a_discard_restores_tracked_files_and_deletes_an_untracked_one() {
+        if !has_git() {
+            return;
+        }
+        let (_dir, repo) = our_repo(&["a.txt", "gone.txt", "*.txt"]);
+        let committed = std::fs::read_to_string(repo.join("a.txt")).unwrap();
+        write(&repo, "a.txt", "edited\n");
+        write(&repo, "*.txt", "edited too\n");
+        std::fs::remove_file(repo.join("gone.txt")).unwrap();
+        write(&repo, "scratch.txt", "fictional notes\n");
+        let discard = |c: &Change| git_ops::confirm_discard(c, &c.path, false).unwrap().answered(0).unwrap();
+        run(&repo, discard(&find(&repo, Group::Changes, "*.txt").await)).await.unwrap();
+        // the glob's name touched only its own file
+        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "edited\n");
+        run(&repo, discard(&find(&repo, Group::Changes, "a.txt").await)).await.unwrap();
+        run(&repo, discard(&find(&repo, Group::Changes, "gone.txt").await)).await.unwrap();
+        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), committed);
+        assert!(repo.join("gone.txt").is_file());
+        assert_eq!(listing(&repo).await, rows(&[(Group::Untracked, "scratch.txt", 'U')]));
+        run(&repo, discard(&find(&repo, Group::Untracked, "scratch.txt").await)).await.unwrap();
+        assert!(!repo.join("scratch.txt").exists());
+        assert_eq!(listing(&repo).await, rows(&[]));
+    }
+
+    /// A commit takes its message from stdin, as typed; Amend replaces the last commit; nothing staged is said so.
+    #[tokio::test]
+    async fn a_commit_an_amend_and_nothing_staged() {
+        if !has_git() {
+            return;
+        }
+        let (_dir, repo) = our_repo(&["a.txt"]);
+        write(&repo, "a.txt", "edited\n");
+        let nothing = run(&repo, Op::Commit { message: "Nothing here".into(), amend: false }).await.unwrap_err();
+        assert_eq!(nothing.kind, git_ops::Kind::NothingStaged, "{nothing:?}");
+        run(&repo, Op::Stage(find(&repo, Group::Changes, "a.txt").await)).await.unwrap();
+        let message = "Tune the fictional widget\n\nIt hums -F now.\n# not a comment";
+        run(&repo, Op::Commit { message: message.into(), amend: false }).await.unwrap();
+        assert_eq!(sh(&repo, &["log", "-1", "--format=%B"]), message);
+        assert_eq!(sh(&repo, &["rev-list", "--count", "HEAD"]), "2");
+        assert_eq!(git_ops::last_message(repo.clone()).await.unwrap(), message);
+        run(&repo, Op::Commit { message: "Tune the widget, reworded".into(), amend: true }).await.unwrap();
+        assert_eq!(sh(&repo, &["log", "-1", "--format=%B"]), "Tune the widget, reworded");
+        assert_eq!(sh(&repo, &["rev-list", "--count", "HEAD"]), "2");
+        assert_eq!(listing(&repo).await, rows(&[]));
+    }
+
+    /// A pre-commit hook's refusal comes back with its own words, and nothing is committed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_pre_commit_hook_is_reported_with_its_output() {
+        use std::os::unix::fs::PermissionsExt;
+        if !has_git() {
+            return;
+        }
+        let (_dir, repo) = our_repo(&["a.txt"]);
+        let hook = repo.join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\necho 'lint: 2 problems in a.txt' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write(&repo, "a.txt", "edited\n");
+        run(&repo, Op::Stage(find(&repo, Group::Changes, "a.txt").await)).await.unwrap();
+        let failed = run(&repo, Op::Commit { message: "Blocked".into(), amend: false }).await.unwrap_err();
+        assert_eq!(failed, git_ops::Failure { kind: git_ops::Kind::HookFailed, text: "lint: 2 problems in a.txt".into() });
+        assert_eq!(sh(&repo, &["rev-list", "--count", "HEAD"]), "1");
+    }
+
+    /// A merge under way reads its `MERGE_MSG`, comments left out; the rows offer what their group allows.
+    #[tokio::test]
+    async fn a_merge_reads_its_message_and_rows_offer_their_actions() {
+        if !has_git() {
+            return;
+        }
+        let (_dir, repo) = our_repo(&["f.txt"]);
+        sh(&repo, &["checkout", "-qb", "other"]);
+        write(&repo, "f.txt", "theirs\n");
+        sh(&repo, &["commit", "-qam", "theirs"]);
+        sh(&repo, &["checkout", "-q", "main"]);
+        write(&repo, "f.txt", "ours\n");
+        sh(&repo, &["commit", "-qam", "ours"]);
+        sh(&repo, &["merge", "-q", "other"]);
+        let answer = read_status(repo.clone()).await.unwrap();
+        assert!(answer.repo.merging && !answer.repo.rebasing && !answer.repo.initial);
+        assert_eq!(answer.repo.merge_msg.as_deref(), Some("Merge branch 'other'"));
+        let conflict = find(&repo, Group::Conflicts, "f.txt").await;
+        assert_eq!(row_actions(&conflict), [RowAction::MarkResolved]);
+        assert!(git_ops::has_conflict_markers(&std::fs::read_to_string(repo.join("f.txt")).unwrap()));
+        let mut c = conflict.clone();
+        c.group = Group::Untracked;
+        assert_eq!(row_actions(&c), [RowAction::Discard, RowAction::Stage]);
+        c.path = "nested/".into();
+        assert_eq!(row_actions(&c), []);
+        c.group = Group::Staged;
+        assert_eq!(row_actions(&c), [RowAction::Unstage]);
+        run(&repo, Op::Stage(conflict)).await.unwrap();
+        assert_eq!(listing(&repo).await, rows(&[(Group::Staged, "f.txt", 'M')]));
     }
 
     /// Run only by `a_git_dir_in_the_environment_does_not_redirect_the_read`, with `GIT_DIR` set.

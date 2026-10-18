@@ -2,6 +2,7 @@
 //! tab strip, edge and width) and the PR tab. It holds what those tabs show and the work that fills them, so a
 //! keystroke in Search re-renders the panel, not the window.
 mod changes;
+mod commit;
 mod files;
 mod search;
 
@@ -105,6 +106,8 @@ pub struct SidePanel {
     changes_tab_shown: bool,
     /// The Changes tab's folded groups, kept across roots as VS Code keeps them across repositories.
     changes_folded: std::collections::HashSet<crate::files::status::Group>,
+    /// The Changes tab's commit message and the stage, discard or commit running.
+    commit: commit::CommitBox,
     /// The panel is open (on any tab, the window active or not): its root is watched.
     panel_shown: bool,
     watch: Option<Watching>,
@@ -144,6 +147,7 @@ impl SidePanel {
             changes_live: false,
             changes_tab_shown: false,
             changes_folded: Default::default(),
+            commit: Default::default(),
             panel_shown: false,
             watch: None,
             watch_state: WatchState::Off,
