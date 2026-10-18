@@ -169,9 +169,10 @@ pub(super) fn drags_while(searching: bool) -> bool {
 }
 
 /// Whether the keyboard stays off herdr's panes this frame: something covers them (`covered`: Settings, the
-/// command panel, a floating view, a file tab), or one of the sidebar's fields is typed in (`typing`).
-pub(super) fn keyboard_elsewhere(covered: bool, typing: bool) -> bool {
-    covered || typing
+/// command panel, a floating view, a file tab), one of the sidebar's fields is typed in (`typing`), or a dialog
+/// with fields is up (`dialog`: New session or Add SSH machine, Edit session), whichever field has the keyboard.
+pub(super) fn keyboard_elsewhere(covered: bool, typing: bool, dialog: bool) -> bool {
+    covered || typing || dialog
 }
 
 /// Whether the sidebar is drawn: docked, or its peek card out (`peek`, how far it has slid).
@@ -612,9 +613,10 @@ mod tests {
 
     #[test]
     fn a_field_typed_in_keeps_the_keyboard_from_the_panes() {
-        assert!(!keyboard_elsewhere(false, false), "herdr's focused pane takes it");
-        assert!(keyboard_elsewhere(false, true), "the search or a rename being typed in");
-        assert!(keyboard_elsewhere(true, false), "Settings, the command panel, a floating view, a file tab");
+        assert!(!keyboard_elsewhere(false, false, false), "herdr's focused pane takes it");
+        assert!(keyboard_elsewhere(false, true, false), "the search or a rename being typed in");
+        assert!(keyboard_elsewhere(true, false, false), "Settings, the command panel, a floating view, a file tab");
+        assert!(keyboard_elsewhere(false, false, true), "New session, Add SSH machine or Edit session up");
     }
 
     #[test]

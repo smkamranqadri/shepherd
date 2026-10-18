@@ -219,6 +219,8 @@ pub(super) struct Choices {
 /// ones picked added, or a new one named in New session…. A session is only ever added because it was picked.
 #[derive(Debug)]
 pub(super) struct HostFlow {
+    /// This dialog's flow among every one opened: an add or read that lands is routed by it (`route`).
+    pub id: u64,
     pub stage: Stage,
     /// The host read, or being read.
     pub target: String,
@@ -237,7 +239,9 @@ pub(super) struct HostFlow {
 
 impl HostFlow {
     pub(super) fn new() -> Self {
-        HostFlow { stage: Stage::Host, target: String::new(), found: Vec::new(), run: 0, picked: Vec::new(), naming: false, problem: None, saved: Vec::new() }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        HostFlow { id, stage: Stage::Host, target: String::new(), found: Vec::new(), run: 0, picked: Vec::new(), naming: false, problem: None, saved: Vec::new() }
     }
 
     /// What Enter does with `host` typed: a host other than the one read is read first.
@@ -250,6 +254,21 @@ impl HostFlow {
             Stage::Choose => Primary::Add,
             Stage::Host | Stage::Failed(_) => Primary::Connect,
         }
+    }
+
+    /// The rows listed are another host's than the one typed (`host`): they are dimmed and not picked, and this
+    /// says what to do.
+    pub(super) fn stale(&self, host: &str) -> Option<String> {
+        let host = host.trim();
+        if host == self.target || !matches!(self.stage, Stage::Choose | Stage::Failed(_)) {
+            return None;
+        }
+        Some(if host.is_empty() { "Type a host, then Connect.".to_string() } else { format!("Press Connect to read {host}.") })
+    }
+
+    /// The Remote switch holds while sessions are being added: their results come back to this flow.
+    pub(super) fn locks_remote(&self) -> bool {
+        matches!(self.stage, Stage::Adding(_))
     }
 
     /// Reads `host`'s sessions: the read's number, for [`Self::listed`]; or why not.
@@ -349,6 +368,10 @@ impl HostFlow {
                 out.push(name.to_string());
             }
         }
+        // every one picked is being added already, from here or Sessions on this host…
+        if out.is_empty() && self.picked.iter().any(|p| rows.iter().any(|r| &r.name == p && r.adding)) {
+            return Err(ALREADY_ADDING.into());
+        }
         if out.is_empty() {
             return Err("Pick a session to add, or New session….".into());
         }
@@ -384,6 +407,67 @@ impl HostFlow {
         }
         if done {
             self.stage = if self.problem.is_none() { Stage::Done } else { Stage::Choose };
+        }
+    }
+}
+
+/// What Add says when every session picked is being added already.
+pub(super) const ALREADY_ADDING: &str = "Already being added.";
+
+/// Where an add's (or a read's) result goes: into the dialog while the flow it was begun from (`flow`) is the one
+/// the open dialog holds (`open`), else a toast. Whether Remote is on or which host is typed does not matter: a
+/// dialog opened again holds another flow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Route {
+    Dialog,
+    Toast,
+}
+
+pub(super) fn route(open: Option<u64>, flow: u64) -> Route {
+    if open == Some(flow) { Route::Dialog } else { Route::Toast }
+}
+
+/// Add SSH machine's adds, run one after another: each begins only while its flow is still up, so a dialog closed
+/// (or opened again) mid queue starts no more.
+#[derive(Debug)]
+pub(super) struct AddQueue {
+    pub flow: u64,
+    pub target: String,
+    left: std::collections::VecDeque<String>,
+    added: usize,
+}
+
+/// What an [`AddQueue`] does next.
+#[derive(Debug, PartialEq)]
+pub(super) enum Next {
+    Add(String),
+    /// Its flow is gone: these were not begun, and the toast says so.
+    Cancelled(Vec<String>, String),
+    Finished,
+}
+
+impl AddQueue {
+    pub(super) fn new(flow: u64, target: String, names: Vec<String>) -> Self {
+        AddQueue { flow, target, left: names.into(), added: 0 }
+    }
+
+    /// The next add, given the flow the open dialog holds now (`open`).
+    pub(super) fn next(&mut self, open: Option<u64>) -> Next {
+        if self.left.is_empty() {
+            return Next::Finished;
+        }
+        if route(open, self.flow) == Route::Toast {
+            let names: Vec<String> = self.left.drain(..).collect();
+            let note = format!("{} added on {}, {} cancelled when the dialog closed.", self.added, self.target, names.len());
+            return Next::Cancelled(names, note);
+        }
+        Next::Add(self.left.pop_front().expect("not empty"))
+    }
+
+    /// The add begun last landed, saved (`saved`) or not.
+    pub(super) fn landed(&mut self, saved: bool) {
+        if saved {
+            self.added += 1;
         }
     }
 }
@@ -466,7 +550,7 @@ impl Shell {
                 return cx.notify();
             }
         };
-        let target = flow.target.clone();
+        let (target, flow_id) = (flow.target.clone(), flow.id);
         let list = self.rt.spawn({
             let target = target.clone();
             async move { crate::herdr::remote_sessions(&target).await }
@@ -474,8 +558,8 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let found = list.await.unwrap_or_else(|e| Err(ListError::Failed(e.to_string())));
             let _ = this.update(cx, |s, cx| {
-                // a dialog closed and opened again meanwhile counts its reads afresh: the host tells them apart too
-                if let Some(d) = s.session_dialog.as_mut().filter(|d| d.is_open() && d.value.flow.target == target) {
+                // a dialog closed and opened again meanwhile holds another flow
+                if let Some(d) = s.session_dialog.as_mut().filter(|d| route(d.is_open().then_some(d.value.flow.id), flow_id) == Route::Dialog) {
                     d.value.flow.listed(run, found);
                     cx.notify();
                 }
@@ -502,17 +586,40 @@ impl Shell {
             }
         };
         let begun: Vec<String> = names.into_iter().filter(|n| self.tree.adds.begin(&target, n)).collect();
+        if begun.is_empty() {
+            flow.problem = Some(ALREADY_ADDING.into());
+            return cx.notify();
+        }
         flow.adding(begun.clone());
+        let mut queue = AddQueue::new(flow.id, target, begun);
         let rt = self.rt.clone();
         cx.spawn(async move |this, cx| {
-            for name in begun {
+            loop {
+                let Ok(next) = this.update(cx, |s, _| queue.next(s.open_flow())) else { return }; // window closed
+                let name = match next {
+                    Next::Add(name) => name,
+                    Next::Finished => return,
+                    Next::Cancelled(names, note) => {
+                        let _ = this.update(cx, |s, cx| {
+                            for name in &names {
+                                s.tree.adds.finished(&queue.target, name, true, Instant::now());
+                            }
+                            crate::ui::toast::info(cx, note, None);
+                            cx.notify();
+                        });
+                        return;
+                    }
+                };
                 let task = rt.spawn({
-                    let (target, name) = (target.clone(), name.clone());
+                    let (target, name) = (queue.target.clone(), name.clone());
                     async move { crate::herdr::add_machine(&target, &name).await }
                 });
                 let added = task.await.unwrap_or_else(|e| Err(AddError::Failed(e.to_string())));
-                if this.update(cx, |s, cx| s.session_added(&target, &name, added, cx)).is_err() {
-                    return; // window closed
+                queue.landed(added.is_ok());
+                let flow = queue.flow;
+                let target = queue.target.clone();
+                if this.update(cx, |s, cx| s.session_added(flow, &target, &name, added, cx)).is_err() {
+                    return;
                 }
             }
         })
@@ -520,14 +627,18 @@ impl Shell {
         cx.notify();
     }
 
-    /// One add of Add SSH machine landed: into the dialog while it is up for the host, else a toast says how it went.
-    /// Once the last is saved, the dialog closes and the first machine saved is shown.
-    fn session_added(&mut self, target: &str, name: &str, added: Result<Machine, AddError>, cx: &mut Context<Self>) {
+    /// The flow the open session dialog holds, if it is open.
+    fn open_flow(&self) -> Option<u64> {
+        self.session_dialog.as_ref().filter(|d| d.is_open()).map(|d| d.value.flow.id)
+    }
+
+    /// One add of Add SSH machine's flow `flow` landed: into the dialog while it holds that flow, else a toast says
+    /// how it went. Once the last is saved, the dialog closes and the first machine saved is shown.
+    fn session_added(&mut self, flow: u64, target: &str, name: &str, added: Result<Machine, AddError>, cx: &mut Context<Self>) {
         let failed = matches!(added, Err(AddError::Failed(_) | AddError::TimedOut));
         self.tree.adds.finished(target, name, failed, Instant::now());
-        let dialog = self.session_dialog.as_mut().filter(|d| d.is_open() && d.value.remote && d.value.flow.target == target);
-        match dialog {
-            Some(dialog) => {
+        match (route(self.open_flow(), flow), self.session_dialog.as_mut()) {
+            (Route::Dialog, Some(dialog)) => {
                 dialog.value.flow.added(name, &added);
                 if dialog.value.flow.stage == Stage::Done {
                     let first = dialog.value.flow.saved.first().cloned();
@@ -538,7 +649,7 @@ impl Shell {
                     }
                 }
             }
-            None => match add_note(&added, target, name) {
+            _ => match add_note(&added, target, name) {
                 Some(note) => crate::ui::toast::error(cx, note),
                 None => crate::ui::toast::info(cx, format!("{name} on {target} was added."), None),
             },
@@ -844,7 +955,7 @@ mod tests {
         f.pick("docs");
         let c = f.choices(&[], &adds);
         assert_eq!(choice_rows(&c), [("agents", "running", false, false), ("docs", "Adding…", false, true)]);
-        assert_eq!(f.chosen("", &[], &adds), Err("Pick a session to add, or New session….".into()), "being added already");
+        assert_eq!(f.chosen("", &[], &adds), Err(ALREADY_ADDING.into()), "being added already: said so, nothing added");
         f.toggle_naming();
         assert_eq!(f.chosen("docs", &[], &adds), Err("docs on you@workbox is being added.".into()));
         f.toggle_naming();
@@ -893,6 +1004,56 @@ mod tests {
         let run = f.connect("you@otherbox").unwrap();
         f.listed(run, Ok(vec![info("docs", true)]));
         assert!(f.chosen("", &[], &none()).is_err(), "docs was picked on you@workbox");
+    }
+
+    #[test]
+    fn an_add_lands_in_the_flow_it_was_begun_from() {
+        let flow = HostFlow::new();
+        assert_eq!(route(Some(flow.id), flow.id), Route::Dialog, "the dialog still up");
+        assert_eq!(route(None, flow.id), Route::Toast, "the dialog closed");
+        let again = HostFlow::new();
+        assert_ne!(again.id, flow.id);
+        assert_eq!(route(Some(again.id), flow.id), Route::Toast, "opened again: another flow");
+        // Remote can't be flipped off while its adds run, and with the same flow up they come back to it
+        let mut f = flow_listed(vec![info("docs", false)]);
+        assert!(!f.locks_remote());
+        f.pick("docs");
+        f.adding(vec!["docs".into()]);
+        assert!(f.locks_remote());
+        assert_eq!(route(Some(f.id), f.id), Route::Dialog);
+        f.added("docs", &Ok(saved("you@workbox", "docs")));
+        assert!(!f.locks_remote());
+    }
+
+    #[test]
+    fn a_dialog_closed_mid_queue_begins_no_more_adds() {
+        let mut q = AddQueue::new(7, "you@workbox".into(), vec!["docs".into(), "agents".into(), "notes".into()]);
+        assert_eq!(q.next(Some(7)), Next::Add("docs".into()));
+        q.landed(true);
+        assert_eq!(q.next(None), Next::Cancelled(vec!["agents".into(), "notes".into()], "1 added on you@workbox, 2 cancelled when the dialog closed.".into()));
+        assert_eq!(q.next(Some(7)), Next::Finished, "none left to begin");
+        let mut q = AddQueue::new(7, "you@workbox".into(), vec!["docs".into(), "agents".into()]);
+        assert_eq!(q.next(Some(7)), Next::Add("docs".into()));
+        q.landed(false);
+        assert_eq!(q.next(Some(8)), Next::Cancelled(vec!["agents".into()], "0 added on you@workbox, 1 cancelled when the dialog closed.".into()), "opened again");
+        let mut q = AddQueue::new(7, "you@workbox".into(), vec!["docs".into()]);
+        assert_eq!(q.next(Some(7)), Next::Add("docs".into()));
+        assert_eq!(q.next(Some(7)), Next::Finished);
+    }
+
+    #[test]
+    fn another_host_typed_dims_the_old_list() {
+        let f = flow_listed(vec![info("docs", false)]);
+        assert_eq!(f.stale("you@workbox"), None);
+        assert_eq!(f.stale(" you@workbox "), None);
+        assert_eq!(f.stale("you@otherbox").as_deref(), Some("Press Connect to read you@otherbox."));
+        assert_eq!(f.stale("").as_deref(), Some("Type a host, then Connect."));
+        assert_eq!(f.primary("you@otherbox"), Primary::Connect);
+        let mut failed = HostFlow::new();
+        let run = failed.connect("you@workbox").unwrap();
+        failed.listed(run, Err(ListError::NotInstalled));
+        assert_eq!(failed.stale("you@otherbox").as_deref(), Some("Press Connect to read you@otherbox."));
+        assert_eq!(HostFlow::new().stale("you@workbox"), None, "nothing listed yet");
     }
 
     /// Add SSH machine's list as it comes over SSH from a stand-in host, and a host where herdr is missing.

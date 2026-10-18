@@ -577,10 +577,17 @@ impl Shell {
                     discover::Stage::Listing => {
                         body = body.child(div().mt(px(12.)).flex().items_center().gap(px(8.)).text_color(theme.text_muted).child(spinner(theme, "add-machine-loading".into())).child("Asking the host…"))
                     }
-                    discover::Stage::Failed(e) => body = body.child(line(discover::list_failure(e, &flow.target, &self.machine_records(&flow.target)))),
+                    discover::Stage::Failed(e) => {
+                        body = body.child(line(discover::list_failure(e, &flow.target, &self.machine_records(&flow.target))));
+                        if let Some(text) = flow.stale(&host_typed) {
+                            body = body.child(line(text));
+                        }
+                    }
                     discover::Stage::Choose | discover::Stage::Adding(_) | discover::Stage::Done => {
                         let choices = flow.choices(&self.machine_records(&flow.target), &self.tree.adds);
-                        let choosing = flow.stage == discover::Stage::Choose;
+                        // another host typed since: the rows listed are the old one's, dimmed and not picked
+                        let stale = flow.stale(&host_typed);
+                        let choosing = flow.stage == discover::Stage::Choose && stale.is_none();
                         if let Some(text) = choices.line {
                             body = body.child(line(text));
                         }
@@ -592,8 +599,11 @@ impl Shell {
                         let new = discover::Row { name: "New session…".into(), note: "named here, started when added", adding: false, picked: flow.naming };
                         let new = discover::session_choice(theme, ("add-machine-new", 0), &new)
                             .when(choosing, |el| el.on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_new_remote_session(window, cx))));
-                        body = body.child(div().mt(px(10.)).flex().flex_col().gap(px(2.)).children(rows).child(new));
-                        if flow.naming && choosing {
+                        body = body.child(div().mt(px(10.)).flex().flex_col().gap(px(2.)).when(stale.is_some(), |el| el.opacity(0.45)).children(rows).child(new));
+                        if let Some(text) = stale {
+                            body = body.child(line(text));
+                        }
+                        if flow.naming && flow.stage == discover::Stage::Choose {
                             body = body.child(label("Name of the new session")).child(field(&dialog.value.name));
                         }
                     }
@@ -616,7 +626,7 @@ impl Shell {
                 (true, discover::Primary::Add) => ("Add SSH machine", "Add"),
                 (true, _) => ("Add SSH machine", "Connect"),
             };
-            let retry = remote && matches!(flow.stage, discover::Stage::Failed(_)) && primary == discover::Primary::Connect;
+            let retry = remote && matches!(flow.stage, discover::Stage::Failed(_)) && flow.stale(&host_typed).is_none();
             let waiting = remote && primary == discover::Primary::Wait;
             let card = dialog_card(theme, "session-dialog", title)
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| this.finish_session_dialog(false, cx)))
@@ -639,6 +649,8 @@ impl Shell {
                         .rounded(px(6.))
                         .child(div().flex_1().child("Remote"))
                         .child(crate::ui::switch(theme, remote, "session-remote"))
+                        // held while sessions are being added
+                        .when(flow.locks_remote(), |el| el.opacity(0.5).cursor_default())
                         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_session_remote(window, cx))),
                 )
                 .child(

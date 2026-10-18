@@ -576,6 +576,10 @@ impl Shell {
 
     pub(super) fn toggle_session_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(dialog) = self.session_dialog.as_mut() else { return };
+        // the adds under way report back to this flow, shown with Remote on
+        if dialog.value.flow.locks_remote() {
+            return;
+        }
         dialog.value.remote = !dialog.value.remote;
         dialog.value.flips += 1;
         let focus = if dialog.value.remote { &dialog.value.host } else { &dialog.value.name };
@@ -606,6 +610,12 @@ impl Shell {
             });
         }
         cx.notify();
+    }
+
+    /// A dialog of Shepherd's is up (New session or Add SSH machine, Edit session): its fields keep the keyboard, so
+    /// herdr moving its focus does not hand it to a pane.
+    pub(super) fn dialog_up(&self) -> bool {
+        self.session_dialog.as_ref().is_some_and(|d| d.is_open()) || self.place_edit.as_ref().is_some_and(|e| e.is_open())
     }
 
     /// Add SSH machine's rows: a click on a session picks it, or no longer.

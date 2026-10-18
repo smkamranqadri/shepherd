@@ -1469,7 +1469,7 @@ impl Render for Shell {
         // moving its focus, or a switch, must not hand it back to a pane mid word
         let typing = self.sidebar_search.as_ref().is_some_and(|s| s.input.read(cx).focus_handle(cx).is_focused(window))
             || self.renaming.as_ref().is_some_and(|r| r.input.read(cx).focus_handle(cx).is_focused(window));
-        let overlaid = sidebar_search::keyboard_elsewhere(covered, typing);
+        let overlaid = sidebar_search::keyboard_elsewhere(covered, typing, self.dialog_up());
         // a session was left: the keyboard leaves its parked panes (out of `panes`) for the window, and herdr's
         // focused pane here takes it next
         if self.views.take_refocus() && self.settings.is_none() {
