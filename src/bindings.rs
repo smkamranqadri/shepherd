@@ -58,6 +58,8 @@ app_actions! {
     Workspace9: "Go to workspace 9",
     ToggleSidebar: "Toggle sidebar",
     ToggleAgentsView: "Sidebar: workspaces or agents",
+    FilterSidebar: "Sidebar: filter",
+    ToggleFocusMode: "Sidebar: focus mode",
     ToggleReview: "Toggle right panel",
     ShowFiles: "Files",
     ShowChanges: "Changes",
@@ -1215,6 +1217,15 @@ mod tests {
         assert!(known("ToggleAgentsView"));
         assert!(!DEFAULTS.iter().any(|(a, _)| *a == "ToggleAgentsView"));
         assert_eq!(chord(&effective(&user(&[])), "ToggleAgentsView"), None);
+    }
+
+    #[test]
+    fn the_sidebar_s_search_and_focus_mode_have_no_default_chord() {
+        for action in ["FilterSidebar", "ToggleFocusMode"] {
+            assert!(known(action), "{action}");
+            assert!(!DEFAULTS.iter().any(|(a, _)| *a == action), "{action}");
+            assert_eq!(chord(&effective(&user(&[])), action), None, "{action}");
+        }
     }
 
     #[test]

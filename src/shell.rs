@@ -35,6 +35,7 @@ mod kept_views;
 mod session_views;
 mod sessions;
 mod sidebar;
+mod sidebar_search;
 mod sidebar_tree;
 mod needs_you;
 mod watchers;
@@ -308,6 +309,8 @@ pub struct Shell {
     feeds: HashMap<watchers::SessionKey, (u64, gpui::Task<()>)>,
     /// The tree's goal after a switch and its machine menu.
     tree: sidebar_tree::TreeState,
+    /// The sidebar's search field, while it is up (FilterSidebar).
+    sidebar_search: Option<sidebar_search::SidebarSearch>,
     /// The New session dialog, open over the window.
     session_dialog: Option<crate::ui::Popup<sessions::SessionDialog>>,
     /// Delete a session, or forget a machine? Asked first.
@@ -662,6 +665,7 @@ impl Shell {
                     session_watch_settled: false,
                     feeds: HashMap::new(),
                     tree: Default::default(),
+                    sidebar_search: None,
                     session_dialog: None,
                     session_delete: None,
                     machine_label: None,
@@ -1817,6 +1821,8 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &Workspace9, _, cx| this.go_to_workspace(8, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &ToggleAgentsView, _, cx| this.toggle_agents_view(cx)))
+            .on_action(cx.listener(|this, _: &FilterSidebar, w, cx| this.open_sidebar_search(w, cx)))
+            .on_action(cx.listener(|this, _: &ToggleFocusMode, _, cx| this.toggle_focus_mode(cx)))
             .on_action(cx.listener(|this, _: &ToggleReview, w, cx| this.toggle_review(w, cx)))
             .on_action(cx.listener(|this, _: &ShowFiles, w, cx| this.show_panel_tab(crate::settings::PanelTab::Files, w, cx)))
             .on_action(cx.listener(|this, _: &ShowChanges, w, cx| this.show_panel_tab(crate::settings::PanelTab::Changes, w, cx)))

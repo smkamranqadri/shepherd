@@ -23,7 +23,7 @@ impl Shell {
             // under the `…` button, its left edge on the button's
             let at = gpui::point(px(sidebar_w - 8. - 24.), px(TRAFFIC_LIGHTS_CENTER + 12. + 4.));
             let settings = &SettingsGlobal::of(cx).settings;
-            let (show, compact) = (settings.workspace_show, settings.compact_workspaces);
+            let (show, compact, focus) = (settings.workspace_show, settings.compact_workspaces, settings.sidebar_focus);
             let show_submenu = self.show_submenu;
             let submenu_bounds = self.show_submenu_bounds.clone();
             let parts: [(&'static str, &'static str, &'static str, fn(&mut crate::settings::WorkspaceShow) -> &mut bool); 5] = [
@@ -109,6 +109,15 @@ impl Shell {
                                 .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
                                     save_from_sidebar(cx, |s| s.compact_workspaces = !s.compact_workspaces)
                                 })),
+                        )
+                        // the Workspaces tree keeps to the session shown
+                        .child(
+                            row(theme, false, "sidebar-focus")
+                                .h(px(30.))
+                                .rounded(px(6.))
+                                .child(div().flex_1().child("Focus mode"))
+                                .child(crate::ui::switch(theme, focus, "sidebar-focus"))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_focus_mode(cx))),
                         ),
                 )),
             )

@@ -12,6 +12,20 @@ use crate::herdr::{Machine, SessionInfo};
 use gpui::DragMoveEvent;
 use std::collections::HashSet;
 use tree_drag::{DraggedTreeItem, Item, Over};
+use super::sidebar_search::{Keep, Kept, TreeView, fold_saved};
+
+/// What a session's workspace rows show and do while the tree is searched: the workspaces the search keeps (`None`
+/// without a search), and whether they drag.
+#[derive(Clone, Copy)]
+pub(super) struct RowFilter<'a> {
+    pub keep: Option<&'a Keep>,
+    pub drags: bool,
+}
+
+/// A faint line where the tree or the Agents view has nothing to list.
+fn no_match(theme: &Theme, text: &'static str) -> gpui::AnyElement {
+    div().flex_none().px(px(8.)).py(px(6.)).text_size(px(11.)).text_color(theme.text_faint).child(text).into_any_element()
+}
 
 /// How long another session's branch, read from its HEAD, is kept before it is read again.
 const HEAD_TTL: Duration = Duration::from_secs(60);
@@ -229,14 +243,18 @@ pub(super) enum ViewRow {
 
 /// The Agents view's rows from the tree's (`rows`, a folded session's already without its workspaces): each session's
 /// workspaces give way to its agents (`sessions`, as the Agents section reads them), sorted by `sort` within it, those
-/// that need you alone when `attention`. An unreachable session's are its last snapshot's, as its workspaces are.
-pub(super) fn agents_view(rows: Vec<TreeRow>, sessions: &[SessionAgents], sort: AgentSort, attention: bool, now: Instant) -> Vec<ViewRow> {
+/// that need you alone when `attention`, and with a search (`kept`) those it keeps. An unreachable session's are its
+/// last snapshot's, as its workspaces are.
+pub(super) fn agents_view(rows: Vec<TreeRow>, sessions: &[SessionAgents], sort: AgentSort, attention: bool, now: Instant, kept: Option<&Kept>) -> Vec<ViewRow> {
     rows.into_iter()
         .map(|row| {
             let TreeRow::Workspaces { key } = row else { return ViewRow::Tree(row) };
             // listed without a snapshot to read yet: the shown session's first is on its way
             let Some(n) = sessions.iter().position(|s| s.key == key) else { return ViewRow::Empty("Connecting…") };
             let (mut entries, any) = cross_agents(&sessions[n..=n], sort, attention, now);
+            if let Some(keep) = kept.map(|k| k.get(&key)) {
+                entries.retain(|e| keep.is_some_and(|k| k.has(&e.pane.pane_id)));
+            }
             // their place in the whole list keeps the rows' ids apart: pane ids repeat across sessions
             for e in &mut entries {
                 e.n = n;
@@ -451,15 +469,20 @@ pub(super) fn tree(places: &[Place], w: &Watchers, collapsed: &HashSet<String>, 
 }
 
 /// The workspaces Workspace1–9 go to: the tree's visible rows from the top, worktrees of a folded group left out.
-pub(super) fn workspace_order<'a>(rows: &[TreeRow], snaps: impl Fn(&SessionKey) -> Option<&'a Snapshot>, folded: &HashSet<String>) -> Vec<(SessionKey, String)> {
+/// With a search (`kept`), only those it shows, every group open as it shows them.
+pub(super) fn workspace_order<'a>(rows: &[TreeRow], snaps: impl Fn(&SessionKey) -> Option<&'a Snapshot>, folded: &HashSet<String>, kept: Option<&Kept>) -> Vec<(SessionKey, String)> {
     let mut order = Vec::new();
     for row in rows {
         let TreeRow::Workspaces { key } = row else { continue };
         let Some(snapshot) = snaps(key) else { continue };
+        let shows = |id: &str| kept.is_none_or(|k| k.get(key).is_some_and(|k| k.has(id)));
         for (w, kids) in crate::model::groups(snapshot.workspace_tree()) {
+            if !shows(&w.workspace_id) {
+                continue;
+            }
             order.push((key.clone(), w.workspace_id.clone()));
-            if !folded.contains(&root_key(&key.0, &w.workspace_id)) {
-                order.extend(kids.iter().map(|k| (key.clone(), k.workspace_id.clone())));
+            if kept.is_some() || !folded.contains(&root_key(&key.0, &w.workspace_id)) {
+                order.extend(kids.iter().filter(|k| shows(&k.workspace_id)).map(|k| (key.clone(), k.workspace_id.clone())));
             }
         }
     }
@@ -498,6 +521,7 @@ pub(super) fn numbered<'a>(
     pending: &HashMap<SessionKey, tree_drag::Pending>,
     folded: &HashSet<String>,
     now: Instant,
+    kept: Option<&Kept>,
 ) -> Vec<(SessionKey, String)> {
     let ordered: HashMap<SessionKey, Snapshot> = pending
         .iter()
@@ -507,7 +531,7 @@ pub(super) fn numbered<'a>(
             Some((k.clone(), tree_drag::with_order(s, p.order(&list, now)?)))
         })
         .collect();
-    workspace_order(rows, |k| ordered.get(k).or_else(|| snaps(k)), folded)
+    workspace_order(rows, |k| ordered.get(k).or_else(|| snaps(k)), folded, kept)
 }
 
 /// Moves an older Shepherd's folded workspaces (bare ids) under the shown session's key; true when any moved.
@@ -521,24 +545,16 @@ pub(super) fn migrate_folds(folded: &mut HashSet<String>, shown: &str) -> bool {
 }
 
 impl Shell {
-    /// The tree's rows and the shown session's key; a socket of one's own (no session of herdr's list), or the
-    /// session shown before the list came, shows its workspaces first.
-    fn tree_model(&self, cx: &App) -> (Vec<TreeRow>, SessionKey) {
-        let collapsed: HashSet<String> = SettingsGlobal::of(cx).settings.collapsed_sessions.iter().cloned().collect();
-        let shown = self.shown_key().unwrap_or_default();
-        (model_rows(&self.places, &self.watchers, &collapsed, self.snapshot.as_ref(), &shown), shown)
-    }
-
-    /// The workspaces Workspace1–9 go to and their hint chips sit on, in the tree's order.
-    fn numbered_workspaces(&self, rows: &[TreeRow], shown: &SessionKey) -> Vec<(SessionKey, String)> {
+    /// The workspaces Workspace1–9 go to and their hint chips sit on, in the order of the tree shown (`shown_tree`).
+    pub(super) fn numbered_workspaces(&self, rows: &[TreeRow], shown: &SessionKey, kept: Option<&Kept>) -> Vec<(SessionKey, String)> {
         let snap = |k: &SessionKey| if k == shown { self.snapshot.as_ref() } else { self.watchers.snapshot(k) };
-        numbered(rows, snap, &self.tree.pending, &self.folded, Instant::now())
+        numbered(rows, snap, &self.tree.pending, &self.folded, Instant::now(), kept)
     }
 
     /// Workspace1–9: the `index`th workspace the tree shows, in whichever session.
     pub(super) fn go_to_tree_workspace(&mut self, index: usize, cx: &mut Context<Self>) {
-        let (rows, shown) = self.tree_model(cx);
-        if let Some((key, ws)) = self.numbered_workspaces(&rows, &shown).into_iter().nth(index) {
+        let (view, shown, kept) = self.shown_tree(cx);
+        if let Some((key, ws)) = self.numbered_workspaces(&view.rows, &shown, kept.as_ref()).into_iter().nth(index) {
             self.go_to(key, Goal::Workspace(ws), cx);
         }
     }
@@ -618,18 +634,22 @@ impl Shell {
     }
 
     fn toggle_collapsed(&mut self, key: &SessionKey, cx: &mut Context<Self>) {
+        let mut collapsed = SettingsGlobal::of(cx).settings.collapsed_sessions.clone();
+        // a search shows every session open: what it gives back stays as it was
+        if !fold_saved(&mut collapsed, &key.0, self.search_query(cx).is_some()) {
+            return;
+        }
         // a drop aimed mid drag: the rows under it fold away or come in
         self.tree.drop = None;
-        let key = key.0.clone();
-        save_from_sidebar(cx, move |s| toggle_in(&mut s.collapsed_sessions, &key));
+        save_from_sidebar(cx, move |s| s.collapsed_sessions = collapsed);
         cx.notify();
     }
 
     /// Fold or unfold the session: the shown one's header, as a click on it does, whether the sidebar shows, peeks
     /// or is hidden (it is not brought out); nothing when the tree gives it no header.
     pub(super) fn toggle_shown_session(&mut self, cx: &mut Context<Self>) {
-        let (rows, shown) = self.tree_model(cx);
-        if foldable(&rows, &shown) {
+        let (view, shown, _) = self.shown_tree(cx);
+        if foldable(&view.rows, &shown) {
             self.toggle_collapsed(&shown, cx);
         }
     }
@@ -670,11 +690,11 @@ impl Shell {
 
     /// The tree's elements, and whether it lists sessions (then the header leaves out the shown one's name).
     pub(super) fn tree_rows(&self, theme: &Theme, snapshot: &Option<Snapshot>, shown_ws: &Option<String>, active: bool, cx: &mut Context<Self>) -> (Vec<gpui::AnyElement>, bool) {
-        let (rows, shown) = self.tree_model(cx);
+        let (TreeView { rows, drags }, shown, kept) = self.shown_tree(cx);
         let listed = rows.iter().any(|r| matches!(r, TreeRow::Session { .. }));
         // held Ctrl+Shift (Ctrl on macOS): each of the first nine visible workspaces' chord
         let hints: Option<Chords> = self.hints_of(hints::HintMode::Workspaces).map(|opacity| {
-            let order = self.numbered_workspaces(&rows, &shown);
+            let order = self.numbered_workspaces(&rows, &shown, kept.as_ref());
             (opacity, order.into_iter().zip(WORKSPACE_ACTIONS).filter_map(|((k, w), a)| Some((k, w, chord_of(cx, a)?))).collect())
         });
         let mut out = Vec::new();
@@ -688,19 +708,22 @@ impl Shell {
             let edge = line.filter(|(at, _)| *at == i).map(|(_, edge)| edge);
             let start = out.len();
             match row.clone() {
-                TreeRow::Machine { id, label, status, enabled } => out.push(self.machine_row(theme, id, label, status, enabled, true, cx)),
+                TreeRow::Machine { id, label, status, enabled } => out.push(self.machine_row(theme, id, label, status, enabled, drags, cx)),
                 TreeRow::Session { key, collapsed, waiting, status } => {
                     if let Some(place) = self.places.iter().find(|p| SessionKey::of(p) == key).cloned() {
-                        out.push(self.session_row(theme, place, key, collapsed, waiting, status, true, cx));
+                        out.push(self.session_row(theme, place, key, collapsed, waiting, status, drags, cx));
                     }
                 }
                 TreeRow::Notice { key, text, action } => out.push(self.notice_row(theme, key, text, action, cx)),
                 TreeRow::Workspaces { key } => {
+                    // a search: only what it keeps of the session
+                    let keep = kept.as_ref().map(|k| k.get(&key).cloned().unwrap_or(Keep::Only(HashSet::new())));
+                    let filter = RowFilter { keep: keep.as_ref(), drags };
                     let ws = if key == shown {
-                        self.workspace_rows(theme, snapshot.as_ref(), shown_ws, RowMode::Live, hints.as_ref(), active, cx)
+                        self.workspace_rows(theme, snapshot.as_ref(), shown_ws, RowMode::Live, hints.as_ref(), active, filter, cx)
                     } else {
                         let other = self.watchers.snapshot(&key);
-                        self.workspace_rows(theme, other, &None, RowMode::Other(key), hints.as_ref(), active, cx)
+                        self.workspace_rows(theme, other, &None, RowMode::Other(key), hints.as_ref(), active, filter, cx)
                     };
                     if listed {
                         // indented under their session's header, a faint guide down their left
@@ -727,6 +750,9 @@ impl Shell {
                 out.push(tree_drag::with_line(el, theme, Some(edge)));
             }
         }
+        if kept.is_some() && rows.is_empty() {
+            out.push(no_match(theme, "No workspaces match"));
+        }
         (out, listed)
     }
 
@@ -734,11 +760,12 @@ impl Shell {
     /// session's folds it, in the tree too: one fold per session) and notices, each session's agents under it in
     /// place of its workspaces, nothing to drag; and whether it lists sessions, as [`Self::tree_rows`] says.
     pub(super) fn agents_view_rows(&self, theme: &Theme, sessions: &[SessionAgents], shown_tab: Option<&str>, cx: &mut Context<Self>) -> (Vec<gpui::AnyElement>, bool) {
-        let (rows, _) = self.tree_model(cx);
+        let (rows, kept) = self.agents_tree(sessions, cx);
         let listed = rows.iter().any(|r| matches!(r, TreeRow::Session { .. }));
         let settings = &SettingsGlobal::of(cx).settings;
         let (attention, compact) = (settings.attention_agents, settings.compact_agents);
-        let rows = agents_view(rows, sessions, self.agent_sort, attention, Instant::now());
+        let none = kept.is_some() && rows.is_empty();
+        let rows = agents_view(rows, sessions, self.agent_sort, attention, Instant::now(), kept.as_ref());
         // indented under their session's header, a faint guide down their left, as its workspaces are in the tree
         let under = |children: Vec<gpui::AnyElement>| {
             div().flex_none().flex().flex_col().gap(px(2.)).ml(px(15.)).pl(px(5.)).border_l_1().border_color(theme.border.opacity(0.6)).children(children).into_any_element()
@@ -766,10 +793,13 @@ impl Shell {
                     out.push(if listed { under(agents) } else { div().flex_none().flex().flex_col().gap(px(2.)).children(agents).into_any_element() });
                 }
                 ViewRow::Empty(text) => {
-                    let line = div().flex_none().px(px(8.)).py(px(6.)).text_size(px(11.)).text_color(theme.text_faint).child(text).into_any_element();
+                    let line = no_match(theme, text);
                     out.push(if listed { under(vec![line]) } else { line });
                 }
             }
+        }
+        if none {
+            out.push(no_match(theme, "No agents match"));
         }
         (out, listed)
     }
@@ -1339,7 +1369,7 @@ mod tests {
         let machine_rows: Vec<String> = kinds(&rows).into_iter().filter(|r| r.starts_with("M ")).collect();
         assert_eq!(machine_rows, ["M This computer", "M you@other", "M you@box"]);
         let snaps = |k: &SessionKey| if *k == key("menqal") { Some(&shown) } else { w.snapshot(k) };
-        let order: Vec<String> = workspace_order(&rows, snaps, &HashSet::new()).into_iter().map(|(k, _)| k.0).collect();
+        let order: Vec<String> = workspace_order(&rows, snaps, &HashSet::new(), None).into_iter().map(|(k, _)| k.0).collect();
         assert_eq!(order, ["/tmp/menqal.sock", "machine:b", "machine:c", "machine:a"]);
     }
 
@@ -1414,16 +1444,16 @@ mod tests {
             TreeRow::Workspaces { key: key("menqal") },
         ];
         let snaps = |k: &SessionKey| if *k == key("default") { Some(&shown) } else if *k == key("menqal") { Some(&other) } else { None };
-        let order = workspace_order(&rows, snaps, &HashSet::new());
+        let order = workspace_order(&rows, snaps, &HashSet::new(), None);
         let ids: Vec<String> = order.iter().map(|(k, w)| format!("{}:{w}", &k.0[5..k.0.len() - 5])).collect();
         assert_eq!(ids, ["default:w1", "default:w2", "default:w3", "menqal:w1", "menqal:w2"]);
         // a folded repo's worktrees are skipped
         let folded: HashSet<String> = [root_key("/tmp/default.sock", "w1")].into();
-        assert_eq!(workspace_order(&rows, snaps, &folded).len(), 4);
+        assert_eq!(workspace_order(&rows, snaps, &folded, None).len(), 4);
         // never past nine
         let many = snapshot(&[("a", None), ("b", None), ("c", None), ("d", None), ("e", None), ("f", None)]);
         let rows = vec![TreeRow::Workspaces { key: key("x") }, TreeRow::Workspaces { key: key("y") }];
-        assert_eq!(workspace_order(&rows, |_| Some(&many), &HashSet::new()).len(), 9);
+        assert_eq!(workspace_order(&rows, |_| Some(&many), &HashSet::new(), None).len(), 9);
     }
 
     #[test]
@@ -1438,10 +1468,10 @@ mod tests {
         let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         p.push(Move { ids: ids(&["w3"]), before: Some("w1".into()) }, ids(&["w1", "w2", "w3"]), ids(&["w3", "w1", "w2"]), now);
         pending.insert(key("default"), p);
-        let order: Vec<String> = numbered(&rows, snaps, &pending, &HashSet::new(), now).into_iter().map(|(_, w)| w).collect();
+        let order: Vec<String> = numbered(&rows, snaps, &pending, &HashSet::new(), now, None).into_iter().map(|(_, w)| w).collect();
         // the chips sit on the same order: `tree_rows` zips it with Workspace1–9's chords
         assert_eq!(order, ["w3", "w1", "w2"]);
-        let none: Vec<String> = numbered(&rows, snaps, &HashMap::new(), &HashSet::new(), now).into_iter().map(|(_, w)| w).collect();
+        let none: Vec<String> = numbered(&rows, snaps, &HashMap::new(), &HashSet::new(), now, None).into_iter().map(|(_, w)| w).collect();
         assert_eq!(none, ["w1", "w2", "w3"]);
     }
 
@@ -1606,7 +1636,7 @@ mod tests {
         let sessions = |shown| listed(shown, &w, &since);
         let now = Instant::now();
         let rows = |collapsed: &HashSet<String>| tree(&places, &w, collapsed, Some(&shown));
-        let view = agents_view(rows(&HashSet::new()), &sessions(&shown), AgentSort::Status, false, now);
+        let view = agents_view(rows(&HashSet::new()), &sessions(&shown), AgentSort::Status, false, now, None);
         assert_eq!(
             view_kinds(&view),
             [
@@ -1631,18 +1661,18 @@ mod tests {
 
         // a folded session keeps its header alone, as in the tree
         let folded: HashSet<String> = ["/tmp/menqal.sock".to_string()].into();
-        let view = agents_view(rows(&folded), &sessions(&shown), AgentSort::Status, false, now);
+        let view = agents_view(rows(&folded), &sessions(&shown), AgentSort::Status, false, now, None);
         assert_eq!(view_kinds(&view)[3..5], ["S /tmp/menqal.sock", "M you@box"]);
 
         // those that need you alone: a session with none says so
         let working = agents_snapshot(&[("p2", "working")]);
-        let view = agents_view(tree(&places, &w, &HashSet::new(), Some(&working)), &sessions(&working), AgentSort::Status, true, now);
+        let view = agents_view(tree(&places, &w, &HashSet::new(), Some(&working)), &sessions(&working), AgentSort::Status, true, now, None);
         assert_eq!(view_kinds(&view)[2..5], ["E Nothing needs you", "S /tmp/menqal.sock", "A q1,q2"]);
 
         // one session alone: no header, its agents straight away; none read yet says there are none
         let one = vec![TreeRow::Workspaces { key: key("default") }];
-        assert_eq!(view_kinds(&agents_view(one.clone(), &sessions(&shown)[..1], AgentSort::Status, false, now)), ["A p1,p2"]);
-        assert_eq!(view_kinds(&agents_view(one, &[], AgentSort::Status, false, now)), ["E Connecting…"], "its first snapshot on its way");
+        assert_eq!(view_kinds(&agents_view(one.clone(), &sessions(&shown)[..1], AgentSort::Status, false, now, None)), ["A p1,p2"]);
+        assert_eq!(view_kinds(&agents_view(one, &[], AgentSort::Status, false, now, None)), ["E Connecting…"], "its first snapshot on its way");
     }
 
     #[test]

@@ -7,6 +7,10 @@ const PEEK_LINGER: Duration = Duration::from_millis(200);
 impl Shell {
     /// Folds or unfolds a worktree group, tweening from wherever its body is now.
     pub(super) fn toggle_fold(&mut self, id: &str, full: f32, cx: &mut Context<Self>) {
+        // a search shows every group open: a click then must not change the folds it gives back
+        if self.search_query(cx).is_some() {
+            return;
+        }
         let open = !self.folded.contains(id);
         let prev = self.fold_motion.get(id).copied();
         let from = prev.filter(|m| m.animating()).map(FoldMotion::current).unwrap_or(if open { full } else { 0. });
@@ -272,7 +276,7 @@ impl Shell {
 
     /// The workspace list's rows for `snapshot`: each workspace with its worktrees folded under it. `Live` rows answer
     /// clicks, renames and drags and show worktrees being made; another session's (`Other`) switch there on a click.
-    /// `hints` holds the numbered workspaces' chords across the tree.
+    /// `hints` holds the numbered workspaces' chords across the tree; `filter`, what a search keeps of them.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn workspace_rows(
         &self,
@@ -282,6 +286,7 @@ impl Shell {
         mode: sidebar_tree::RowMode,
         hints: Option<&sidebar_tree::Chords>,
         active: bool,
+        filter: sidebar_tree::RowFilter,
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         let live = mode == sidebar_tree::RowMode::Live;
@@ -294,17 +299,21 @@ impl Shell {
         let snapshot = pending.as_ref().or(snapshot);
         // a workspace row's height, one line; a worktree's, which always has a branch line unless compact
         let (ws_h, kid_h) = if SettingsGlobal::of(cx).settings.compact_workspaces { (26., 26.) } else { (32., WS_TWO_LINES) };
+        // a search keeps a worktree's checkout whenever it keeps the worktree
+        let shows = |id: &str| filter.keep.is_none_or(|k| k.has(id));
         let groups: Vec<(crate::model::Workspace, Vec<crate::model::Workspace>)> = snapshot
             .as_ref()
             .map(|s| {
                 crate::model::groups(s.workspace_tree())
                     .into_iter()
-                    .map(|(w, kids)| (w.clone(), kids.into_iter().cloned().collect()))
+                    .filter(|(w, _)| shows(&w.workspace_id))
+                    .map(|(w, kids)| (w.clone(), kids.into_iter().filter(|k| shows(&k.workspace_id)).cloned().collect()))
                     .collect()
             })
             .unwrap_or_default();
-        // a workspace moves with its worktrees among the others, a worktree among its siblings; not one being removed
-        let movable = self.can_drag_workspaces(&key);
+        // a workspace moves with its worktrees among the others, a worktree among its siblings; not one being removed,
+        // nor any while the tree is searched
+        let movable = filter.drags && self.can_drag_workspaces(&key);
         let draggable: std::collections::HashSet<String> = groups
             .iter()
             .flat_map(|(w, kids)| {
@@ -519,9 +528,9 @@ impl Shell {
             if kids.is_empty() && pending.is_empty() {
                 return tree_drag::with_line(ws_row(&w, false, None, None, true, cx), theme, group_line(&w.workspace_id));
             }
-            // A folded group opens while one of its worktrees is being created.
+            // A folded group opens while one of its worktrees is being created, and while the tree is searched.
             let fold = fold_key(&w.workspace_id);
-            let open = !self.folded.contains(&fold) || !pending.is_empty();
+            let open = filter.keep.is_some() || !self.folded.contains(&fold) || !pending.is_empty();
             let full = (kids.len() + pending.len()) as f32 * (kid_h + 2.);
             let tween = self.fold_motion.get(&fold).copied().filter(|m| m.animating());
             let chevron = fold_chevron(theme, &format!("{idx}-{}", w.workspace_id), open, full, tween).map(|el| {
@@ -622,6 +631,9 @@ impl Shell {
             (body, listed)
         };
         let toggle = layout.toggle.then(|| self.view_toggle(theme, layout.agents_view, self.waiting_everywhere(), cx));
+        // focus mode narrows the Workspaces tree alone: its chip shows there
+        let focus = layout.tree && SettingsGlobal::of(cx).settings.sidebar_focus;
+        let header = self.sidebar_header(theme, listed, focus, cx);
         let waiting = self.error.is_none() && self.connecting.is_some_and(|at| crate::ui::loader::due(at, window));
         // Laid out at full width and clipped by its tweened box, so rows never reflow mid slide.
         div()
@@ -638,21 +650,7 @@ impl Shell {
                 .size_full()
                 .flex()
                 .flex_col()
-            .child(
-                div()
-                    .px(px(16.))
-                    .pt(px(8.))
-                    .pb(px(6.))
-                    .flex()
-                    .items_center()
-                    .text_size(px(11.))
-                    .text_color(theme.text_faint)
-                    // the tree names every session; with one, its name heads the list
-                    .child(div().flex_1().truncate().when(!listed, |el| el.child(self.place_label(cx))))
-                    .when(is_dev_build(), |el| el.child(dev_badge(theme)))
-                    // the place's own snapshot hasn't come yet: the list is its last, or none
-                    .when(waiting, |el| el.child(crate::ui::loader::mini_spinner(2., theme.text_faint, window))),
-            )
+            .child(header.when(waiting, |el| el.child(crate::ui::loader::mini_spinner(2., theme.text_faint, window))))
             .children(toggle)
             .child(
                 div()
@@ -769,6 +767,75 @@ impl Shell {
             ))
             .children(strip)
             .child(self.footer(theme, cx))
+    }
+
+    /// The sidebar's head: the shown session's name when the tree names none (with one session, or in focus mode),
+    /// the Focus chip that turns focus mode off, and the magnifier that opens the search; while it is up, its field
+    /// in their place, Escape or × closing it. The place's spinner goes after it.
+    fn sidebar_header(&self, theme: &Theme, listed: bool, focus: bool, cx: &mut Context<Self>) -> Div {
+        let head = div().px(px(16.)).pt(px(8.)).pb(px(6.)).flex().items_center().gap(px(6.)).text_size(px(11.)).text_color(theme.text_faint);
+        let hover_bg = theme.hover;
+        if let Some(search) = &self.sidebar_search {
+            let field = div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(12.))
+                .text_color(theme.text)
+                .capture_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, _, cx| {
+                    if e.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.close_sidebar_search(cx);
+                    }
+                }))
+                .child(Input::new(&search.input));
+            let close = div()
+                .id("sidebar-search-close")
+                .size(px(18.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.))
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover_bg))
+                .tooltip(tip("Close the search", None))
+                .child(gpui::svg().path("icons/close.svg").size(px(11.)).text_color(theme.text_faint))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_sidebar_search(cx)));
+            return head.child(gpui::svg().path("icons/solar/magnifier.svg").size(px(12.)).flex_none().text_color(theme.text_faint)).child(field).child(close);
+        }
+        let chip = focus.then(|| {
+            let accent = theme.accent;
+            div()
+                .id("sidebar-focus-chip")
+                .flex_none()
+                .h(px(18.))
+                .px(px(6.))
+                .flex()
+                .items_center()
+                .gap(px(3.))
+                .rounded(px(9.))
+                .bg(accent.opacity(0.14))
+                .text_color(accent)
+                .cursor_pointer()
+                .hover(move |s| s.bg(accent.opacity(0.22)))
+                .tooltip(tip("Show every session again", Some("ToggleFocusMode")))
+                .child(gpui::svg().path("icons/solar/target.svg").size(px(10.)).text_color(accent))
+                .child("Focus")
+                .child(gpui::svg().path("icons/close.svg").size(px(9.)).text_color(accent))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_focus_mode(cx)))
+        });
+        let magnifier = icon_button(theme, "sidebar-search", "")
+            .size(px(18.))
+            .rounded(px(4.))
+            .tooltip(tip("Filter the sidebar", Some("FilterSidebar")))
+            .child(gpui::svg().path("icons/solar/magnifier.svg").size(px(12.)).text_color(theme.text_faint))
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open_sidebar_search(window, cx)));
+        head
+            // the tree names every session; with one, or in focus mode, its name heads the list
+            .child(div().flex_1().min_w_0().truncate().when(!listed, |el| el.child(self.place_label(cx))))
+            .children(chip)
+            .when(is_dev_build(), |el| el.child(dev_badge(theme)))
+            .child(magnifier)
     }
 
     /// Under the sidebar: Settings, a new workspace in the session shown, and + for a new session or SSH machine.

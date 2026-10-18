@@ -107,6 +107,9 @@ pub struct Settings {
     /// With the sidebar hidden, the pointer at the window's left edge slides it out floating over the panes. Off,
     /// only `⌘B` brings it back; on by default, as before the switch, so an older file keeps it.
     pub sidebar_peek: bool,
+    /// Focus mode: the sidebar's Workspaces tree shows the session shown alone, without its header. The Agents
+    /// section and view, Next agent that needs you and the panels still list every session, and a search every one.
+    pub sidebar_focus: bool,
     /// The workspaces sidebar is shown; `⌘B` hides it.
     pub sidebar_open: bool,
     /// Worktree groups folded in the sidebar, by their session's key and workspace id (`roots::root_key`); a bare
@@ -353,6 +356,7 @@ impl Default for Settings {
             window_buttons: true,
             show_shortcut_hints: true,
             sidebar_peek: true,
+            sidebar_focus: false,
             sidebar_open: true,
             folded: Vec::new(),
             collapsed_sessions: Vec::new(),
