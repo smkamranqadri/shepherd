@@ -118,6 +118,9 @@ pub struct Settings {
     pub folded: Vec<String>,
     /// Sessions whose workspaces the sidebar's tree hides, by key (a socket, `machine:<id>`).
     pub collapsed_sessions: Vec<String>,
+    /// Machine groups whose sessions the sidebar's tree hides, by machine (`local` for this computer, else the SSH
+    /// target).
+    pub collapsed_machines: Vec<String>,
     /// The sidebar tree's sessions in the order they were dragged to, by key (a socket, `machine:<id>`); each keeps to
     /// its machine, and a session not listed comes after, in herdr's order. herdr keeps no order of its own.
     pub session_order: Vec<String>,
@@ -361,6 +364,7 @@ impl Default for Settings {
             sidebar_open: true,
             folded: Vec::new(),
             collapsed_sessions: Vec::new(),
+            collapsed_machines: Vec::new(),
             session_order: Vec::new(),
             machine_order: Vec::new(),
             window: None,

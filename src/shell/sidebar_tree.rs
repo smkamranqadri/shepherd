@@ -72,8 +72,9 @@ const GOAL_EXPIRY: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum TreeRow {
-    /// A machine: this computer, or an SSH target with its saved sessions. Disabled machines are listed greyed.
-    Machine { id: String, label: String, status: Status, enabled: bool },
+    /// A machine: this computer, or an SSH target with its saved sessions. Disabled machines are listed greyed. A
+    /// folded one (`collapsed`) hides its sessions and counts their agents waiting or done (`waiting`).
+    Machine { id: String, label: String, status: Status, enabled: bool, collapsed: bool, waiting: usize },
     Session { key: SessionKey, collapsed: bool, waiting: usize, status: Status },
     /// The session's workspace rows.
     Workspaces { key: SessionKey },
@@ -417,8 +418,24 @@ pub(super) fn cross_agents(sessions: &[SessionAgents], sort: AgentSort, attentio
     (out.into_iter().map(|(e, _)| e).collect(), any)
 }
 
-/// The tree's rows for `places` (in [`tree_order`]), their watchers and the collapsed sessions; `shown` is the shown
-/// session's snapshot, which its watcher does not hold.
+/// The key a machine's group is folded by among the tree's folds, beside the sessions' keys (a socket,
+/// `machine:<id>`), which it never matches.
+pub(super) fn group_key(id: &str) -> String {
+    format!("group:{id}")
+}
+
+/// The tree's folds as [`tree`] reads them: the sessions' by key, and the machines' groups by [`group_key`].
+pub(super) fn saved_folds(s: &crate::settings::Settings) -> HashSet<String> {
+    s.collapsed_sessions.iter().cloned().chain(s.collapsed_machines.iter().map(|id| group_key(id))).collect()
+}
+
+/// A click on a machine's row: its group folds when it is open, opens when it is folded, in the settings.
+pub(super) fn fold_machine(s: &mut crate::settings::Settings, id: &str) {
+    toggle_in(&mut s.collapsed_machines, id);
+}
+
+/// The tree's rows for `places` (in [`tree_order`]), their watchers and the folds (`saved_folds`: sessions, and
+/// machines' groups); `shown` is the shown session's snapshot, which its watcher does not hold.
 pub(super) fn tree(places: &[Place], w: &Watchers, collapsed: &HashSet<String>, shown: Option<&Snapshot>) -> Vec<TreeRow> {
     let mut machines: Vec<(&str, Vec<&Place>)> = Vec::new();
     for place in places {
@@ -438,10 +455,16 @@ pub(super) fn tree(places: &[Place], w: &Watchers, collapsed: &HashSet<String>, 
     let mut rows = Vec::new();
     for (id, list) in &machines {
         let statuses: Vec<Status> = list.iter().map(|p| w.get(&SessionKey::of(p)).map_or(Status::Connecting, |w| w.status)).collect();
+        let group_folded = show_machines && collapsed.contains(&group_key(id));
         if show_machines {
             let status = if statuses.iter().all(|s| *s == Status::Unreachable) { Status::Unreachable } else { Status::Live };
             let label = if *id == LOCAL { "This computer".to_string() } else { id.to_string() };
-            rows.push(TreeRow::Machine { id: id.to_string(), label, status, enabled: true });
+            // folded, the group's count stands in for its sessions' own
+            let waiting = if group_folded { list.iter().map(|p| session_waiting(w, &SessionKey::of(p), shown)).sum() } else { 0 };
+            rows.push(TreeRow::Machine { id: id.to_string(), label, status, enabled: true, collapsed: group_folded, waiting });
+        }
+        if group_folded {
+            continue;
         }
         for (place, status) in list.iter().zip(statuses) {
             let key = SessionKey::of(place);
@@ -472,7 +495,7 @@ pub(super) fn tree(places: &[Place], w: &Watchers, collapsed: &HashSet<String>, 
         }
     }
     for target in off {
-        rows.push(TreeRow::Machine { id: target.to_string(), label: target.to_string(), status: Status::Stopped, enabled: false });
+        rows.push(TreeRow::Machine { id: target.to_string(), label: target.to_string(), status: Status::Stopped, enabled: false, collapsed: false, waiting: 0 });
     }
     rows
 }
@@ -671,6 +694,19 @@ impl Shell {
         cx.notify();
     }
 
+    /// A click on a machine's row folds or unfolds its group, as a session's row folds its workspaces; never while a
+    /// search shows every group open.
+    fn toggle_machine_fold(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.search_query(cx).is_some() {
+            return;
+        }
+        // a drop aimed mid drag: the rows under it fold away or come in
+        self.tree.drop = None;
+        let id = id.to_string();
+        save_from_sidebar(cx, move |s| fold_machine(s, &id));
+        cx.notify();
+    }
+
     /// Fold or unfold the session: the shown one's header, as a click on it does, whether the sidebar shows, peeks
     /// or is hidden (it is not brought out); nothing when the tree gives it no header.
     pub(super) fn toggle_shown_session(&mut self, cx: &mut Context<Self>) {
@@ -734,7 +770,7 @@ impl Shell {
             let edge = line.filter(|(at, _)| *at == i).map(|(_, edge)| edge);
             let start = out.len();
             match row.clone() {
-                TreeRow::Machine { id, label, status, enabled } => out.push(self.machine_row(theme, id, label, status, enabled, drags, cx)),
+                TreeRow::Machine { id, label, status, enabled, collapsed, waiting } => out.push(self.machine_row(theme, id, label, status, enabled, collapsed, waiting, drags, cx)),
                 TreeRow::Session { key, collapsed, waiting, status } => {
                     if let Some(place) = self.places.iter().find(|p| SessionKey::of(p) == key).cloned() {
                         out.push(self.session_row(theme, place, key, collapsed, waiting, status, drags, cx));
@@ -802,7 +838,9 @@ impl Shell {
                 out.push(div().flex_none().mx(px(6.)).mt(px(6.)).mb(px(4.)).h(px(1.)).bg(theme.border.opacity(0.6)).into_any_element());
             }
             match row.clone() {
-                ViewRow::Tree(TreeRow::Machine { id, label, status, enabled }) => out.push(self.machine_row(theme, id, label, status, enabled, false, cx)),
+                ViewRow::Tree(TreeRow::Machine { id, label, status, enabled, collapsed, waiting }) => {
+                    out.push(self.machine_row(theme, id, label, status, enabled, collapsed, waiting, false, cx))
+                }
                 ViewRow::Tree(TreeRow::Session { key, collapsed, waiting, status }) => {
                     if let Some(place) = self.places.iter().find(|p| SessionKey::of(p) == key).cloned() {
                         out.push(self.session_row(theme, place, key, collapsed, waiting, status, false, cx));
@@ -830,10 +868,11 @@ impl Shell {
         (out, listed)
     }
 
-    /// A machine's header: its icon, its name in small caps, a dot for whether it answers, and ⋯ on hover. `drags`:
-    /// it is dragged and dropped on (the tree; the Agents view has no drags).
+    /// A machine's header: a chevron, its icon, its name in small caps, folded its ●N, a dot for whether it answers,
+    /// and ⋯ on hover; a click anywhere folds its sessions. `drags`: it is dragged and dropped on (the tree; the
+    /// Agents view has no drags).
     #[allow(clippy::too_many_arguments)]
-    fn machine_row(&self, theme: &Theme, id: String, label: String, status: Status, enabled: bool, drags: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn machine_row(&self, theme: &Theme, id: String, label: String, status: Status, enabled: bool, collapsed: bool, waiting: usize, drags: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         let hover_bg = theme.hover;
         let menu_id = id.clone();
         let group = SharedString::from(format!("tree-machine-group-{id}"));
@@ -852,20 +891,42 @@ impl Shell {
         let movable = drags && enabled && id != LOCAL && targets.len() > 1;
         let dragged = DraggedTreeItem { from: SessionKey::default(), item: Item::Machine(id.clone()), label: label.clone(), theme: theme.clone() };
         let over = id.clone();
+        // a machine turned off lists no sessions to fold
+        let folds = enabled.then(|| id.clone());
+        let chevron = folds.is_some().then(|| fold_chevron(theme, &format!("machine-{id}"), !collapsed, 1., None));
+        // folded: its sessions' agents waiting or done; a click goes to the one that has waited longest
+        let badge = (waiting > 0).then(|| {
+            let target = id.clone();
+            waiting_pill(theme, waiting)
+                .id(SharedString::from(format!("tree-machine-waiting-{id}")))
+                .cursor_pointer()
+                .tooltip(tip("Go to the agent that has waited longest", None))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.go_to_longest_waiting_on(&target, cx);
+                }))
+        });
         div()
             .id(SharedString::from(format!("tree-machine-{id}")))
             .group(group.clone())
             .h(px(26.))
-            .px(px(8.))
+            .pl(px(if chevron.is_some() { 2. } else { 8. }))
+            .pr(px(8.))
             .flex()
             .flex_none()
             .items_center()
             .gap(px(6.))
+            .rounded(px(6.))
             .text_size(px(10.5))
             .font_weight(gpui::FontWeight::BOLD)
             .text_color(ink)
+            .children(chevron)
             .child(gpui::svg().path(icon).size(px(13.)).flex_none().text_color(ink))
             .child(div().flex_1().min_w_0().truncate().child(if enabled { label.to_uppercase() } else { format!("{} · OFF", label.to_uppercase()) }))
+            .children(badge)
+            .when_some(folds, |el, id| {
+                el.cursor_pointer().hover(move |s| s.bg(hover_bg)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_machine_fold(&id, cx)))
+            })
             .when(movable, |el| el.on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone())))
             .when(drags, |el| el.on_drag_move(cx.listener(move |this, e: &DragMoveEvent<DraggedTreeItem>, _, cx| this.tree_drag_over(Over::Machine(over.clone()), e, cx))))
             .child(div().size(px(6.)).flex_none().rounded_full().bg(dot))
@@ -888,6 +949,23 @@ impl Shell {
                     })),
             )
             .into_any_element()
+    }
+
+    /// A folded machine's ●N: the agent that has waited longest in the first of its sessions with one waiting.
+    fn go_to_longest_waiting_on(&mut self, machine: &str, cx: &mut Context<Self>) {
+        let shown = self.shown_key();
+        let found = self.places.iter().filter(|p| machine_of(p) == machine).find_map(|p| {
+            let key = SessionKey::of(p);
+            let at = if shown.as_ref() == Some(&key) {
+                self.snapshot.as_ref().and_then(|s| longest_waiting(s, &self.since))
+            } else {
+                self.watchers.get(&key).and_then(|w| longest_waiting(w.snapshot.as_ref()?, &w.since))
+            };
+            at.map(|(tab, pane)| (key, tab, pane))
+        });
+        if let Some((key, tab, pane)) = found {
+            self.go_to(key, Goal::Pane { tab, pane }, cx);
+        }
     }
 
     /// A session's header; `drags` as [`Self::machine_row`]'s.
@@ -1206,8 +1284,7 @@ impl Shell {
             })))
             .child(item("add-menu-machine", "Add SSH machine…").on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 close(this);
-                this.open_session_dialog(window, cx);
-                this.toggle_session_remote(window, cx);
+                this.open_add_machine(None, false, window, cx);
             })));
         Some(
             gpui::deferred(
@@ -1403,7 +1480,7 @@ mod tests {
     fn a_drag_line_goes_over_its_row_or_under_its_group() {
         use super::super::tree_drag::{Edge, Line};
         let session = |n: &str| TreeRow::Session { key: key(n), collapsed: false, waiting: 0, status: Status::Live };
-        let machine = |id: &str| TreeRow::Machine { id: id.into(), label: id.into(), status: Status::Live, enabled: true };
+        let machine = |id: &str| TreeRow::Machine { id: id.into(), label: id.into(), status: Status::Live, enabled: true, collapsed: false, waiting: 0 };
         let notice = TreeRow::Notice { key: key("b"), text: "Stopped".into(), action: None };
         let rows = vec![machine(LOCAL), session("a"), TreeRow::Workspaces { key: key("a") }, session("b"), notice, machine("you@box"), session("c")];
         assert_eq!(line_row(&rows, &Line::Session(key("a"), Edge::Above)), Some((1, Edge::Above)));
@@ -1581,7 +1658,7 @@ mod tests {
     #[test]
     fn dividers_part_the_session_groups() {
         let session = |n: &str| TreeRow::Session { key: key(n), collapsed: false, waiting: 0, status: Status::Live };
-        let machine = TreeRow::Machine { id: "you@box".into(), label: "you@box".into(), status: Status::Live, enabled: true };
+        let machine = TreeRow::Machine { id: "you@box".into(), label: "you@box".into(), status: Status::Live, enabled: true, collapsed: false, waiting: 0 };
         let rows = vec![session("a"), TreeRow::Workspaces { key: key("a") }, session("b"), machine, session("c")];
         let at: Vec<usize> = (0..rows.len()).filter(|i| divider_above(&rows, *i)).collect();
         assert_eq!(at, [2, 3], "not over the first, not under a machine's header");
@@ -1777,5 +1854,85 @@ mod tests {
         assert_eq!(one[0].workspace, "web");
         let (none, any) = cross_agents(&[], AgentSort::Status, true, now);
         assert!(none.is_empty() && !any);
+    }
+
+    /// This computer with `default` shown and `menqal`; you@box with machines a and c, each a snapshot with one agent
+    /// waiting.
+    fn two_machines() -> (Vec<Place>, Watchers, Snapshot) {
+        let (places, _) = tree_order(vec![info("default", true), info("menqal", true)], vec![machine("a", "you@box", true), machine("c", "you@box", true)], &[], &[]);
+        let mut w = watched(&places, "default");
+        let now = Instant::now();
+        for k in ["machine:a", "machine:c"] {
+            w.set_client(&SessionKey(k.into()), Client::at("/tmp/x".into()));
+        }
+        w.due(now, super::super::watchers::Activity::Active);
+        for k in ["machine:a", "machine:c"] {
+            w.apply(&SessionKey(k.into()), Ok(snapshot(&[("w1", None)])), now);
+        }
+        (places, w, snapshot(&[("w1", None)]))
+    }
+
+    #[test]
+    fn a_folded_machine_hides_its_sessions_and_counts_their_agents() {
+        let (places, w, shown) = two_machines();
+        let rows = tree(&places, &w, &[group_key("you@box")].into(), Some(&shown));
+        assert_eq!(kinds(&rows), ["M This computer", "S /tmp/default.sock", "W /tmp/default.sock", "S /tmp/menqal.sock", "M you@box"]);
+        assert_eq!(
+            rows[4],
+            TreeRow::Machine { id: "you@box".into(), label: "you@box".into(), status: Status::Live, enabled: true, collapsed: true, waiting: 2 },
+            "a and c, one each"
+        );
+        assert!(matches!(rows[0], TreeRow::Machine { collapsed: false, waiting: 0, .. }), "open, its sessions show their own");
+        // this computer folds the same way, the shown session's live count in it (menqal has no snapshot)
+        let rows = tree(&places, &w, &[group_key(LOCAL)].into(), Some(&shown));
+        assert_eq!(kinds(&rows), ["M This computer", "M you@box", "S machine:a", "W machine:a", "S machine:c", "W machine:c"]);
+        assert!(matches!(rows[0], TreeRow::Machine { collapsed: true, waiting: 1, .. }));
+        // a session's fold folds no machine, and no machine's fold any session
+        let rows = tree(&places, &w, &["you@box".to_string(), LOCAL.to_string()].into(), Some(&shown));
+        assert!(rows.iter().all(|r| !matches!(r, TreeRow::Machine { collapsed: true, .. } | TreeRow::Session { collapsed: true, .. })));
+        // a folded machine's group still moves as one: the drag line goes under its row
+        use super::super::tree_drag::{Edge, Line};
+        let rows = tree(&places, &w, &[group_key("you@box")].into(), Some(&shown));
+        assert_eq!(line_row(&rows, &Line::Machine("you@box".into(), Edge::Below)), Some((4, Edge::Below)));
+        assert_eq!(line_row(&rows, &Line::Machine(LOCAL.into(), Edge::Below)), Some((3, Edge::Below)));
+    }
+
+    #[test]
+    fn a_lone_machine_has_no_row_to_fold() {
+        let places = [Place::Session(info("default", true)), Place::Session(info("menqal", true))];
+        let rows = tree(&places, &watched(&places, "default"), &[group_key(LOCAL)].into(), None);
+        assert_eq!(kinds(&rows), ["S /tmp/default.sock", "W /tmp/default.sock", "S /tmp/menqal.sock"], "no machine row, so nothing folded out of reach");
+    }
+
+    #[test]
+    fn a_machine_fold_is_saved_and_read_back() {
+        let old: crate::settings::Settings = serde_json::from_str(r#"{"collapsed_sessions": ["/tmp/a.sock"]}"#).unwrap();
+        assert!(old.collapsed_machines.is_empty(), "a file from before machine folds");
+        let mut s = crate::settings::Settings::default();
+        assert!(s.collapsed_machines.is_empty());
+        fold_machine(&mut s, "you@box");
+        fold_machine(&mut s, LOCAL);
+        let back: crate::settings::Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.collapsed_machines, ["you@box", LOCAL]);
+        assert!(back.collapsed_sessions.is_empty());
+        assert_eq!(saved_folds(&back), HashSet::from([group_key("you@box"), group_key(LOCAL)]));
+        fold_machine(&mut s, "you@box");
+        assert_eq!(s.collapsed_machines, [LOCAL], "a second click opens it");
+        let both = crate::settings::Settings { collapsed_sessions: vec!["/tmp/a.sock".into()], ..back };
+        assert_eq!(saved_folds(&both).len(), 3);
+    }
+
+    #[test]
+    fn a_search_or_focus_mode_shows_a_folded_machine_open() {
+        use super::super::sidebar_search::{Keep, Kept, tree_view};
+        let (places, w, shown) = two_machines();
+        let folds: HashSet<String> = [group_key("you@box")].into();
+        let kept: Kept = [(SessionKey("machine:a".into()), Keep::All)].into();
+        let found = tree_view(&places, &w, &folds, Some(&shown), &key("default"), false, Some(&kept));
+        assert_eq!(kinds(&found.rows), ["M you@box", "S machine:a", "W machine:a"]);
+        assert!(matches!(found.rows[0], TreeRow::Machine { collapsed: false, waiting: 0, .. }));
+        // focus mode on a machine's session shows its workspaces whatever its machine's fold
+        let focused = tree_view(&places, &w, &folds, Some(&shown), &SessionKey("machine:a".into()), true, None);
+        assert_eq!(kinds(&focused.rows), ["W machine:a"]);
     }
 }

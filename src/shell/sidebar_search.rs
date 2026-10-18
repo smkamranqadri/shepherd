@@ -328,7 +328,7 @@ impl Shell {
     /// search keeps.
     pub(super) fn shown_tree(&self, cx: &mut App) -> (TreeView, SessionKey, Option<Kept>) {
         let settings = &SettingsGlobal::of(cx).settings;
-        let collapsed: HashSet<String> = settings.collapsed_sessions.iter().cloned().collect();
+        let collapsed = sidebar_tree::saved_folds(settings);
         let focus = settings.sidebar_focus;
         let (view, show_agents) = (settings.sidebar_view, settings.show_agents);
         let shown = self.shown_key().unwrap_or_default();
@@ -344,7 +344,7 @@ impl Shell {
     /// The tree's rows for the Agents view, every session's whatever focus mode says, and with the search the
     /// sessions with an agent it keeps; and what it keeps.
     pub(super) fn agents_tree(&self, sessions: &[SessionAgents], cx: &App) -> (Vec<TreeRow>, Option<Kept>) {
-        let collapsed: HashSet<String> = SettingsGlobal::of(cx).settings.collapsed_sessions.iter().cloned().collect();
+        let collapsed = sidebar_tree::saved_folds(&SettingsGlobal::of(cx).settings);
         let shown = self.shown_key().unwrap_or_default();
         let kept = self.search_query(cx).map(|query| agent_hits(&query, sessions));
         (agents_rows(&self.places, &self.watchers, &collapsed, self.snapshot.as_ref(), &shown, kept.as_ref()), kept)
@@ -503,15 +503,15 @@ mod tests {
     #[test]
     fn sessions_with_nothing_kept_go_with_their_notices_and_machines() {
         let rows = vec![
-            TreeRow::Machine { id: "local".into(), label: "This computer".into(), status: Status::Live, enabled: true },
+            TreeRow::Machine { id: "local".into(), label: "This computer".into(), status: Status::Live, enabled: true, collapsed: false, waiting: 0 },
             TreeRow::Session { key: key("default"), collapsed: false, waiting: 0, status: Status::Shown },
             TreeRow::Workspaces { key: key("default") },
             TreeRow::Session { key: key("old"), collapsed: false, waiting: 0, status: Status::Stopped },
             TreeRow::Notice { key: key("old"), text: "Stopped".into(), action: None },
-            TreeRow::Machine { id: "you@workbox".into(), label: "you@workbox".into(), status: Status::Live, enabled: true },
+            TreeRow::Machine { id: "you@workbox".into(), label: "you@workbox".into(), status: Status::Live, enabled: true, collapsed: false, waiting: 0 },
             TreeRow::Session { key: SessionKey("machine:m1".into()), collapsed: false, waiting: 0, status: Status::Live },
             TreeRow::Workspaces { key: SessionKey("machine:m1".into()) },
-            TreeRow::Machine { id: "you@otherbox".into(), label: "you@otherbox".into(), status: Status::Stopped, enabled: false },
+            TreeRow::Machine { id: "you@otherbox".into(), label: "you@otherbox".into(), status: Status::Stopped, enabled: false, collapsed: false, waiting: 0 },
         ];
         let kept: Kept = [(key("default"), only(&["w1"]))].into();
         assert_eq!(kinds(&filter_rows(rows.clone(), &kept)), ["M This computer", "S default", "W default"]);
