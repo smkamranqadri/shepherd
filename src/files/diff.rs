@@ -11,6 +11,9 @@
 //! Word emphasis follows wooloo's (`WorkspaceDiffView.swift`): each run of removed lines pairs with the run of
 //! added lines after it, line by line, and each pair is diffed by words with `similar`; a pair that keeps less than
 //! 40% of its text gets no emphasis, as whole changed lines read better than confetti.
+//!
+//! `unified` writes the same text for two strings git has never seen (the editor's buffer against the file on
+//! disk), so the diff tab's parser and view show those too.
 use super::status::{Change, Group};
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -560,6 +563,65 @@ pub fn hunk_text(hunk: &Hunk) -> String {
     out
 }
 
+/// A line of a text as `unified` diffs it: its text without its line end, and whether one ended it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Line<'a> {
+    text: &'a str,
+    ended: bool,
+}
+
+/// `text` in lines, a `\r` before a `\n` left out (CRLF and LF are one line end here).
+fn split_lines(text: &str) -> Vec<Line<'_>> {
+    text.split_inclusive('\n')
+        .map(|l| match l.strip_suffix('\n') {
+            Some(body) => Line { text: body.strip_suffix('\r').unwrap_or(body), ended: true },
+            None => Line { text: l, ended: false },
+        })
+        .collect()
+}
+
+/// `old` against `new` as git's unified diff of one file, hunks only (no `diff --git` or `---`/`+++` lines), with
+/// `context` unchanged lines around each change: what `parse_unified` reads, for two texts git has never seen (the
+/// editor's buffer against the file on disk). Lines are compared with whether they end: a last line that lost its
+/// line end is changed, and says `\ No newline at end of file` as git does. Past `deadline` the diff settles for
+/// fewer, larger hunks. Equal texts give nothing.
+pub fn unified(old: &str, new: &str, context: usize, deadline: Instant) -> String {
+    let (a, b) = (split_lines(old), split_lines(new));
+    let ops = similar::capture_diff_slices_deadline(similar::Algorithm::Myers, &a, &b, Some(deadline));
+    let mut out = String::new();
+    let line = |out: &mut String, sign: char, l: &Line| {
+        out.push(sign);
+        out.push_str(l.text);
+        out.push('\n');
+        if !l.ended {
+            out.push_str("\\ No newline at end of file\n");
+        }
+    };
+    for group in similar::group_diff_ops(ops, context) {
+        if group.iter().all(|op| op.tag() == similar::DiffTag::Equal) {
+            continue;
+        }
+        let (Some(first), Some(last)) = (group.first(), group.last()) else { continue };
+        let (old_range, new_range) = (first.old_range().start..last.old_range().end, first.new_range().start..last.new_range().end);
+        // git numbers an empty side by the line before it
+        let start = |r: &Range<usize>| if r.is_empty() { r.start } else { r.start + 1 };
+        out.push_str(&format!("@@ -{},{} +{},{} @@\n", start(&old_range), old_range.len(), start(&new_range), new_range.len()));
+        for op in &group {
+            let (tag, o, n) = op.as_tag_tuple();
+            match tag {
+                similar::DiffTag::Equal => o.for_each(|i| line(&mut out, ' ', &a[i])),
+                similar::DiffTag::Delete => o.for_each(|i| line(&mut out, '-', &a[i])),
+                similar::DiffTag::Insert => n.for_each(|i| line(&mut out, '+', &b[i])),
+                similar::DiffTag::Replace => {
+                    o.for_each(|i| line(&mut out, '-', &a[i]));
+                    n.for_each(|i| line(&mut out, '+', &b[i]));
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,6 +642,46 @@ mod tests {
         assert_eq!(d.hunks[0].new_first(), 1);
         assert_eq!(d.hunks[0].old_first(), 1);
         assert_eq!(d.counts(), (2, 0));
+    }
+
+    /// `unified` against parsing it back: every line numbered as in its own text.
+    fn round_trip(old: &str, new: &str) -> Diff {
+        let d = parse_unified(unified(old, new, 3, Instant::now() + Duration::from_secs(5)).as_bytes());
+        let (a, b) = (split_lines(old), split_lines(new));
+        for l in d.hunks.iter().flat_map(|h| &h.lines) {
+            if let Some(n) = l.old {
+                assert_eq!(a[n as usize - 1].text, l.text, "old line {n}");
+            }
+            if let Some(n) = l.new {
+                assert_eq!(b[n as usize - 1].text, l.text, "new line {n}");
+            }
+        }
+        d
+    }
+
+    #[test]
+    fn two_texts_diff_as_git_would() {
+        assert_eq!(unified("a\nb\n", "a\nb\n", 3, Instant::now() + Duration::from_secs(5)), "", "equal: nothing");
+        // empty to text and back: git's 0,0 side
+        assert_eq!(unified("", "x\ny\n", 3, Instant::now() + Duration::from_secs(5)), "@@ -0,0 +1,2 @@\n+x\n+y\n");
+        assert_eq!(unified("x\n", "", 3, Instant::now() + Duration::from_secs(5)), "@@ -1,1 +0,0 @@\n-x\n");
+        let d = round_trip("", "x\ny\n");
+        assert_eq!(numbers(&d), [(A, None, Some(1), "x"), (A, None, Some(2), "y")]);
+        // a last line that lost its line end is a change, marked as git marks it
+        let d = round_trip("one\ntwo\n", "one\ntwo");
+        assert_eq!(numbers(&d), [(C, Some(1), Some(1), "one"), (R, Some(2), None, "two"), (A, None, Some(2), "two")]);
+        assert!(d.hunks[0].lines[2].no_newline && !d.hunks[0].lines[1].no_newline);
+        // CRLF is LF here: only the changed word shows
+        let d = round_trip("a\r\nb\r\nc\r\n", "a\nB\nc\n");
+        assert_eq!(numbers(&d), [(C, Some(1), Some(1), "a"), (R, Some(2), None, "b"), (A, None, Some(2), "B"), (C, Some(3), Some(3), "c")]);
+        // far apart: two hunks, each with its context, numbered from their own lines
+        let old: String = (1..=40).map(|i| format!("l{i}\n")).collect();
+        let new = old.replace("l5\n", "five\n").replace("l35\n", "");
+        let d = round_trip(&old, &new);
+        assert_eq!(d.hunks.len(), 2);
+        assert_eq!((d.hunks[0].old_start, d.hunks[0].old_count, d.hunks[0].new_start, d.hunks[0].new_count), (2, 7, 2, 7));
+        assert_eq!((d.hunks[1].old_start, d.hunks[1].old_count, d.hunks[1].new_start, d.hunks[1].new_count), (32, 7, 32, 6));
+        assert_eq!(d.counts(), (1, 2));
     }
 
     #[test]

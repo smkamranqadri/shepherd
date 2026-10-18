@@ -86,9 +86,9 @@ impl TabView {
     }
 
     /// Back in view.
-    fn show(&self, cx: &mut App) {
+    fn show(&self, window: &mut Window, cx: &mut App) {
         if let TabView::File(v) = self {
-            v.update(cx, |v, cx| v.show(cx));
+            v.update(cx, |v, cx| v.show(window, cx));
         }
     }
 
@@ -432,6 +432,12 @@ impl Shell {
                 }
                 cx.notify();
             }
+            // a deleted file's banner's Close: as the tab's own close, asking first with unsaved changes
+            EditorEvent::Close => {
+                if let Some(key) = s.file_tabs.iter().find(|(_, t)| t.get(id).is_some()).map(|(k, _)| k.clone()) {
+                    s.close_file_tab(&key, id, window, cx);
+                }
+            }
         })
         .detach();
         let place = self.tab_places.remove(&id);
@@ -637,7 +643,7 @@ impl Shell {
                 self.reload_shown_diff(false, cx);
             }
             if let Some(view) = &view {
-                view.show(cx);
+                view.show(window, cx);
             }
         }
         let hidden_focused = self.tab_views.iter().any(|(id, v)| Some(*id) != drawn && v.focus_handle(cx).contains_focused(window, cx));

@@ -7,7 +7,16 @@
 //! The text is compared with the last version on disk on every change (its length first, then its chunks), so the
 //! tab's dot goes when an undo comes back to it. A save (`files::save`, off the main thread) makes the version it
 //! wrote the new baseline, not the buffer as it is when the save ends: typing during a save leaves the tab dirty.
-//! A save that fails says why in a banner under the header; one the file changed under offers Overwrite or Reload.
+//! A save that fails says why in a banner under the header.
+//!
+//! The file is watched on disk (its folder, through `notify`, for events naming it) and looked at when its tab
+//! shows and when the window comes to the front. A change with no unsaved changes here is taken in place: the
+//! buffer gets the disk's text as one edit (undo steps back to what it was), the cursor and scroll kept. With
+//! unsaved changes a banner asks: Reload (the disk's text, theirs dropped, though undo still has it), Keep mine
+//! (the next save writes over that version of the disk's, and only that one) or Compare (the disk's text against
+//! the buffer, read-only, in the editor's place). A file deleted or moved away keeps its buffer, says so, and Save
+//! anyway makes it again. Ctrl/Cmd+S over a newer version on disk asks Overwrite / Compare / Cancel; Save All and
+//! closing a tab leave the banner instead.
 //!
 //! The gutter marks the lines changed against git's index, and those staged (HEAD to index) as outlines
 //! (`files::line_changes`): its blobs are fetched when the file opens and when git's state may have moved
@@ -17,9 +26,10 @@ use crate::files::content::{self, FileKind};
 use crate::files::highlight;
 use crate::files::line_changes::{self, Hunk, LineChange, Mark};
 use crate::files::runner::{self, Host, Limits};
-use crate::files::save::{self, Baseline, LineEnding, SaveError, SaveMode};
+use crate::files::save::{self, Baseline, LineEnding, SaveError, SaveMode, Seen};
 use crate::shell::widgets::{tip, titlebar_button};
 use crate::theme::Theme;
+use crate::ui::diff_view::DiffView;
 use crate::ui::editor_highlight::{SyntectHighlighter, editor_style};
 use crate::ui::markdown::{Link, Links};
 use crate::ui::review::Block;
@@ -53,6 +63,8 @@ const GUTTER_AFTER: Duration = Duration::from_millis(300);
 const GUTTER_BUDGET: Duration = Duration::from_millis(250);
 /// The padding left of the line numbers: the gutter's bars are drawn in it.
 const GUTTER_PAD: f32 = 8.;
+/// How long after the first event of a burst on disk (a checkout, a formatter's rename) the file is looked at.
+const DISK_AFTER: Duration = Duration::from_millis(300);
 
 pub enum EditorEvent {
     /// "Open in editor", at a line when there is one: the Shell shows the terminals and opens the file there.
@@ -62,6 +74,8 @@ pub enum EditorEvent {
     /// The unsaved-changes dot came or went, or a save started or ended: the tab bar draws again, and a preview is
     /// pinned on its first edit.
     Dirty(bool),
+    /// The deleted file's banner's Close: the Shell closes the tab (asking first, with unsaved changes).
+    Close,
 }
 
 /// Where the cursor and the scroll were, kept for the tab while its view is gone (dropped to save memory) and put
@@ -118,6 +132,12 @@ impl Tracker {
     pub fn changed<'a>(&mut self, len: usize, chunks: impl IntoIterator<Item = &'a str>) -> bool {
         let dirty = !same_text(len, chunks, &self.saved);
         std::mem::replace(&mut self.dirty, dirty) != dirty
+    }
+
+    /// The buffer is about to take the disk's text in place (`saved`): that is the saved text now, which the buffer's
+    /// next change is compared with.
+    pub fn reloaded(&mut self, saved: Arc<Vec<u8>>) {
+        self.saved = saved;
     }
 
     /// A save starts; its number, or `None` while another runs.
@@ -239,17 +259,105 @@ fn read_for_edit(path: &Path, root: Option<&Path>, force: bool) -> Loaded {
     let real_root = blocks.as_ref().and(root).and_then(|r| r.canonicalize().ok());
     let sample = || text.lines().take(2000);
     let hard_tabs = sample().filter(|l| l.starts_with('\t')).count() > sample().filter(|l| l.starts_with("  ")).count();
-    let normal = if text.text.contains('\r') { text.text.replace("\r\n", "\n").replace('\r', "\n") } else { text.text };
-    Loaded::Edit(Box::new(Editable { text: normal, baseline, syntax, readonly, blocks, real_root, hard_tabs }))
+    Loaded::Edit(Box::new(Editable { text: lf(text.text), baseline, syntax, readonly, blocks, real_root, hard_tabs }))
 }
 
-/// A save that failed, as the banner under the header says it.
+/// `text` with its line ends made `\n`, as the editor holds it.
+fn lf(text: String) -> String {
+    if text.contains('\r') { text.replace("\r\n", "\n").replace('\r', "\n") } else { text }
+}
+
+/// The saved text for the tracker: the baseline's own bytes when they are `text` (no BOM, `\n` ends), so they are kept
+/// once.
+fn saved_text(baseline: &Baseline, text: &str) -> Arc<Vec<u8>> {
+    if baseline.bytes.as_slice() == text.as_bytes() { baseline.bytes.clone() } else { Arc::new(text.as_bytes().to_vec()) }
+}
+
+/// The buffer is about to take `file`'s text in place (a reload that keeps undo): the baseline and the tracker's saved
+/// text become the file's first, so the change the buffer then hears compares clean against them.
+fn rebase(tracker: &mut Tracker, baseline: &mut Baseline, file: &Editable) {
+    *baseline = file.baseline.clone();
+    tracker.reloaded(saved_text(baseline, &file.text));
+}
+
+/// What a look at the disk found, against the baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disk {
+    /// The baseline's bytes (touched, maybe, but not changed).
+    Same,
+    /// Another version, by its length and digest.
+    Changed(Seen),
+    /// Nothing there, or no file: deleted, or moved away.
+    Gone,
+}
+
+/// What the editor does about a look at the disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnDisk {
+    Nothing,
+    /// The disk is as opened: a banner about it goes.
+    Clear,
+    /// No unsaved changes: the buffer takes the disk's text in place.
+    Reload,
+    /// Unsaved changes: the banner asks what to do.
+    Banner,
+    Deleted,
+}
+
+/// What to do about `disk`, with unsaved changes or not (`dirty`), when the user chose to keep their text over the
+/// version `kept`: that version again asks nothing, any other does.
+pub fn decide(dirty: bool, disk: Disk, kept: Option<Seen>) -> OnDisk {
+    match disk {
+        Disk::Same => OnDisk::Clear,
+        Disk::Gone => OnDisk::Deleted,
+        Disk::Changed(_) if !dirty => OnDisk::Reload,
+        Disk::Changed(seen) if kept == Some(seen) => OnDisk::Nothing,
+        Disk::Changed(_) => OnDisk::Banner,
+    }
+}
+
+/// Looks at the file on disk against `b` (blocking); `None` when it can't tell (an error reading it).
+fn look(path: &Path, b: &Baseline) -> Option<Disk> {
+    let gone = |e: &std::io::Error| matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput);
+    match save::changed_on_disk(path, b) {
+        Ok(false) => Some(Disk::Same),
+        // a folder or a FIFO in its place is no file either
+        Ok(true) => match save::fingerprint(path) {
+            Ok(seen) => Some(Disk::Changed(seen)),
+            Err(e) if gone(&e) => Some(Disk::Gone),
+            Err(_) => None,
+        },
+        Err(e) if gone(&e) => Some(Disk::Gone),
+        Err(_) => None,
+    }
+}
+
+/// `save::save`, but a save that finds the disk changed writes over it when the disk holds the version the user
+/// chose to keep their text over (`kept`), and only then: checked again at the rename, as any save.
+fn save_kept(root: &Path, path: &Path, text: &str, b: &Baseline, mode: SaveMode, kept: Option<Seen>) -> Result<Baseline, SaveError> {
+    let saved = save::save(root, path, text, b, mode);
+    let (Err(SaveError::Conflict), Some(kept), SaveMode::Safe | SaveMode::InPlace) = (&saved, kept, mode) else { return saved };
+    match Baseline::read(path) {
+        Ok(disk) if Seen::of(&disk.bytes) == kept => save::save(root, path, text, &b.over(&disk), mode),
+        _ => saved,
+    }
+}
+
+/// The disk's version of `path` as the editor would hold it, for a Compare: `None` when it is not text.
+fn disk_text(path: &Path) -> Option<String> {
+    let b = Baseline::read(path).ok()?;
+    let text = content::decode(&b.bytes)?;
+    Some(lf(text.text))
+}
+
+/// A save that failed, or the disk's news, as the banner under the header says it.
 #[derive(Debug, Clone, PartialEq)]
 enum Banner {
     Failed(String),
-    /// The file changed on disk since it was opened (or saved): Overwrite or Reload.
-    Conflict,
-    /// The file was deleted on disk: Save anyway recreates it.
+    /// The file changed on disk (to `disk`) while the buffer has unsaved changes: Compare, Keep mine or Reload.
+    /// `save`: a save found it so and wrote nothing (Overwrite then stands for Keep mine).
+    Changed { disk: Seen, save: bool },
+    /// The file was deleted or moved away on disk: Save anyway makes it again; Close closes the tab.
     Deleted,
 }
 
@@ -263,6 +371,8 @@ struct Edit {
     blocks: Option<Vec<Block>>,
     real_root: Option<PathBuf>,
     _events: Subscription,
+    /// The window coming to the front looks at the disk.
+    _activation: Subscription,
 }
 
 enum Body {
@@ -324,6 +434,17 @@ pub struct FileEditor {
     gutter_diff: Option<Task<()>>,
     /// git changed while the tab was out of sight: the blobs are fetched again when it shows.
     gutter_stale: bool,
+    /// The watch on the file's folder (its watcher lives in the task), the look at the disk under way, and the read
+    /// of a reload in place (apart, so a look never cancels a Reload asked for).
+    disk_watch: Option<Task<()>>,
+    disk_check: Option<Task<()>>,
+    disk_reload: Option<Task<()>>,
+    /// The version on disk the user chose to keep their text over ("Keep mine"): the next save writes over it.
+    kept: Option<Seen>,
+    /// The disk's text against the buffer, shown in the text's place.
+    compare: Option<Entity<DiffView>>,
+    /// The save under way was asked for by Ctrl/Cmd+S: a newer version on disk is asked about, not bannered.
+    explicit: bool,
     _theme: Subscription,
 }
 
@@ -331,6 +452,9 @@ impl EventEmitter<EditorEvent> for FileEditor {}
 
 impl Focusable for FileEditor {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
+        if let (Body::Edit(_), Some(compare)) = (&self.body, &self.compare) {
+            return compare.read(cx).focus_handle(cx);
+        }
         match &self.body {
             Body::Edit(e) if !self.preview_shown() => e.state.read(cx).focus_handle(cx),
             Body::View { viewer, .. } => viewer.read(cx).focus_handle(cx),
@@ -373,6 +497,12 @@ impl FileEditor {
             gutter_fetch: None,
             gutter_diff: None,
             gutter_stale: false,
+            disk_watch: None,
+            disk_check: None,
+            disk_reload: None,
+            kept: None,
+            compare: None,
+            explicit: false,
             _theme: theme,
         }
     }
@@ -427,8 +557,9 @@ impl FileEditor {
                 let rope: Rope = e.state.read(cx).text().clone();
                 let (root, path, baseline) = (self.save_root(), self.path.clone(), e.baseline.clone());
                 let mode = if self.in_place { SaveMode::InPlace } else { SaveMode::Safe };
+                let kept = self.kept;
                 let job = self.rt.spawn_blocking(move || {
-                    if let Err(err) = save::save(&root, &path, &rope_text(&rope), &baseline, mode) {
+                    if let Err(err) = save_kept(&root, &path, &rope_text(&rope), &baseline, mode, kept) {
                         eprintln!("shepherd: quitting, couldn't save {}: {err}", path.display());
                     }
                 });
@@ -489,6 +620,7 @@ impl FileEditor {
         (self.saving, self.queued) = (None, None);
         (self.preview, self.preview_scroll) = (true, ScrollHandle::new());
         (self.gutter, self.blobs, self.gutter_stale) = (Arc::default(), Blobs::default(), false);
+        (self.kept, self.explicit) = (None, false);
         let generation = self.generation;
         let job = self.rt.spawn(async move {
             let read = tokio::task::spawn_blocking(move || read_for_edit(&path, root.as_deref(), force));
@@ -525,7 +657,7 @@ impl FileEditor {
     fn edit(&mut self, file: Editable, window: &mut Window, cx: &mut Context<Self>) {
         let Editable { text, baseline, syntax, readonly, blocks, real_root, hard_tabs } = file;
         // the bytes on disk are the text as edited (no BOM, `\n` ends): one copy for both
-        let saved = if baseline.bytes.as_slice() == text.as_bytes() { baseline.bytes.clone() } else { Arc::new(text.clone().into_bytes()) };
+        let saved = saved_text(&baseline, &text);
         let style = editor_style(Theme::of(cx));
         let state = cx.new(|cx| {
             let mut state = EditorState::new(window, cx)
@@ -551,8 +683,15 @@ impl FileEditor {
                 e.changed(cx);
             }
         });
+        let activation = cx.observe_window_activation(window, |e: &mut FileEditor, window, cx| {
+            if window.is_window_active() {
+                e.check_disk(false, window, cx);
+            }
+        });
         let markdown = blocks.is_some();
-        self.body = Body::Edit(Box::new(Edit { state, baseline, tracker: Tracker::new(saved), readonly, blocks, real_root, _events: events }));
+        let tracker = Tracker::new(saved);
+        self.body = Body::Edit(Box::new(Edit { state, baseline, tracker, readonly, blocks, real_root, _events: events, _activation: activation }));
+        self.watch_disk(window, cx);
         match self.goto.take() {
             Some(Goto::Line(line)) => self.go_to_line(line, window, cx),
             Some(Goto::Fragment(fragment)) => self.go_to_fragment(&fragment, window, cx),
@@ -593,6 +732,10 @@ impl FileEditor {
             viewer.update(cx, |v, cx| v.release(window, cx));
         }
         (self.gutter_wait, self.gutter_fetch, self.gutter_diff) = (None, None, None);
+        (self.disk_watch, self.disk_check, self.disk_reload) = (None, None, None);
+        if let Some(compare) = self.compare.take() {
+            compare.update(cx, |v, _| v.release());
+        }
     }
 
     /// Out of sight: the viewer's image leaves gpui's cache.
@@ -602,11 +745,12 @@ impl FileEditor {
         }
     }
 
-    /// Back in sight: the gutter catches up with git if it moved meanwhile.
-    pub fn show(&mut self, cx: &mut Context<Self>) {
+    /// Back in sight: the gutter catches up with git if it moved meanwhile, and the disk is looked at.
+    pub fn show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if std::mem::take(&mut self.gutter_stale) {
             self.fetch_blobs(cx);
         }
+        self.check_disk(false, window, cx);
     }
 
     /// git's state may have moved (a Changes poll, a watch on `.git`): the gutter's blobs are fetched again, now if
@@ -754,12 +898,18 @@ impl FileEditor {
     /// one runs, one more is queued (typing since is saved too) and the task answers for that one. `None` when there
     /// is nothing to save it from (read-only, not text).
     pub fn save(&mut self, mode: SaveMode, window: &mut Window, cx: &mut Context<Self>) -> Option<Saving> {
+        self.save_as(mode, false, window, cx)
+    }
+
+    /// `save`; `explicit` (Ctrl/Cmd+S) asks about a newer version on disk rather than leaving the banner.
+    fn save_as(&mut self, mode: SaveMode, explicit: bool, window: &mut Window, cx: &mut Context<Self>) -> Option<Saving> {
         let Body::Edit(e) = &self.body else { return None };
         if e.readonly.is_some() {
             return None;
         }
         if let Some(current) = self.saving.clone() {
             self.queued = Some(mode);
+            self.explicit |= explicit;
             let follow = cx.spawn_in(window, async move |this, cx| {
                 let first = current.await;
                 // the queued one started as that one ended (`saved`), unless that one failed or left nothing to save
@@ -770,6 +920,7 @@ impl FileEditor {
             });
             return Some(follow.boxed_local().shared());
         }
+        self.explicit = explicit;
         self.start_save(mode, window, cx)
     }
 
@@ -784,13 +935,18 @@ impl FileEditor {
         let Body::Edit(e) = &mut self.body else { return None };
         let ticket = e.tracker.start_save()?;
         let rope: Rope = e.state.read(cx).text().clone();
-        let (baseline, path, generation) = (e.baseline.clone(), self.path.clone(), self.generation);
-        let job = self.rt.spawn_blocking(move || {
-            let text = rope_text(&rope);
-            let saved = save::save(&root, &path, &text, &baseline, mode);
-            (Arc::new(text), saved)
+        let (baseline, path, generation, kept) = (e.baseline.clone(), self.path.clone(), self.generation, self.kept);
+        // the answer comes from a runtime task, not the blocking thread itself (gpui's test scheduler hears tasks
+        // woken from its own thread only)
+        let job = self.rt.spawn(async move {
+            let save = tokio::task::spawn_blocking(move || {
+                let text = rope_text(&rope);
+                let saved = save_kept(&root, &path, &text, &baseline, mode, kept);
+                (Arc::new(text), saved)
+            });
+            save.await.ok()
         });
-        let job = job.map(|done| done.ok()).boxed().shared();
+        let job = job.map(|done| done.ok().flatten()).boxed().shared();
         self.writing = Some(job.clone().map(|_| ()).boxed().shared());
         cx.emit(EditorEvent::Dirty(e.tracker.is_dirty()));
         cx.notify();
@@ -813,6 +969,7 @@ impl FileEditor {
         }
         (self.saving, self.writing) = (None, None);
         let queued = self.queued.take();
+        let explicit = std::mem::take(&mut self.explicit);
         let Body::Edit(e) = &mut self.body else { return false };
         let (written, result) = match done {
             Ok((text, Ok(baseline))) => {
@@ -839,15 +996,24 @@ impl FileEditor {
         };
         match result {
             Ok(()) => {
-                self.banner = None;
+                // what was kept over is written over
+                (self.banner, self.kept) = (None, None);
                 // typed during it and asked again: one more
                 if let Some(mode) = queued.filter(|_| dirty) {
+                    self.explicit = explicit;
                     let _ = self.start_save(mode, window, cx);
+                } else {
+                    // anything written meanwhile by another program is heard now, not only at its next event
+                    self.check_disk(false, window, cx);
                 }
                 true
             }
+            Err(SaveError::Conflict) if explicit => {
+                self.ask_overwrite(window, cx);
+                false
+            }
             Err(SaveError::Conflict) => {
-                self.banner = Some(Banner::Conflict);
+                self.check_disk(true, window, cx);
                 false
             }
             Err(SaveError::Deleted) => {
@@ -887,38 +1053,282 @@ impl FileEditor {
         .detach();
     }
 
-    /// The conflict banner's Overwrite and the deleted one's Save anyway: the buffer is written over what changed
-    /// on disk, or where the file was.
-    fn overwrite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.save(SaveMode::Overwrite, window, cx);
-    }
-
-    /// The conflict banner's Reload: the file as it is on disk, the cursor and scroll kept; unsaved changes are
-    /// dropped only once that is confirmed.
-    fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.is_dirty() {
-            return self.reload_now(window, cx);
-        }
-        let detail = "The file is read again from disk; your changes here are lost.";
-        let answer = window.prompt(PromptLevel::Warning, "Discard your changes?", Some(detail), &["Discard", "Cancel"], cx);
+    /// Ctrl/Cmd+S found a newer version on disk: Overwrite it, Compare the two, or Cancel (the banner stays).
+    fn ask_overwrite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let detail = "The file changed on disk since you opened it. Overwrite writes your text over it; Compare shows the two side by side.";
+        let answer = window.prompt(PromptLevel::Warning, "Overwrite the newer version on disk?", Some(detail), &["Overwrite", "Compare", "Cancel"], cx);
         let generation = self.generation;
         cx.spawn_in(window, async move |this, cx| {
-            if answer.await == Ok(0) {
-                let _ = this.update_in(cx, |e, window, cx| {
-                    if e.generation == generation {
-                        e.reload_now(window, cx);
+            let answer = answer.await.ok();
+            let _ = this.update_in(cx, |e, window, cx| {
+                if e.generation != generation {
+                    return;
+                }
+                match answer {
+                    Some(0) => e.overwrite(window, cx),
+                    Some(1) => {
+                        e.check_disk(true, window, cx);
+                        e.compare(window, cx);
                     }
-                });
-            }
+                    _ => e.check_disk(true, window, cx),
+                }
+            });
         })
         .detach();
     }
 
+    /// The banner's Overwrite and the deleted one's Save anyway: the buffer is written over what changed on disk,
+    /// or where the file was.
+    fn overwrite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.save(SaveMode::Overwrite, window, cx);
+    }
+
+    /// The banner's Keep mine: the version on disk it names is the one the next save writes over; another change
+    /// on disk asks again.
+    fn keep_mine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(Banner::Changed { disk, .. }) = self.banner {
+            (self.kept, self.banner) = (Some(disk), None);
+        }
+        self.end_compare(window, cx);
+        cx.notify();
+    }
+
+    /// The banner's Reload: the disk's text in place, the unsaved changes dropped (undo still has them).
+    fn discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.end_compare(window, cx);
+        self.reload_in_place(true, window, cx);
+    }
+
+    /// Reads the file again and puts its text in the buffer as one edit, the cursor and scroll kept; `discard`
+    /// drops unsaved changes, else a buffer edited meanwhile is left alone (and the banner asks). Text that no
+    /// longer opens editable (binary now, too large) goes to the viewer.
+    fn reload_in_place(&mut self, discard: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let (path, root, generation) = (self.path.clone(), self.root.clone(), self.generation);
+        let job = self.rt.spawn(async move {
+            let read = tokio::task::spawn_blocking(move || read_for_edit(&path, root.as_deref(), false));
+            tokio::time::timeout(LOAD_TIMEOUT, read).await.ok().and_then(Result::ok)
+        });
+        self.disk_reload = Some(cx.spawn_in(window, async move |this, cx| {
+            let Ok(Some(loaded)) = job.await else { return };
+            let _ = this.update_in(cx, |e, window, cx| {
+                if e.generation != generation {
+                    return;
+                }
+                match loaded {
+                    Loaded::Edit(file) => e.put_in_place(*file, discard, window, cx),
+                    Loaded::View(_) => e.reload_now(window, cx),
+                }
+            });
+        }));
+    }
+
+    fn put_in_place(&mut self, file: Editable, discard: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let place = self.place(cx);
+        let Body::Edit(e) = &mut self.body else { return };
+        // a save began meanwhile (it looks again when it ends), or typing did and nothing is to be dropped
+        if e.tracker.saving() || (!discard && e.tracker.is_dirty()) {
+            return self.check_disk(false, window, cx);
+        }
+        // the baseline and the saved text first: the buffer's change below is compared with them
+        rebase(&mut e.tracker, &mut e.baseline, &file);
+        let Editable { text, readonly, blocks, real_root, .. } = file;
+        (e.readonly, e.blocks, e.real_root) = (readonly, blocks, real_root);
+        e.state.update(cx, |s, cx| {
+            s.set_readonly(readonly.is_some(), cx);
+            s.replace_all(text, window, cx);
+            if let Some(place) = place {
+                // the cursor where it was, on a line the text still has
+                let last = s.text().lines_len().saturating_sub(1) as u32;
+                let offset = s.text().position_to_offset(&Position::new(place.line.min(last), place.column));
+                s.set_selected_range(offset..offset, cx);
+                s.set_scroll_offset(point(px(0.), px(place.scroll_y)), cx);
+            }
+        });
+        if matches!(self.banner, Some(Banner::Changed { .. } | Banner::Deleted)) {
+            self.banner = None;
+        }
+        self.kept = None;
+        // the dot now, not only when the buffer's change is heard
+        self.changed(cx);
+        cx.notify();
+    }
+
+    /// Reads the file again from scratch (as opening it): for text that no longer opens editable in place.
     fn reload_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let place = self.place(cx);
         let (path, root) = (self.path.clone(), self.root.clone());
         self.load(path, None, root, place, false, window, cx);
         cx.emit(EditorEvent::Dirty(false));
+    }
+
+    /// The banner's Compare: the disk's text (left) against the buffer (right) in the text's place, read again
+    /// when the disk changes while it shows.
+    fn compare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Body::Edit(e) = &self.body else { return };
+        let rope: Rope = e.state.read(cx).text().clone();
+        let (path, generation) = (self.path.clone(), self.generation);
+        let read = path.clone();
+        let job = self.rt.spawn(async move {
+            let texts = tokio::task::spawn_blocking(move || disk_text(&read).map(|disk| (disk, rope_text(&rope))));
+            tokio::time::timeout(LOAD_TIMEOUT, texts).await.ok().and_then(Result::ok).flatten()
+        });
+        let rt = self.rt.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let texts = job.await.ok().flatten();
+            let _ = this.update_in(cx, |e, window, cx| {
+                if e.generation != generation {
+                    return;
+                }
+                let Some((disk, mine)) = texts else {
+                    return crate::ui::toast::error(cx, "Can't compare: the file on disk isn't text");
+                };
+                let (disk, mine) = (Arc::new(disk), Arc::new(mine));
+                if let Some(view) = &e.compare {
+                    view.update(cx, |v, cx| v.set_texts(disk, mine, cx));
+                    return;
+                }
+                let had = e.focus_handle(cx).contains_focused(window, cx);
+                let view = cx.new(|cx| DiffView::compare(rt, path, disk, mine, ("On disk", "Yours"), cx));
+                e.compare = Some(view);
+                if had {
+                    let handle = e.focus_handle(cx);
+                    window.focus(&handle, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Back from a Compare to the text.
+    fn end_compare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.compare.take() else { return };
+        let had = view.read(cx).focus_handle(cx).contains_focused(window, cx);
+        view.update(cx, |v, _| v.release());
+        if had {
+            let handle = self.focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+        cx.notify();
+    }
+
+    /// Watches the file's folder (not its tree) for events naming the file, the watch made on the runtime's
+    /// blocking pool (a dead mount can hang it); a burst is heard `DISK_AFTER` after its first event, on the
+    /// runtime, and the editor looks at the disk then. The watch goes with the editor's task (the runtime's sees its
+    /// channel close). A folder that can't be watched leaves the looks to the tab showing and the window coming to
+    /// the front.
+    fn watch_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(dir), Some(name)) = (self.path.parent().map(PathBuf::from), self.path.file_name().map(std::ffi::OsString::from)) else { return };
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (out, mut heard) = tokio::sync::mpsc::unbounded_channel::<()>();
+        self.rt.spawn(async move {
+            let make = tokio::task::spawn_blocking(move || {
+                use ::notify::event::{AccessKind, AccessMode};
+                use ::notify::{EventKind, RecursiveMode, Watcher};
+                let mut watcher = ::notify::recommended_watcher(move |event: ::notify::Result<::notify::Event>| {
+                    let named = |ev: &::notify::Event| ev.paths.iter().any(|p| p.file_name() == Some(&name));
+                    let ours = match &event {
+                        // an open or a read (the editor's own looks among them) changes nothing; a write's close does
+                        Ok(ev) if matches!(ev.kind, EventKind::Access(AccessKind::Close(AccessMode::Write))) => named(ev),
+                        Ok(ev) if matches!(ev.kind, EventKind::Access(_)) => false,
+                        // a rescan names nothing
+                        Ok(ev) => ev.paths.is_empty() || named(ev),
+                        Err(_) => true,
+                    };
+                    if ours {
+                        let _ = tx.send(());
+                    }
+                })
+                .ok()?;
+                watcher.watch(&dir, RecursiveMode::NonRecursive).ok()?;
+                Some(watcher)
+            });
+            let Ok(Ok(Some(watcher))) = tokio::time::timeout(LOAD_TIMEOUT, make).await else { return };
+            // the watch lasts as long as this loop
+            let _watcher = watcher;
+            loop {
+                tokio::select! {
+                    got = events.recv() => if got.is_none() { return },
+                    _ = out.closed() => return,
+                }
+                tokio::time::sleep(DISK_AFTER).await;
+                while events.try_recv().is_ok() {}
+                if out.send(()).is_err() {
+                    return;
+                }
+            }
+        });
+        let generation = self.generation;
+        self.disk_watch = Some(cx.spawn_in(window, async move |this, cx| {
+            while heard.recv().await.is_some() {
+                let looked = this.update_in(cx, |e, window, cx| {
+                    if e.generation == generation {
+                        e.check_disk(false, window, cx);
+                    }
+                });
+                if looked.is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// Looks at the file on disk off the main thread and acts on it (`decide`): not while a save runs (it looks when
+    /// it ends). `after_save`: a save found the disk changed, which the banner says.
+    fn check_disk(&mut self, after_save: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Body::Edit(e) = &self.body else { return };
+        if e.tracker.saving() {
+            return;
+        }
+        let (path, baseline, generation) = (self.path.clone(), e.baseline.clone(), self.generation);
+        let checked = baseline.bytes.clone();
+        let job = self.rt.spawn(async move {
+            let look = tokio::task::spawn_blocking(move || look(&path, &baseline));
+            tokio::time::timeout(LOAD_TIMEOUT, look).await.ok().and_then(Result::ok).flatten()
+        });
+        self.disk_check = Some(cx.spawn_in(window, async move |this, cx| {
+            let Ok(Some(disk)) = job.await else { return };
+            let _ = this.update_in(cx, |e, window, cx| e.on_disk(generation, &checked, disk, after_save, window, cx));
+        }));
+    }
+
+    fn on_disk(&mut self, generation: u64, checked: &Arc<Vec<u8>>, disk: Disk, after_save: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Body::Edit(e) = &self.body else { return };
+        // another file since, or a save began or ended since the look: that one looks again
+        if generation != self.generation || e.tracker.saving() || !Arc::ptr_eq(&e.baseline.bytes, checked) {
+            return;
+        }
+        let dirty = e.tracker.is_dirty();
+        match decide(dirty, disk, self.kept) {
+            OnDisk::Nothing => {}
+            OnDisk::Clear => {
+                self.kept = None;
+                if matches!(self.banner, Some(Banner::Changed { .. } | Banner::Deleted)) {
+                    self.banner = None;
+                    cx.notify();
+                }
+            }
+            OnDisk::Reload => self.reload_in_place(false, window, cx),
+            OnDisk::Banner => {
+                let Disk::Changed(seen) = disk else { return };
+                let save = after_save || matches!(self.banner, Some(Banner::Changed { save: true, .. }));
+                let banner = Some(Banner::Changed { disk: seen, save });
+                if self.banner != banner {
+                    self.banner = banner;
+                    cx.notify();
+                }
+            }
+            OnDisk::Deleted => {
+                if self.banner != Some(Banner::Deleted) {
+                    self.banner = Some(Banner::Deleted);
+                    cx.notify();
+                }
+            }
+        }
+        // a Compare showing takes the disk's new text
+        if self.compare.is_some() && matches!(disk, Disk::Changed(_)) {
+            self.compare(window, cx);
+        }
     }
 
     fn open_in_editor(&mut self, cx: &mut Context<Self>) {
@@ -1124,7 +1534,7 @@ impl FileEditor {
             .hover(move |s| s.bg(hover))
     }
 
-    /// The strip under the header for a save's trouble (E2 puts the disk's changes here too).
+    /// The strip under the header for a save's trouble or the disk's changes.
     fn banner(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let banner = self.banner.as_ref()?;
         let strip = div()
@@ -1141,14 +1551,34 @@ impl FileEditor {
             .font_family(theme.font_ui.clone())
             .text_size(px(12.5));
         Some(match banner {
-            Banner::Conflict => strip
-                .child(div().flex_1().min_w_0().text_color(theme.text).child("The file changed on disk since it was opened."))
-                .child(Self::button(theme, "editor-overwrite").child("Overwrite").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.overwrite(window, cx))))
-                .child(Self::button(theme, "editor-reload").child("Reload").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.reload(window, cx))))
-                .into_any_element(),
+            Banner::Changed { save, .. } => {
+                let said = if *save { "The file changed on disk, so your save was not written." } else { "The file changed on disk." };
+                let keep = if *save {
+                    Self::button(theme, "editor-overwrite").child("Overwrite").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.overwrite(window, cx)))
+                } else {
+                    Self::button(theme, "editor-keep-mine").child("Keep mine").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.keep_mine(window, cx)))
+                };
+                let compare = if self.compare.is_some() {
+                    Self::button(theme, "editor-back").child("Back to editor").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.end_compare(window, cx)))
+                } else {
+                    Self::button(theme, "editor-compare").child("Compare").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.compare(window, cx)))
+                };
+                strip
+                    .child(div().flex_1().min_w_0().text_color(theme.text).child(said))
+                    .child(compare)
+                    .child(keep)
+                    .child(
+                        Self::button(theme, "editor-reload")
+                            .child("Reload")
+                            .tooltip(tip("Take the disk's version; undo brings yours back", None))
+                            .on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.discard(window, cx))),
+                    )
+                    .into_any_element()
+            }
             Banner::Deleted => strip
-                .child(div().flex_1().min_w_0().text_color(theme.text).child("Deleted on disk."))
+                .child(div().flex_1().min_w_0().text_color(theme.text).child("Deleted or moved on disk."))
                 .child(Self::button(theme, "editor-save-anyway").child("Save anyway").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.overwrite(window, cx))))
+                .child(Self::button(theme, "editor-close").child("Close").on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(EditorEvent::Close))))
                 .into_any_element(),
             Banner::Failed(why) => strip
                 .child(div().flex_1().min_w_0().text_color(theme.text).child(format!("Couldn't save: {why}")))
@@ -1249,7 +1679,26 @@ impl FileEditor {
 
     /// The strips under the header, in order: a save's trouble, the disk's changes.
     fn banners(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        self.banner(theme, cx).into_iter().collect()
+        let mut out: Vec<AnyElement> = self.banner(theme, cx).into_iter().collect();
+        // a Compare with no banner to leave it by (the disk went back, or Keep mine came from elsewhere)
+        if self.compare.is_some() && !matches!(self.banner, Some(Banner::Changed { .. })) {
+            let strip = div()
+                .flex_none()
+                .min_h(px(32.))
+                .px(px(12.))
+                .py(px(4.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .border_b_1()
+                .border_color(theme.border)
+                .font_family(theme.font_ui.clone())
+                .text_size(px(12.5))
+                .child(div().flex_1().min_w_0().text_color(theme.text_muted).child("The file on disk against your text."))
+                .child(Self::button(theme, "editor-back").child("Back to editor").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.end_compare(window, cx))));
+            out.push(strip.into_any_element());
+        }
+        out
     }
 
     /// What sits between the banners and the text (a find bar): none yet.
@@ -1257,9 +1706,11 @@ impl FileEditor {
         Vec::new()
     }
 
-    /// The text: markdown's preview, or the editor.
+    /// The text: a Compare, markdown's preview, or the editor.
     fn body_element(&self, e: &Edit, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        if self.preview_shown() {
+        if let Some(compare) = &self.compare {
+            compare.clone().into_any_element()
+        } else if self.preview_shown() {
             // a press in the preview gives it the keyboard (its selection is ui::markdown's)
             let preview = self.preview_body(e, theme, cx);
             div()
@@ -1319,7 +1770,7 @@ impl Render for FileEditor {
             .on_key_down(cx.listener(|e, ev: &KeyDownEvent, window, cx| e.key(ev, window, cx)))
             // the editor's text and a markdown preview's alike
             .on_action(cx.listener(|e, _: &SaveFile, window, cx| {
-                let _ = e.save(SaveMode::Safe, window, cx);
+                let _ = e.save_as(SaveMode::Safe, true, window, cx);
             }))
             .size_full()
             .flex()
@@ -1432,6 +1883,226 @@ mod tests {
             Loaded::Edit(e) => assert!(e.readonly.is_some()),
             Loaded::View(_) => panic!("editable"),
         }
+    }
+
+    #[test]
+    fn the_disk_s_changes_are_decided_by_dirt_and_what_was_kept() {
+        let (v1, v2) = (Seen { len: 3, hash: 1 }, Seen { len: 3, hash: 2 });
+        use OnDisk::*;
+        let table = [
+            // (dirty, disk, kept) -> what happens
+            (false, Disk::Same, None, Clear),
+            (true, Disk::Same, Some(v1), Clear),
+            (false, Disk::Changed(v1), None, Reload),
+            (false, Disk::Changed(v1), Some(v1), Reload),
+            (true, Disk::Changed(v1), None, Banner),
+            (true, Disk::Changed(v1), Some(v1), Nothing),
+            (true, Disk::Changed(v2), Some(v1), Banner),
+            (false, Disk::Gone, None, Deleted),
+            (true, Disk::Gone, Some(v1), Deleted),
+        ];
+        for (dirty, disk, kept, want) in table {
+            assert_eq!(decide(dirty, disk, kept), want, "dirty {dirty}, {disk:?}, kept {kept:?}");
+        }
+    }
+
+    #[test]
+    fn a_look_at_the_disk_tells_same_changed_and_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let b = Baseline::read(&path).unwrap();
+        assert_eq!(look(&path, &b), Some(Disk::Same));
+        std::fs::write(&path, "two\n").unwrap();
+        assert_eq!(look(&path, &b), Some(Disk::Changed(Seen::of(b"two\n"))));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(look(&path, &b), Some(Disk::Gone), "deleted");
+        // a folder in its place is no file
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(look(&path, &b), Some(Disk::Gone));
+        std::fs::remove_dir(&path).unwrap();
+        // back as it was: the same
+        std::fs::write(&path, "one\n").unwrap();
+        assert_eq!(look(&path, &b), Some(Disk::Same));
+    }
+
+    #[test]
+    fn a_save_writes_over_the_version_kept_and_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let b = Baseline::read(&path).unwrap();
+        std::fs::write(&path, "theirs\n").unwrap();
+        // nothing kept: a conflict
+        assert_eq!(save_kept(dir.path(), &path, "mine\n", &b, SaveMode::Safe, None), Err(SaveError::Conflict));
+        // their version kept: written over
+        let kept = Some(Seen::of(b"theirs\n"));
+        let saved = save_kept(dir.path(), &path, "mine\n", &b, SaveMode::Safe, kept).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine\n");
+        assert_eq!(*saved.bytes, b"mine\n");
+        // a newer version than the one kept: a conflict again
+        std::fs::write(&path, "theirs again\n").unwrap();
+        assert_eq!(save_kept(dir.path(), &path, "mine 2\n", &saved, SaveMode::Safe, kept), Err(SaveError::Conflict));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs again\n");
+        // an Overwrite needs nothing kept
+        save_kept(dir.path(), &path, "mine 2\n", &saved, SaveMode::Overwrite, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine 2\n");
+    }
+
+    #[test]
+    fn a_reload_in_place_leaves_the_tracker_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn a() {}\r\n").unwrap();
+        let Loaded::Edit(old) = read_for_edit(&path, Some(dir.path()), false) else { panic!("editable") };
+        let mut baseline = old.baseline.clone();
+        let mut tracker = Tracker::new(saved_text(&baseline, &old.text));
+        // unsaved changes, then the disk's new text taken in place
+        tracker.changed(5, ["mine\n"]);
+        assert!(tracker.is_dirty());
+        std::fs::write(&path, "fn b() {}\r\n").unwrap();
+        let Loaded::Edit(file) = read_for_edit(&path, Some(dir.path()), false) else { panic!("editable") };
+        rebase(&mut tracker, &mut baseline, &file);
+        assert_eq!(*baseline.bytes, b"fn b() {}\r\n", "the disk's version is the baseline");
+        // the buffer's change to that text is heard after: clean, the dot going
+        assert!(tracker.changed(file.text.len(), [file.text.as_str()]));
+        assert!(!tracker.is_dirty());
+        // undo back to what was typed: dirty again
+        assert!(tracker.changed(5, ["mine\n"]));
+    }
+
+    /// A runtime driven on the test's thread (`settle`): gpui's test scheduler hears tasks woken from there only.
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    /// Runs the window's tasks and the runtime's until `done` holds.
+    fn settle(rt: &tokio::runtime::Runtime, cx: &mut gpui::VisualTestContext, mut done: impl FnMut(&mut gpui::VisualTestContext) -> bool) {
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            rt.block_on(async { tokio::time::sleep(Duration::from_millis(5)).await });
+        }
+        panic!("never settled");
+    }
+
+    /// A window with an editor on `path` (in `root`), once its text is in.
+    fn editor_on(cx: &mut gpui::TestAppContext, rt: &tokio::runtime::Runtime, root: &Path, path: &Path) -> (Entity<FileEditor>, &'static mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(crate::settings::Settings::default().theme(gpui::WindowAppearance::Dark));
+        });
+        let handle = rt.handle().clone();
+        let (editor, cx) = cx.add_window_view(|_, cx| FileEditor::new(handle, cx));
+        let cx: &'static mut gpui::VisualTestContext = Box::leak(Box::new(cx.clone()));
+        let (path, root) = (path.to_path_buf(), root.to_path_buf());
+        editor.update_in(cx, |e, window, cx| e.open(path, None, Some(root), None, window, cx));
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| matches!(e.body, Body::Edit(_))));
+        (editor, cx)
+    }
+
+    fn text_of(editor: &Entity<FileEditor>, cx: &mut gpui::VisualTestContext) -> String {
+        editor.read_with(cx, |e, cx| e.editor_state().map(|s| rope_text(s.read(cx).text())).unwrap_or_default())
+    }
+
+    #[gpui::test]
+    fn a_clean_buffer_takes_the_disk_s_change_in_place_and_undo_steps_back(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let (editor, cx) = editor_on(cx, &rt, dir.path(), &path);
+        std::fs::write(&path, "one\nTWO\nthree\n").unwrap();
+        editor.update_in(cx, |e, window, cx| e.check_disk(false, window, cx));
+        settle(rt, cx, |cx| text_of(&editor, cx) == "one\nTWO\nthree\n");
+        editor.read_with(cx, |e, _| {
+            assert!(!e.is_dirty(), "the disk's text is the saved text");
+            assert_eq!(e.banner, None);
+            let Body::Edit(edit) = &e.body else { panic!("editable") };
+            assert_eq!(*edit.baseline.bytes, b"one\nTWO\nthree\n");
+        });
+        // the reload was one edit: undo brings the old text back, unsaved against the disk's
+        editor.update_in(cx, |e, window, cx| {
+            let handle = e.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(gpui_base::input::Undo);
+        settle(rt, cx, |cx| text_of(&editor, cx) == "one\ntwo\n");
+        editor.read_with(cx, |e, _| assert!(e.is_dirty()));
+    }
+
+    #[gpui::test]
+    fn a_write_heard_by_the_watch_is_taken_in_and_a_neighbour_s_is_not(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let (editor, cx) = editor_on(cx, rt, dir.path(), &path);
+        // the watch is made on the blocking pool: a moment for it
+        let mut rounds = 0;
+        settle(rt, cx, |_| {
+            rounds += 1;
+            rounds > 20
+        });
+        let looks = |cx: &mut gpui::VisualTestContext| editor.read_with(cx, |e, _| e.disk_check.is_some());
+        assert!(!looks(cx), "nothing looked yet");
+        std::fs::write(dir.path().join("b.txt"), "other\n").unwrap();
+        let mut rounds = 0;
+        settle(rt, cx, |_| {
+            rounds += 1;
+            rounds > 100
+        });
+        assert!(!looks(cx), "another file's write is not this one's");
+        // renamed over it, as an editor saves
+        std::fs::write(dir.path().join("a.tmp"), "two\n").unwrap();
+        std::fs::rename(dir.path().join("a.tmp"), &path).unwrap();
+        settle(rt, cx, |cx| text_of(&editor, cx) == "two\n");
+        editor.read_with(cx, |e, _| assert!(!e.is_dirty()));
+    }
+
+    #[gpui::test]
+    fn unsaved_changes_ask_and_keep_mine_writes_over_that_version_only(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let (editor, cx) = editor_on(cx, &rt, dir.path(), &path);
+        editor.update_in(cx, |e, window, cx| {
+            let state = e.editor_state().unwrap().clone();
+            state.update(cx, |s, cx| s.replace_all("mine\n", window, cx));
+        });
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| e.is_dirty()));
+        std::fs::write(&path, "theirs\n").unwrap();
+        editor.update_in(cx, |e, window, cx| e.check_disk(false, window, cx));
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| e.banner.is_some()));
+        editor.read_with(cx, |e, _| assert_eq!(e.banner, Some(Banner::Changed { disk: Seen::of(b"theirs\n"), save: false })));
+        assert_eq!(text_of(&editor, cx), "mine\n", "the buffer is left alone");
+        // Keep mine: the same version again asks nothing; the save writes over it
+        editor.update_in(cx, |e, window, cx| e.keep_mine(window, cx));
+        editor.update_in(cx, |e, window, cx| e.check_disk(false, window, cx));
+        let mut rounds = 0;
+        settle(rt, cx, |_| {
+            rounds += 1;
+            rounds > 20
+        });
+        editor.read_with(cx, |e, _| assert_eq!(e.banner, None));
+        let saved = editor.update_in(cx, |e, window, cx| e.save(SaveMode::Safe, window, cx)).unwrap();
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| !e.is_saving()));
+        assert!(futures::executor::block_on(saved));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine\n");
+        // deleted: the buffer stays, and says so
+        std::fs::remove_file(&path).unwrap();
+        editor.update_in(cx, |e, window, cx| e.check_disk(false, window, cx));
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| e.banner.is_some()));
+        editor.read_with(cx, |e, _| assert_eq!(e.banner, Some(Banner::Deleted)));
+        assert_eq!(text_of(&editor, cx), "mine\n");
+        // back as saved: the banner goes
+        std::fs::write(&path, "mine\n").unwrap();
+        editor.update_in(cx, |e, window, cx| e.check_disk(false, window, cx));
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| e.banner.is_none()));
     }
 
     #[test]
