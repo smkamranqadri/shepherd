@@ -29,6 +29,7 @@ mod floating;
 mod motion;
 mod pane_drag;
 mod popups;
+mod quick_open;
 mod review;
 mod right_panel;
 mod kept_views;
@@ -801,6 +802,7 @@ impl Shell {
                 None => Vec::new(),
             },
             Kind::Worktrees => Vec::new(), // herdr's list fills it: see `open_worktrees_panel`
+            Kind::Files => Vec::new(), // the shown workspace's files fill it: see `quick_open`
             Kind::Places => crate::ui::command_panel::place_items(
                 self.places
                     .iter()
@@ -894,6 +896,7 @@ impl Shell {
                         }
                     }
                 }
+                PanelEvent::Run(Run::OpenFile { path, line }) => this.open_quick_file(path.clone(), *line, window, cx),
                 PanelEvent::Run(Run::Place(key)) => {
                     let places = &this.places;
                     let (Some(to), at) = (places.iter().position(|p| &p.key() == key), places.iter().position(|p| this.places_shown(p))) else { return };
@@ -1841,8 +1844,8 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ShowPullRequest, w, cx| this.show_panel_tab(crate::settings::PanelTab::Pr, w, cx)))
             // the shown pane's repo: also the status bar branch's click
             .on_action(cx.listener(|this, _: &SwitchBranch, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Branches, w, cx)))
-            // ponytail: until Quick Open (M7) and reveal (M8) land, these open the Files tab
-            .on_action(cx.listener(|this, _: &QuickOpen, w, cx| this.open_panel_tab(crate::settings::PanelTab::Files, w, cx)))
+            .on_action(cx.listener(|this, _: &QuickOpen, w, cx| this.quick_open(w, cx)))
+            // ponytail: until reveal (M8) lands, it opens the Files tab
             .on_action(cx.listener(|this, _: &RevealActiveFile, w, cx| this.open_panel_tab(crate::settings::PanelTab::Files, w, cx)))
             .on_action(cx.listener(|this, _: &ChooseRoot, w, cx| this.choose_root(w, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.toggle_settings_here(window, cx)))

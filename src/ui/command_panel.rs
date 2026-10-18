@@ -10,6 +10,11 @@ use gpui::{
     div, linear_color_stop, linear_gradient, point, prelude::FluentBuilder, px,
 };
 use gpui_base::input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+pub use crate::files::fuzzy::{matched, score};
 
 /// What an item does when run.
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +39,8 @@ pub enum Run {
     /// Go to this workspace or agent of the session `key` (a socket, `machine:<id>`), switching there first when it
     /// is not the one shown, as a click in the sidebar's tree does.
     Go(String, crate::shell::Goal),
+    /// Open this file in a tab of the shown workspace, at this line.
+    OpenFile { path: PathBuf, line: Option<u32> },
 }
 
 /// The heading an item sits under; also searched, so "tab" finds the tabs.
@@ -49,6 +56,9 @@ pub enum Section {
     Worktrees,
     Places,
     Shortcuts,
+    /// Quick Open's file tabs of the shown workspace.
+    Open,
+    Files,
 }
 
 impl Section {
@@ -64,6 +74,8 @@ impl Section {
             Section::Worktrees => "Worktrees",
             Section::Places => "Sessions",
             Section::Shortcuts => "Shortcuts",
+            Section::Open => "Open",
+            Section::Files => "Files",
         }
     }
 }
@@ -97,7 +109,7 @@ impl Item {
             return std::iter::once(self.label.clone()).chain(self.chords.iter().map(|c| c.replace('-', " "))).collect::<Vec<_>>().join(" ");
         }
         match self.run {
-            Run::Action(_) | Run::EditKeys(_) | Run::Branch(_) | Run::Herdr(_) | Run::Theme(_) => self.label.clone(),
+            Run::Action(_) | Run::EditKeys(_) | Run::Branch(_) | Run::Herdr(_) | Run::Theme(_) | Run::OpenFile { .. } => self.label.clone(),
             // the branch, then its folder; the place, then where it is
             Run::Worktree { .. } | Run::Place(_) => [Some(self.label.as_str()), self.hint.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" "),
             Run::Tab(_) | Run::Go(..) => [Some(self.label.as_str()), self.hint.as_deref(), Some(self.section.title())].into_iter().flatten().collect::<Vec<_>>().join(" "),
@@ -190,6 +202,8 @@ pub enum Kind {
     Worktrees,
     Places,
     Shortcuts,
+    /// Quick Open: the shown workspace's files, ranked off the main thread (`files::quick_open`).
+    Files,
 }
 
 impl Kind {
@@ -203,6 +217,7 @@ impl Kind {
             Kind::Themes => "ChangeTheme",
             Kind::Places => "SwitchSession",
             Kind::Shortcuts => "ShowShortcuts",
+            Kind::Files => "QuickOpen",
         }
     }
 }
@@ -621,67 +636,66 @@ fn place_after_current(items: &[Item], matches: &[usize]) -> usize {
     current.map_or(0, |row| (row + 1) % matches.len())
 }
 
-/// How well `query` matches `text`, ignoring case, and which chars of `text` it matched; None if it does not:
-/// `text` starting with it ranks first, then it starting a word, then anywhere, then its letters in order (more
-/// of them on word starts, fewer gaps, higher).
-pub fn matched(query: &str, text: &str) -> Option<(i32, Vec<usize>)> {
-    let q: Vec<char> = query.trim().to_lowercase().chars().collect();
-    if q.is_empty() {
-        return Some((0, Vec::new()));
-    }
-    let t: Vec<char> = text.to_lowercase().chars().collect();
-    let word_start = |i: usize| i == 0 || !t[i - 1].is_alphanumeric();
-    let hits: Vec<usize> = (0..t.len()).filter(|&i| t[i..].starts_with(&q)).collect();
-    let run = |at: usize| (at..at + q.len()).collect();
-    if hits.first() == Some(&0) {
-        return Some((3000, run(0)));
-    }
-    if let Some(&at) = hits.iter().find(|&&i| word_start(i)) {
-        return Some((2000, run(at)));
-    }
-    if let Some(&at) = hits.first() {
-        return Some((1000, run(at)));
-    }
-    // The best placement of the letters: +10 for each on a word start, -1 for each char skipped before it.
-    // best[k][i] scores q[..=k] with q[k] at t[i]; a running max over the previous row keeps it O(q·t).
-    let q: Vec<char> = q.into_iter().filter(|c| !c.is_whitespace()).collect();
-    if q.is_empty() {
-        return None;
-    }
-    let bonus = |i: usize| if word_start(i) { 10 } else { 0 };
-    let mut best: Vec<Vec<Option<(i32, usize)>>> = Vec::with_capacity(q.len());
-    for (k, &c) in q.iter().enumerate() {
-        let mut row = vec![None; t.len()];
-        // the best (score + j, j) among the previous letter's places before i
-        let mut prev: Option<(i32, usize)> = None;
-        for i in 0..t.len() {
-            if t[i] == c {
-                row[i] = match k {
-                    0 => Some((bonus(i) - i as i32, 0)),
-                    _ => prev.map(|(s, j)| (s + bonus(i) - i as i32 + 1, j)),
-                };
+/// Quick Open's ranked files as rows: the file's name, its folder from `root` faint beside it, each opening at `line`.
+pub fn file_items(root: &Path, ranked: Vec<crate::files::quick_open::Ranked>, line: Option<u32>) -> Vec<Item> {
+    use crate::files::quick_open::{Group, name_of};
+    ranked
+        .into_iter()
+        .map(|r| {
+            let name = name_of(&r.path).to_string();
+            let folder = r.path[..r.path.len() - name.len()].trim_end_matches('/');
+            Item {
+                section: match r.group {
+                    Group::Open => Section::Open,
+                    Group::Recent => Section::Recent,
+                    Group::Files => Section::Files,
+                },
+                icon: crate::files::icons::material_icon(&name, false, false),
+                mark: None,
+                hint: (!folder.is_empty()).then(|| folder.to_string()),
+                chords: Vec::new(),
+                status: None,
+                waiting: 0,
+                run: Run::OpenFile { path: root.join(&r.path), line },
+                label: name,
+                key: r.path,
             }
-            if k > 0
-                && let Some((s, _)) = best[k - 1][i]
-                && prev.is_none_or(|(p, _)| s + i as i32 > p)
-            {
-                prev = Some((s + i as i32, i));
-            }
-        }
-        best.push(row);
-    }
-    let (mut i, score) = best[q.len() - 1].iter().enumerate().filter_map(|(i, c)| c.map(|(s, _)| (i, s))).max_by_key(|&(i, s)| (s, std::cmp::Reverse(i)))?;
-    let mut at = vec![i];
-    for k in (1..q.len()).rev() {
-        i = best[k][i]?.1;
-        at.push(i);
-    }
-    at.reverse();
-    Some((score.min(999), at))
+        })
+        .collect()
 }
 
-pub fn score(query: &str, text: &str) -> Option<i32> {
-    matched(query, text).map(|(score, _)| score)
+/// Why Quick Open has no files to list.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilesState {
+    Listing,
+    Listed { capped: bool },
+    Failed(String),
+    /// The workspace is on a herdr machine.
+    Remote,
+    /// The workspace has no folder yet.
+    NoFolder,
+}
+
+/// Quick Open's side of a panel: what it ranks and the ranking under way.
+struct Files {
+    root: PathBuf,
+    paths: Arc<Vec<Box<str>>>,
+    open: Arc<Vec<String>>,
+    recent: Arc<Vec<String>>,
+    state: FilesState,
+    /// Counts the rankings started; only the last one's answer is shown.
+    generation: u64,
+    /// Set to stop the ranking under way, when a newer one starts or the panel goes.
+    cancel: Arc<AtomicBool>,
+    ranking: Option<gpui::Task<()>>,
+    /// The listing under way, stopped when dropped: when the panel closes or a newer panel takes its place.
+    job: Option<Box<dyn std::any::Any>>,
+}
+
+impl Drop for Files {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Indices of the `items` matching `query`, by section, best match first in each; a section with a better best
@@ -705,9 +719,8 @@ pub fn rank(query: &str, items: &[Item]) -> Vec<usize> {
     sections.into_iter().flat_map(|section| hits.iter().filter(move |&&(i, _)| items[i].section == section).map(|&(i, _)| i)).collect()
 }
 
-/// `text` with the chars the query matched in bold accent.
-fn highlighted(text: &str, query: &str, theme: &Theme) -> StyledText {
-    let mut chars: Vec<usize> = matched(query, text).map(|(_, at)| at).unwrap_or_default();
+/// `text` with `chars` (those the query matched) in bold accent.
+fn highlighted(text: &str, mut chars: Vec<usize>, theme: &Theme) -> StyledText {
     // lowercasing that changes the char count (İ) would misplace the indices: leave such labels plain
     if text.to_lowercase().chars().count() != text.chars().count() {
         chars.clear();
@@ -766,6 +779,8 @@ pub struct Panel {
     /// The panel's own chord, shown by the search field.
     chord: Option<String>,
     scroll: ScrollHandle,
+    /// Quick Open's files; `None` in the other panels.
+    files: Option<Files>,
     _events: Subscription,
 }
 
@@ -775,7 +790,7 @@ impl Panel {
     pub fn new(kind: Kind, items: Vec<Item>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let items = match kind {
             Kind::Commands => with_recent(items, &crate::settings::SettingsGlobal::of(cx).settings.recent_commands),
-            Kind::Agents | Kind::Workspaces | Kind::Branches | Kind::Themes | Kind::Worktrees | Kind::Places | Kind::Shortcuts => items,
+            Kind::Agents | Kind::Workspaces | Kind::Branches | Kind::Themes | Kind::Worktrees | Kind::Places | Kind::Shortcuts | Kind::Files => items,
         };
         let theme = Theme::of(cx).clone();
         let placeholder = match kind {
@@ -787,6 +802,7 @@ impl Panel {
             Kind::Worktrees => "Open worktree",
             Kind::Places => "Switch session or machine",
             Kind::Shortcuts => "Search actions or keys",
+            Kind::Files => "Go to file",
         };
         let input = cx.new(|cx| {
             let mut input = InputState::new(window, cx).placeholder(placeholder);
@@ -806,7 +822,107 @@ impl Panel {
         let selected = if kind == Kind::Places { place_after_current(&items, &matches) } else { 0 };
         let scroll = ScrollHandle::new();
         scroll.scroll_to_item(selected);
-        Panel { kind, input, items, query: String::new(), matches, selected, chord, scroll, _events: events }
+        Panel { kind, input, items, query: String::new(), matches, selected, chord, scroll, files: None, _events: events }
+    }
+
+    /// Quick Open's root, the shown workspace's file tabs in it (relative, most recent first), the files opened from
+    /// here this run, and its listing when one is kept (shown at once, even while a fresher one is made).
+    pub fn files_root(&mut self, root: PathBuf, open: Vec<String>, recent: Vec<String>, listed: Option<(Arc<Vec<Box<str>>>, bool)>, cx: &mut Context<Self>) {
+        let (paths, state) = match listed {
+            Some((paths, capped)) => (paths, FilesState::Listed { capped }),
+            None => (Arc::default(), FilesState::Listing),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (open, recent) = (Arc::new(open), Arc::new(recent));
+        self.files = Some(Files { root, paths, open, recent, state, generation: 0, cancel, ranking: None, job: None });
+        self.refilter(cx);
+    }
+
+    /// Keeps `job` (the listing under way) until the panel closes or goes; dropping it stops the listing.
+    pub fn hold(&mut self, job: Box<dyn std::any::Any>) {
+        if let Some(files) = &mut self.files {
+            files.job = Some(job);
+        }
+    }
+
+    /// A listing's answer: its files ranked by what is typed; a failure keeps the files already shown.
+    pub fn files_listed(&mut self, listed: Result<(Arc<Vec<Box<str>>>, bool), String>, cx: &mut Context<Self>) {
+        let Some(files) = &mut self.files else { return };
+        files.job = None;
+        match listed {
+            Ok((paths, capped)) => {
+                files.paths = paths;
+                files.state = FilesState::Listed { capped };
+            }
+            Err(_) if !files.paths.is_empty() => {}
+            Err(e) => files.state = FilesState::Failed(e),
+        }
+        self.rank_files(true, cx);
+    }
+
+    /// Quick Open with nothing to list: on a machine, or before the workspace has a folder.
+    pub fn files_unavailable(&mut self, state: FilesState, cx: &mut Context<Self>) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let empty = Arc::new(Vec::new());
+        self.files = Some(Files { root: PathBuf::new(), paths: Arc::default(), open: empty.clone(), recent: empty, state, generation: 0, cancel, ranking: None, job: None });
+        self.items.clear();
+        self.matches.clear();
+        cx.notify();
+    }
+
+    /// Stops the listing under way: the panel is closing.
+    pub fn stop_listing(&mut self) {
+        if let Some(files) = &mut self.files {
+            files.job = None;
+        }
+    }
+
+    /// Ranks the files by the query on the background executor; the answer replaces the rows only if no newer
+    /// ranking started meanwhile. `keep` holds the highlighted row where it is when that file is still listed (a
+    /// fresher listing came in under the same query).
+    fn rank_files(&mut self, keep: bool, cx: &mut Context<Self>) {
+        let Some(files) = &mut self.files else { return };
+        if matches!(files.state, FilesState::Remote | FilesState::NoFolder) {
+            return;
+        }
+        files.cancel.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        files.cancel = cancel.clone();
+        files.generation += 1;
+        let generation = files.generation;
+        let query = crate::files::quick_open::parse_query(&self.query, cfg!(windows));
+        let (paths, open, recent) = (files.paths.clone(), files.open.clone(), files.recent.clone());
+        let job = cx.background_spawn(async move {
+            let ranked = crate::files::quick_open::rank(&query, &paths, &open, &recent, crate::files::quick_open::TOP_K, &cancel)?;
+            Some((query.line, ranked))
+        });
+        files.ranking = Some(cx.spawn(async move |panel, cx| {
+            let Some((line, ranked)) = job.await else { return };
+            let _ = panel.update(cx, |panel, cx| panel.show_files(generation, line, ranked, keep, cx));
+        }));
+    }
+
+    fn show_files(&mut self, generation: u64, line: Option<u32>, ranked: Vec<crate::files::quick_open::Ranked>, keep: bool, cx: &mut Context<Self>) {
+        let Some(files) = &self.files else { return };
+        if files.generation != generation {
+            return;
+        }
+        let was = keep.then(|| self.matches.get(self.selected).map(|&i| self.items[i].key.clone())).flatten();
+        self.items = file_items(&files.root, ranked, line);
+        self.matches = (0..self.items.len()).collect();
+        self.selected = was.and_then(|key| self.items.iter().position(|i| i.key == key)).unwrap_or(0);
+        if self.selected == 0 {
+            self.scroll.scroll_to_item(0);
+        }
+        cx.notify();
+    }
+
+    /// The chars of `label` the query matched, for its row's bold.
+    fn hits(&self, label: &str) -> Vec<usize> {
+        match self.kind {
+            Kind::Files => crate::files::quick_open::name_hits(&crate::files::quick_open::parse_query(&self.query, cfg!(windows)), label),
+            _ => matched(&self.query, label).map(|(_, at)| at).unwrap_or_default(),
+        }
     }
 
     /// Fills a panel opened before its list arrived (the worktrees herdr answers with), keeping what is typed.
@@ -817,6 +933,9 @@ impl Panel {
 
     fn refilter(&mut self, cx: &mut Context<Self>) {
         self.query = self.input.read(cx).value().to_string();
+        if self.kind == Kind::Files {
+            return self.rank_files(false, cx);
+        }
         self.matches = rank(&self.query, &self.items);
         self.selected = 0;
         self.scroll.scroll_to_item(0);
@@ -825,7 +944,7 @@ impl Panel {
 
     /// Headings show in the command panel; the agents panel is one section.
     fn headings(&self) -> bool {
-        self.kind == Kind::Commands
+        matches!(self.kind, Kind::Commands | Kind::Files)
     }
 
     /// Whether `row` starts its section, so a heading goes before it.
@@ -859,6 +978,7 @@ impl Panel {
         if self.kind == Kind::Commands && crate::settings::SettingsGlobal::of(cx).error.is_none() {
             crate::ui::settings::update(cx, |s| remember(&mut s.recent_commands, &item.key));
         }
+        self.stop_listing();
         cx.emit(PanelEvent::Run(item.run));
     }
 
@@ -921,7 +1041,7 @@ impl Render for Panel {
                             .text_color(icon_ink(item.icon, if selected { theme.text } else { theme.text_muted }))
                             .into_any_element(),
                     })
-                    .child(div().flex_1().min_w_0().truncate().child(highlighted(&item.label, &self.query, &theme)))
+                    .child(div().flex_1().min_w_0().truncate().child(highlighted(&item.label, self.hits(&item.label), &theme)))
                     .when(item.waiting > 0, |el| el.child(crate::shell::widgets::waiting_pill(&theme, item.waiting)))
                     .children(item.hint.clone().map(|hint| div().flex_none().max_w(px(160.)).truncate().text_size(px(12.)).text_color(theme.text_faint).child(hint)))
                     .children(item.status.map(|status| crate::shell::status_dot(status, &theme)))
@@ -957,8 +1077,16 @@ impl Render for Panel {
                 Kind::Places if self.items.is_empty() => ("No sessions", "herdr's sessions and saved machines show up here."),
                 Kind::Places => ("No results", "Try a session's name, a machine's, or remote."),
                 Kind::Shortcuts => ("No results", "Try an action, or keys such as ctrl shift t."),
+                Kind::Files => match self.files.as_ref().map(|f| (&f.state, f.paths.is_empty())) {
+                    Some((FilesState::Remote, _)) => ("Not supported", "Files on herdr machines aren't supported yet."),
+                    Some((FilesState::NoFolder, _)) | None => ("No folder", "Choose the workspace's folder in the Files tab."),
+                    Some((FilesState::Failed(e), _)) => ("Can't list files", e.as_str()),
+                    Some((FilesState::Listing, _)) => ("Listing files…", "Its files show up here."),
+                    Some((FilesState::Listed { .. }, true)) => ("No files", "This folder has no files to open."),
+                    Some((FilesState::Listed { .. }, false)) => ("No results", "Try a file's name, a folder/, or name:line."),
+                },
             };
-            div().py(px(24.)).flex().flex_col().items_center().gap(px(6.)).child(title).child(div().text_color(theme.text_muted).child(hint))
+            div().py(px(24.)).flex().flex_col().items_center().gap(px(6.)).child(title).child(div().text_color(theme.text_muted).child(SharedString::from(hint.to_string())))
         });
         div()
             .id("command-panel")
@@ -982,11 +1110,15 @@ impl Render for Panel {
                 cx.stop_propagation();
                 panel.step(1, cx);
             }))
-            .capture_action(cx.listener(|_, _: &Escape, _, cx| {
+            .capture_action(cx.listener(|panel, _: &Escape, _, cx| {
                 cx.stop_propagation();
+                panel.stop_listing();
                 cx.emit(PanelEvent::Dismiss);
             }))
-            .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(PanelEvent::Dismiss)))
+            .on_mouse_down_out(cx.listener(|panel, _, _, cx| {
+                panel.stop_listing();
+                cx.emit(PanelEvent::Dismiss)
+            }))
             .child(
                 div()
                     .min_h(px(44.))
@@ -1042,8 +1174,21 @@ impl Render for Panel {
                                 .on_click(cx.listener(|panel, _, _, cx| panel.edit_keys(panel.selected, cx))),
                         )
                     })
-                    .child(key_hint(&theme, &["esc"], "Close")),
+                    .child(key_hint(&theme, &["esc"], "Close"))
+                    .children(self.files_note().map(|note| div().flex_1().min_w_0().truncate().text_right().text_size(px(11.)).text_color(theme.text_faint).child(note))),
             )
+    }
+}
+
+impl Panel {
+    /// Quick Open's footer note: a listing under way over the files shown, or one cut at its cap.
+    fn files_note(&self) -> Option<&'static str> {
+        let files = self.files.as_ref()?;
+        match files.state {
+            FilesState::Listed { capped: true } => Some(crate::files::quick_open::CAPPED),
+            _ if files.job.is_some() && !files.paths.is_empty() => Some("Listing files…"),
+            _ => None,
+        }
     }
 }
 
