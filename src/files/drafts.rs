@@ -12,6 +12,9 @@
 //! since (`Restore::Stale`) or gone (`Restore::Deleted`) says so when it comes back. Drafts no file opens again are
 //! not listed anywhere; they and unreadable ones go after `MAX_AGE` (`sweep`).
 //!
+//! A draft is a plain copy of the text in the user's own folder, so a home backup takes it, unencrypted, even for a
+//! file from an encrypted or removable volume. Files that look like secrets (`secret`) get none.
+//!
 //! Two windows or two Shepherds editing one file write one draft: the last writer wins.
 use crate::files::save::{self, Baseline};
 use serde::{Deserialize, Serialize};
@@ -114,9 +117,22 @@ pub fn read(dir: &Path, path: &Path) -> Option<Draft> {
     (draft.header.path == path.to_string_lossy()).then_some(draft)
 }
 
-/// The folder, made 0700 when missing (and made so if it is not).
+/// Whether the file at `path` looks like it holds a secret (keys, certificates, an environment's settings, anything
+/// in `.ssh` or `.gnupg`): its unsaved text is never copied into a draft.
+pub fn secret(path: &Path) -> bool {
+    let in_secret_folder = path.components().any(|c| matches!(c.as_os_str().to_str(), Some(".ssh" | ".gnupg")));
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return in_secret_folder };
+    let lower = name.to_ascii_lowercase();
+    in_secret_folder
+        || lower == ".env"
+        || lower.starts_with(".env.")
+        || lower.starts_with("id_")
+        || [".pem", ".key", ".p12"].iter().any(|ext| lower.ends_with(ext))
+}
+
+/// The folder, made 0700 from the start when missing (and made so if it is not).
 fn ensure_dir(dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
+    os::make_private_dir(dir)?;
     os::private_dir(dir)
 }
 
@@ -243,10 +259,15 @@ impl Slot {
 
 #[cfg(unix)]
 mod os {
-    use std::fs::{self, OpenOptions, Permissions};
+    use std::fs::{self, DirBuilder, OpenOptions, Permissions};
     use std::io;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     use std::path::Path;
+
+    /// Made 0700 (its missing parents too), never open to others for a moment.
+    pub(super) fn make_private_dir(dir: &Path) -> io::Result<()> {
+        DirBuilder::new().recursive(true).mode(0o700).create(dir)
+    }
 
     pub(super) fn private_dir(dir: &Path) -> io::Result<()> {
         if fs::metadata(dir)?.permissions().mode() & 0o777 != 0o700 {
@@ -266,6 +287,10 @@ mod os {
     use std::fs::OpenOptions;
     use std::io;
     use std::path::Path;
+
+    pub(super) fn make_private_dir(dir: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(dir)
+    }
 
     pub(super) fn private_dir(_: &Path) -> io::Result<()> {
         Ok(())
@@ -388,6 +413,27 @@ mod tests {
         assert_eq!(sweep(&dir, now + TEMP_AGE + Duration::from_secs(1), MAX_AGE), 1);
         assert!(!dir.join(".x.draft.1-2.tmp").exists());
         assert_eq!(sweep(&home.path().join("none"), now, MAX_AGE), 0, "no folder yet");
+    }
+
+    #[test]
+    fn secret_looking_files_get_no_draft() {
+        for path in ["/w/.env", "/w/.env.local", "/w/.ENV.production", "/w/cert.pem", "/w/server.key", "/w/store.p12", "/h/.ssh/config", "/h/.ssh/known_hosts", "/h/.gnupg/gpg.conf", "/h/id_ed25519", "/h/id_rsa.pub"] {
+            assert!(secret(Path::new(path)), "{path}");
+        }
+        for path in ["/w/a.rs", "/w/env.rs", "/w/.envrc", "/w/keys.rs", "/w/README.md", "/w/ssh/config", "/w/pem.txt", "/w/valid_id.rs"] {
+            assert!(!secret(Path::new(path)), "{path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_folder_is_private_from_its_making() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("config/drafts");
+        os::make_private_dir(&dir).unwrap();
+        // checked before anything could have changed it afterwards
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
     }
 
     #[test]

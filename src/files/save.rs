@@ -221,6 +221,9 @@ pub enum SaveMode {
     InPlace,
     /// As `InPlace`, whatever is on disk now; recreates a deleted file.
     OverwriteInPlace,
+    /// Makes a deleted file again, and only that: a file there now (made again meanwhile) is a conflict, never
+    /// written over.
+    Recreate,
 }
 
 impl SaveMode {
@@ -540,6 +543,8 @@ fn save_with(root: &Path, path: &Path, text: &str, b: &Baseline, mode: SaveMode,
     let target = contained(root, path)?;
     let bytes = encode(text, b);
     let meta = match fs::metadata(&target) {
+        // made again meanwhile: not the deleted file's to write over
+        Ok(_) if mode == SaveMode::Recreate => return Err(SaveError::Conflict),
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return if mode.checks() { Err(SaveError::Deleted) } else { recreate(&target, bytes, b, hooks) };
@@ -554,7 +559,7 @@ fn save_with(root: &Path, path: &Path, text: &str, b: &Baseline, mode: SaveMode,
         return Err(SaveError::ReadOnly);
     }
     match mode {
-        SaveMode::Safe | SaveMode::Overwrite => {
+        SaveMode::Safe | SaveMode::Overwrite | SaveMode::Recreate => {
             let links = os::links(&meta);
             if links > 1 {
                 return Err(SaveError::HardLinked(links));
@@ -1336,6 +1341,21 @@ mod tests {
             assert!(matches!(save_with(dir.path(), &gone, "x", &b, SaveMode::Overwrite, &mut hooks), Err(SaveError::Io(_))));
             assert!(!gone.exists());
         }
+    }
+
+    #[test]
+    fn recreating_makes_a_deleted_file_and_never_writes_over_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "one\n").unwrap();
+        let b = Baseline::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        save(dir.path(), &path, "mine\n", &b, SaveMode::Recreate).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "mine\n");
+        // made again by someone else meanwhile: theirs stays
+        fs::write(&path, "theirs\n").unwrap();
+        assert_eq!(save(dir.path(), &path, "mine 2\n", &b, SaveMode::Recreate), Err(SaveError::Conflict));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "theirs\n");
     }
 
     #[test]

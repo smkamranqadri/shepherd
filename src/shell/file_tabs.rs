@@ -877,6 +877,11 @@ pub(super) enum Exit {
     Close,
 }
 
+/// A quit's Don't Save was answered in one window: the others' unsaved changes are kept as drafts, not saved.
+struct QuitLetGo;
+
+impl gpui::Global for QuitLetGo {}
+
 /// What runs once Shepherd quits, however it quits (the updater's relaunch): kept until a quit goes through.
 #[derive(Default)]
 pub struct AfterQuit(Vec<Box<dyn FnOnce()>>);
@@ -958,10 +963,14 @@ impl Shell {
             let go = match answer {
                 Closing::Keep => false,
                 Closing::Discard => {
-                    // the unsaved changes let go: their drafts too, so the next run does not bring them back
+                    // the unsaved changes let go: their drafts too, so the next run does not bring them back; the
+                    // other windows' (not asked about) are kept as drafts, not saved
                     let _ = this.update(cx, |s, cx| {
                         for e in s.editors(false, cx) {
                             e.update(cx, |e, _| e.discard_draft());
+                        }
+                        if exit == Exit::Quit {
+                            cx.set_global(QuitLetGo);
                         }
                     });
                     // what is being written finishes first, whatever was answered
@@ -1045,7 +1054,9 @@ impl Shell {
             // Don't Save was the answer; what was being written was waited for then
             return Vec::new();
         }
-        self.editors(true, cx).iter().filter_map(|e| e.read(cx).flush(cx)).collect()
+        // another window's Don't Save let the quit go: this one's changes are not saved unasked, only kept as drafts
+        let save = !cx.has_global::<QuitLetGo>();
+        self.editors(true, cx).iter().filter_map(|e| e.read(cx).flush(save, cx)).collect()
     }
 
     /// The view of a tab that went with its workspace, unsaved, for the file a tab now opens: that tab takes it over
