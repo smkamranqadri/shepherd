@@ -381,6 +381,14 @@ impl FileEditor {
         &self.path
     }
 
+    /// The editor's text state, while the file is open editable: what a find bar searches and selects in.
+    pub(crate) fn editor_state(&self) -> Option<&Entity<EditorState>> {
+        match &self.body {
+            Body::Edit(e) => Some(&e.state),
+            _ => None,
+        }
+    }
+
     /// Markdown's preview is on screen (in the editor, or the viewer's).
     pub fn shows_markdown(&self, cx: &App) -> bool {
         match &self.body {
@@ -446,8 +454,7 @@ impl FileEditor {
 
     /// The cursor and the scroll, to put back if the view is made again.
     pub fn place(&self, cx: &App) -> Option<Place> {
-        let Body::Edit(e) = &self.body else { return None };
-        let state = e.state.read(cx);
+        let state = self.editor_state()?.read(cx);
         let at = state.cursor_position();
         Some(Place { line: at.line, column: at.character, scroll_y: f32::from(state.scroll_offset().y) })
     }
@@ -1240,6 +1247,31 @@ impl FileEditor {
             .into_any_element()
     }
 
+    /// The strips under the header, in order: a save's trouble, the disk's changes.
+    fn banners(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        self.banner(theme, cx).into_iter().collect()
+    }
+
+    /// What sits between the banners and the text (a find bar): none yet.
+    fn overlays(&self, _theme: &Theme, _cx: &mut Context<Self>) -> Vec<AnyElement> {
+        Vec::new()
+    }
+
+    /// The text: markdown's preview, or the editor.
+    fn body_element(&self, e: &Edit, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if self.preview_shown() {
+            // a press in the preview gives it the keyboard (its selection is ui::markdown's)
+            let preview = self.preview_body(e, theme, cx);
+            div()
+                .size_full()
+                .on_mouse_down(MouseButton::Left, cx.listener(|e, _, window, cx| window.focus(&e.focus, cx)))
+                .child(preview)
+                .into_any_element()
+        } else {
+            self.code(e, theme)
+        }
+    }
+
     fn preview_body(&self, e: &Edit, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let blocks = e.blocks.as_deref().unwrap_or_default();
         let links = match &e.real_root {
@@ -1300,20 +1332,15 @@ impl Render for FileEditor {
                 root.children(note).child(div().flex_1().min_h_0().child(viewer.clone())).into_any_element()
             }
             Body::Edit(e) => {
-                let body = if self.preview_shown() {
-                    // a press in the preview gives it the keyboard (its selection is ui::markdown's)
-                    let preview = self.preview_body(e, theme, cx);
-                    div()
-                        .size_full()
-                        .on_mouse_down(MouseButton::Left, cx.listener(|e, _, window, cx| window.focus(&e.focus, cx)))
-                        .child(preview)
-                        .into_any_element()
-                } else {
-                    self.code(e, theme)
-                };
                 let header = self.header(theme, cx);
-                let banner = self.banner(theme, cx);
-                root.child(header).children(banner).child(div().flex_1().min_h_0().overflow_hidden().child(body)).into_any_element()
+                let banners = self.banners(theme, cx);
+                let overlays = self.overlays(theme, cx);
+                let body = self.body_element(e, theme, cx);
+                root.child(header)
+                    .children(banners)
+                    .children(overlays)
+                    .child(div().flex_1().min_h_0().overflow_hidden().child(body))
+                    .into_any_element()
             }
         }
     }
