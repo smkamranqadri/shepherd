@@ -65,12 +65,19 @@ pub fn score(query: &str, text: &str) -> Option<i32> {
     matched(query, text).map(|(score, _)| score)
 }
 
-/// Reused rows of `score_ascii`'s table.
+/// Reused buffers of `score_ascii`.
 #[derive(Default)]
-pub struct Scratch(Vec<i32>, Vec<i32>);
+pub struct Scratch {
+    lower: Vec<u8>,
+    last: Vec<i32>,
+    row: Vec<i32>,
+    /// Each letter's first and last place in the text that a whole match can use.
+    window: Vec<(usize, usize)>,
+}
 
 /// `score` of a lowercase ASCII `query` without whitespace in an ASCII `text`, the same number without allocating
-/// past `scratch`: Quick Open scores 200,000 paths a keystroke.
+/// past `scratch`: Quick Open scores 200,000 paths a keystroke. The table only runs over the places each letter can
+/// take in a whole match (after the earliest the letters before it allow, before the latest the ones after it do).
 pub fn score_ascii(query: &[u8], text: &[u8], scratch: &mut Scratch) -> Option<i32> {
     const NONE: i32 = i32::MIN;
     let (m, n) = (query.len(), text.len());
@@ -80,11 +87,14 @@ pub fn score_ascii(query: &[u8], text: &[u8], scratch: &mut Scratch) -> Option<i
     if m > n {
         return None;
     }
-    let lower = |i: usize| text[i].to_ascii_lowercase();
-    let word_start = |i: usize| i == 0 || !text[i - 1].is_ascii_alphanumeric();
+    let Scratch { lower, last, row, window } = scratch;
+    lower.clear();
+    lower.extend(text.iter().map(u8::to_ascii_lowercase));
+    let t = &lower[..];
+    let word_start = |i: usize| i == 0 || !t[i - 1].is_ascii_alphanumeric();
     let mut anywhere = false;
     for i in 0..=n - m {
-        if (0..m).all(|j| lower(i + j) == query[j]) {
+        if t[i] == query[0] && &t[i..i + m] == query {
             if i == 0 {
                 return Some(3000);
             }
@@ -97,27 +107,48 @@ pub fn score_ascii(query: &[u8], text: &[u8], scratch: &mut Scratch) -> Option<i
     if anywhere {
         return Some(1000);
     }
-    // `matched`'s table a row at a time: `last[i]` scores the letters so far with the latest at text[i]
+    // the windows: greedy from the front for each letter's first place, from the back for its last
+    window.clear();
+    let mut at = 0;
+    for &c in query {
+        let found = at + t[at..].iter().position(|&b| b == c)?;
+        window.push((found, 0));
+        at = found + 1;
+    }
+    let mut end = n;
+    for (k, &c) in query.iter().enumerate().rev() {
+        let found = t[..end].iter().rposition(|&b| b == c)?;
+        window[k].1 = found;
+        end = found;
+    }
+    // `matched`'s table a row at a time: `last[i]` scores the letters so far with the latest at t[i]
     let bonus = |i: usize| if word_start(i) { 10 } else { 0 };
-    let Scratch(last, row) = scratch;
-    last.clear();
-    last.extend((0..n).map(|i| if lower(i) == query[0] { bonus(i) - i as i32 } else { NONE }));
-    for &c in &query[1..] {
-        row.clear();
+    // only ever read inside the windows each row writes first, so never cleared
+    if last.len() < n {
+        last.resize(n, NONE);
         row.resize(n, NONE);
+    }
+    let (lo, hi) = window[0];
+    for i in lo..=hi {
+        last[i] = if t[i] == query[0] { bonus(i) - i as i32 } else { NONE };
+    }
+    for k in 1..m {
+        let ((plo, phi), (lo, hi), c) = (window[k - 1], window[k], query[k]);
         // the best (score + j) among the previous letter's places before i
-        let mut prev = NONE;
-        for i in 0..n {
-            if prev != NONE && lower(i) == c {
-                row[i] = prev + bonus(i) - i as i32 + 1;
+        let (mut prev, mut j) = (NONE, plo);
+        for i in lo..=hi {
+            while j < i && j <= phi {
+                if last[j] != NONE && (prev == NONE || last[j] + j as i32 > prev) {
+                    prev = last[j] + j as i32;
+                }
+                j += 1;
             }
-            if last[i] != NONE && (prev == NONE || last[i] + i as i32 > prev) {
-                prev = last[i] + i as i32;
-            }
+            row[i] = if t[i] == c && prev != NONE { prev + bonus(i) - i as i32 + 1 } else { NONE };
         }
         std::mem::swap(last, row);
     }
-    last.iter().copied().filter(|&s| s != NONE).max().map(|s| s.min(999))
+    let (lo, hi) = window[m - 1];
+    last[lo..=hi].iter().copied().filter(|&s| s != NONE).max().map(|s| s.min(999))
 }
 
 #[cfg(test)]
@@ -126,17 +157,26 @@ mod tests {
 
     #[test]
     fn the_ascii_score_is_score() {
-        let texts = ["", "a", "src/main.rs", "Src/Widgets/FooBar.ts", "foo_bar.py", "a_b/c-d/x.y.z", "README.md", "aaaa", "abab_ab", "x/yy/zzz/q.rs", "Split right"];
-        let queries = ["a", "ab", "aa", "main", "mr", "src/", "fb", "foobar", "readme", "xyz", "/", "_", "-", "q", "zzzz", "srm", "abab", "spr", "rs"];
+        // a seeded xorshift: the same 20,000 texts and queries every run, from letters, cases, digits and the
+        // separators that make word starts
+        let mut seed: u64 = 0x5eed_1234_abcd_ef01;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        const ALPHABET: &[u8] = b"abcABC_xyz/-.09 Q";
         let mut scratch = Scratch::default();
-        let mut found = 0;
-        for text in texts {
-            for query in queries {
-                let want = score(query, text);
-                assert_eq!(score_ascii(query.as_bytes(), text.as_bytes(), &mut scratch), want, "{query:?} in {text:?}");
-                found += usize::from(want.is_some_and(|s| s < 1000));
-            }
+        let (mut scattered, mut none) = (0, 0);
+        for _ in 0..20_000 {
+            let text: String = (0..next(40)).map(|_| ALPHABET[next(ALPHABET.len())] as char).collect();
+            let query: String = (0..1 + next(5)).map(|_| ALPHABET[next(ALPHABET.len())].to_ascii_lowercase() as char).filter(|c| *c != ' ').collect();
+            let want = score(&query, &text);
+            assert_eq!(score_ascii(query.as_bytes(), text.as_bytes(), &mut scratch), want, "{query:?} in {text:?}");
+            scattered += usize::from(want.is_some_and(|s| s < 1000));
+            none += usize::from(want.is_none());
         }
-        assert!(found > 10, "scattered letters were scored too: {found}");
+        assert!(scattered > 1000 && none > 1000, "both kinds came up: {scattered} scattered, {none} not found");
     }
 }

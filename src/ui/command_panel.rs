@@ -685,11 +685,23 @@ struct Files {
     state: FilesState,
     /// Counts the rankings started; only the last one's answer is shown.
     generation: u64,
+    /// The ranking whose rows are shown.
+    shown: u64,
+    /// Enter came while a ranking was under way: it runs the row that ranking puts first.
+    enter: bool,
     /// Set to stop the ranking under way, when a newer one starts or the panel goes.
     cancel: Arc<AtomicBool>,
     ranking: Option<gpui::Task<()>>,
-    /// The listing under way, stopped when dropped: when the panel closes or a newer panel takes its place.
-    job: Option<Box<dyn std::any::Any>>,
+    /// A listing is under way.
+    listing: bool,
+}
+
+impl Files {
+    fn new(root: PathBuf, state: FilesState) -> Self {
+        let empty = Arc::new(Vec::new());
+        let cancel = Arc::new(AtomicBool::new(false));
+        Files { root, paths: Arc::default(), open: empty.clone(), recent: empty, state, generation: 0, shown: 0, enter: false, cancel, ranking: None, listing: false }
+    }
 }
 
 impl Drop for Files {
@@ -813,6 +825,7 @@ impl Panel {
         let events = cx.subscribe_in(&input, window, |panel, _, event: &InputEvent, _, cx| match event {
             InputEvent::Change => panel.refilter(cx),
             InputEvent::PressEnter { secondary: true, .. } if panel.kind == Kind::Shortcuts => panel.edit_keys(panel.selected, cx),
+            InputEvent::PressEnter { .. } if panel.kind == Kind::Files => panel.enter_files(cx),
             InputEvent::PressEnter { .. } => panel.run(panel.selected, cx),
             _ => {}
         });
@@ -825,30 +838,28 @@ impl Panel {
         Panel { kind, input, items, query: String::new(), matches, selected, chord, scroll, files: None, _events: events }
     }
 
-    /// Quick Open's root, the shown workspace's file tabs in it (relative, most recent first), the files opened from
-    /// here this run, and its listing when one is kept (shown at once, even while a fresher one is made).
-    pub fn files_root(&mut self, root: PathBuf, open: Vec<String>, recent: Vec<String>, listed: Option<(Arc<Vec<Box<str>>>, bool)>, cx: &mut Context<Self>) {
-        let (paths, state) = match listed {
-            Some((paths, capped)) => (paths, FilesState::Listed { capped }),
-            None => (Arc::default(), FilesState::Listing),
-        };
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (open, recent) = (Arc::new(open), Arc::new(recent));
-        self.files = Some(Files { root, paths, open, recent, state, generation: 0, cancel, ranking: None, job: None });
+    /// Quick Open over `root`, its files on their way (`files_context`, `files_listed`).
+    pub fn files_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        self.files = Some(Files::new(root, FilesState::Listing));
         self.refilter(cx);
     }
 
-    /// Keeps `job` (the listing under way) until the panel closes or goes; dropping it stops the listing.
-    pub fn hold(&mut self, job: Box<dyn std::any::Any>) {
-        if let Some(files) = &mut self.files {
-            files.job = Some(job);
+    /// The shown workspace's file tabs in the root (relative, most recent first), the files opened from here this run,
+    /// and the root's listing when one is kept (shown at once, even while `listing` makes a fresher one).
+    pub fn files_context(&mut self, open: Vec<String>, recent: Vec<String>, listed: Option<(Arc<Vec<Box<str>>>, bool)>, listing: bool, cx: &mut Context<Self>) {
+        let Some(files) = &mut self.files else { return };
+        (files.open, files.recent, files.listing) = (Arc::new(open), Arc::new(recent), listing);
+        if let Some((paths, capped)) = listed {
+            files.paths = paths;
+            files.state = FilesState::Listed { capped };
         }
+        self.rank_files(true, cx);
     }
 
     /// A listing's answer: its files ranked by what is typed; a failure keeps the files already shown.
     pub fn files_listed(&mut self, listed: Result<(Arc<Vec<Box<str>>>, bool), String>, cx: &mut Context<Self>) {
         let Some(files) = &mut self.files else { return };
-        files.job = None;
+        files.listing = false;
         match listed {
             Ok((paths, capped)) => {
                 files.paths = paths;
@@ -862,18 +873,17 @@ impl Panel {
 
     /// Quick Open with nothing to list: on a machine, or before the workspace has a folder.
     pub fn files_unavailable(&mut self, state: FilesState, cx: &mut Context<Self>) {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let empty = Arc::new(Vec::new());
-        self.files = Some(Files { root: PathBuf::new(), paths: Arc::default(), open: empty.clone(), recent: empty, state, generation: 0, cancel, ranking: None, job: None });
+        self.files = Some(Files::new(PathBuf::new(), state));
         self.items.clear();
         self.matches.clear();
         cx.notify();
     }
 
-    /// Stops the listing under way: the panel is closing.
-    pub fn stop_listing(&mut self) {
-        if let Some(files) = &mut self.files {
-            files.job = None;
+    /// Enter in Quick Open: the highlighted row, once the rows are the ones the query typed last ranks.
+    fn enter_files(&mut self, cx: &mut Context<Self>) {
+        match &mut self.files {
+            Some(files) if !crate::files::quick_open::enter_now(files.generation, files.shown) => files.enter = true,
+            _ => self.run(self.selected, cx),
         }
     }
 
@@ -903,10 +913,12 @@ impl Panel {
     }
 
     fn show_files(&mut self, generation: u64, line: Option<u32>, ranked: Vec<crate::files::quick_open::Ranked>, keep: bool, cx: &mut Context<Self>) {
-        let Some(files) = &self.files else { return };
+        let Some(files) = &mut self.files else { return };
         if files.generation != generation {
             return;
         }
+        files.shown = generation;
+        let enter = std::mem::take(&mut files.enter);
         let was = keep.then(|| self.matches.get(self.selected).map(|&i| self.items[i].key.clone())).flatten();
         self.items = file_items(&files.root, ranked, line);
         self.matches = (0..self.items.len()).collect();
@@ -915,6 +927,9 @@ impl Panel {
             self.scroll.scroll_to_item(0);
         }
         cx.notify();
+        if enter {
+            self.run(self.selected, cx);
+        }
     }
 
     /// The chars of `label` the query matched, for its row's bold.
@@ -978,7 +993,6 @@ impl Panel {
         if self.kind == Kind::Commands && crate::settings::SettingsGlobal::of(cx).error.is_none() {
             crate::ui::settings::update(cx, |s| remember(&mut s.recent_commands, &item.key));
         }
-        self.stop_listing();
         cx.emit(PanelEvent::Run(item.run));
     }
 
@@ -1110,15 +1124,11 @@ impl Render for Panel {
                 cx.stop_propagation();
                 panel.step(1, cx);
             }))
-            .capture_action(cx.listener(|panel, _: &Escape, _, cx| {
+            .capture_action(cx.listener(|_, _: &Escape, _, cx| {
                 cx.stop_propagation();
-                panel.stop_listing();
                 cx.emit(PanelEvent::Dismiss);
             }))
-            .on_mouse_down_out(cx.listener(|panel, _, _, cx| {
-                panel.stop_listing();
-                cx.emit(PanelEvent::Dismiss)
-            }))
+            .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(PanelEvent::Dismiss)))
             .child(
                 div()
                     .min_h(px(44.))
@@ -1186,7 +1196,7 @@ impl Panel {
         let files = self.files.as_ref()?;
         match files.state {
             FilesState::Listed { capped: true } => Some(crate::files::quick_open::CAPPED),
-            _ if files.job.is_some() && !files.paths.is_empty() => Some("Listing files…"),
+            _ if files.listing && !files.paths.is_empty() => Some("Listing files…"),
             _ => None,
         }
     }

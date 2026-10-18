@@ -95,12 +95,33 @@ fn first_line(text: &str) -> Option<String> {
     text.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string)
 }
 
-/// Lists `root`'s files with `rg` (the program to run), else git; runs on the runtime.
+/// Lists `root`'s files with `rg` (the program to run), else git; runs on the runtime. git's list keeps a tracked
+/// file deleted since and a submodule's folder, which cannot be opened: only the files that are there are kept.
 pub async fn list(host: &Host, root: &Path, rg: &str) -> Result<Listing, String> {
-    match from_rg(runner::run(host, rg_cmd(root, rg), LIMITS).await) {
-        Some(listed) => listed,
-        None => from_git(runner::run(host, ls_files_cmd(root), LIMITS).await),
+    if let Some(listed) = from_rg(runner::run(host, rg_cmd(root, rg), LIMITS).await) {
+        return listed;
     }
+    let mut listed = from_git(runner::run(host, ls_files_cmd(root), LIMITS).await)?;
+    let root = root.to_path_buf();
+    listed.paths = tokio::task::spawn_blocking(move || existing(&root, listed.paths)).await.map_err(|e| e.to_string())?;
+    Ok(listed)
+}
+
+/// The `paths` (relative to `root`, `/` between folders) that are files there now; blocking.
+pub fn existing<P: AsRef<str>>(root: &Path, paths: Vec<P>) -> Vec<P> {
+    paths.into_iter().filter(|p| root.join(p.as_ref()).is_file()).collect()
+}
+
+/// `root` with its symlinks resolved, as written when it cannot be: the one key of a folder however it is spelled,
+/// and the prefix of the file tabs' (real) paths in it. Blocking.
+pub fn real_root(root: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
+/// Whether Enter runs the highlighted row now: only once the rows shown are the last ranking's (`shown`, of
+/// `started` begun); else it waits for that one, whose rows and `:line` are what was typed.
+pub fn enter_now(started: u64, shown: u64) -> bool {
+    shown == started
 }
 
 /// What is typed, read: its words (lowercase; on Windows `\` as `/`), and the line and column after a trailing
@@ -223,6 +244,17 @@ fn key(score: i32, path: &str) -> Key<'_> {
 /// typed: the open tabs, then the `recent` files not open. Otherwise the open tabs that match, best first, then the
 /// best `k` of `paths` that are not open. `None` once `cancel` is set (a newer keystroke's ranking took over).
 pub fn rank(query: &Query, paths: &[Box<str>], open: &[String], recent: &[String], k: usize, cancel: &AtomicBool) -> Option<Vec<Ranked>> {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = cores.min(MAX_THREADS).min(paths.len().div_ceil(PER_THREAD)).max(1);
+    rank_on(query, paths, open, recent, k, cancel, threads)
+}
+
+/// A list this long is shared out among threads, at most `MAX_THREADS`.
+const PER_THREAD: usize = 25_000;
+const MAX_THREADS: usize = 8;
+
+/// `rank`, the paths split among `threads`: each keeps its best `k`, and the best `k` of those are the answer.
+fn rank_on(query: &Query, paths: &[Box<str>], open: &[String], recent: &[String], k: usize, cancel: &AtomicBool, threads: usize) -> Option<Vec<Ranked>> {
     let opened: HashSet<&str> = open.iter().map(String::as_str).collect();
     let ranked = |path: &str, group| Ranked { path: path.to_string(), group };
     if query.tokens.is_empty() {
@@ -232,13 +264,34 @@ pub fn rank(query: &Query, paths: &[Box<str>], open: &[String], recent: &[String
     let mut scratch = Scratch::default();
     let mut open_hits: Vec<(Key, &str)> = open.iter().filter_map(|p| Some((key(score_path(&query.tokens, p, &mut scratch)?, p), p.as_str()))).collect();
     open_hits.sort_by(|a, b| b.0.cmp(&a.0));
+    let files = match threads {
+        0 | 1 => best_k(&query.tokens, paths, &opened, k, cancel)?,
+        _ => {
+            let chunk = paths.len().div_ceil(threads).max(1);
+            let parts: Vec<Option<Vec<Key>>> = std::thread::scope(|scope| {
+                let jobs: Vec<_> = paths.chunks(chunk).map(|part| scope.spawn(|| best_k(&query.tokens, part, &opened, k, cancel))).collect();
+                jobs.into_iter().map(|job| job.join().ok().flatten()).collect()
+            });
+            let mut all: Vec<Key> = parts.into_iter().collect::<Option<Vec<_>>>()?.into_iter().flatten().collect();
+            all.sort_by(|a, b| b.cmp(a));
+            all.truncate(k);
+            all
+        }
+    };
+    let files = files.into_iter().map(|(_, _, Reverse(path))| ranked(path, Group::Files));
+    Some(open_hits.into_iter().map(|(_, p)| ranked(p, Group::Open)).chain(files).collect())
+}
+
+/// The best `k` of `paths` that are not `opened`, best first; `None` once `cancel` is set.
+fn best_k<'a>(tokens: &[String], paths: &'a [Box<str>], opened: &HashSet<&str>, k: usize, cancel: &AtomicBool) -> Option<Vec<Key<'a>>> {
+    let mut scratch = Scratch::default();
     // the worst kept on top, so a better one replaces it
     let mut best: BinaryHeap<Reverse<Key>> = BinaryHeap::with_capacity(k + 1);
     for (i, path) in paths.iter().enumerate() {
         if i % CANCEL_EVERY == 0 && cancel.load(Ordering::Relaxed) {
             return None;
         }
-        let Some(score) = score_path(&query.tokens, path, &mut scratch) else { continue };
+        let Some(score) = score_path(tokens, path, &mut scratch) else { continue };
         let candidate = key(score, path);
         if best.len() == k && best.peek().is_some_and(|Reverse(worst)| candidate <= *worst) {
             continue;
@@ -251,8 +304,7 @@ pub fn rank(query: &Query, paths: &[Box<str>], open: &[String], recent: &[String
             best.pop();
         }
     }
-    let files = best.into_sorted_vec().into_iter().map(|Reverse((_, _, Reverse(path)))| ranked(path, Group::Files));
-    Some(open_hits.into_iter().map(|(_, p)| ranked(p, Group::Open)).chain(files).collect())
+    Some(best.into_sorted_vec().into_iter().map(|Reverse(key)| key).collect())
 }
 
 #[cfg(test)]
@@ -376,16 +428,20 @@ mod tests {
         let mut all: Vec<(Key, &str)> = paths.iter().filter_map(|p| Some((key(score_path(&query.tokens, p, &mut scratch)?, p), p.as_str()))).collect();
         all.sort_by(|a, b| b.0.cmp(&a.0));
         let want: Vec<&str> = all.iter().take(TOP_K).map(|(_, p)| *p).collect();
-        let got = rank(&query, &boxed, &[], &[], TOP_K, &AtomicBool::new(false)).unwrap();
-        assert_eq!(got.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(), want);
-        assert_eq!(got.len(), TOP_K);
+        for threads in [1, 3, 8] {
+            let got = rank_on(&query, &boxed, &[], &[], TOP_K, &AtomicBool::new(false), threads).unwrap();
+            assert_eq!(got.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(), want, "on {threads} threads");
+            assert_eq!(got.len(), TOP_K);
+        }
     }
 
     #[test]
     fn a_cancelled_ranking_stops() {
-        let paths = boxed(&["src/main.rs"]);
-        assert_eq!(rank(&q("main"), &paths, &[], &[], TOP_K, &AtomicBool::new(true)), None);
-        assert!(rank(&q("main"), &paths, &[], &[], TOP_K, &AtomicBool::new(false)).is_some());
+        let paths = boxed(&["src/main.rs", "src/menu.rs", "lib/mod.rs"]);
+        for threads in [1, 3] {
+            assert_eq!(rank_on(&q("m"), &paths, &[], &[], TOP_K, &AtomicBool::new(true), threads), None, "on {threads} threads");
+            assert!(rank_on(&q("m"), &paths, &[], &[], TOP_K, &AtomicBool::new(false), threads).is_some());
+        }
     }
 
     #[test]
@@ -411,6 +467,35 @@ mod tests {
         assert!(!parse(&exact, b'\n', false, false).capped, "exactly the cap is all of them");
     }
 
+    #[test]
+    fn enter_waits_for_the_last_ranking() {
+        assert!(enter_now(0, 0), "nothing ranked: the rows are as they are");
+        assert!(enter_now(3, 3));
+        assert!(!enter_now(4, 3), "the last keystroke's ranking is still under way");
+    }
+
+    #[test]
+    fn only_files_still_there_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/folder")).unwrap();
+        std::fs::write(dir.path().join("src/kept.rs"), "x").unwrap();
+        let recent = vec!["src/kept.rs".to_string(), "src/gone.rs".to_string(), "src/folder".to_string()];
+        assert_eq!(existing(dir.path(), recent), ["src/kept.rs"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_folder_has_one_key_however_it_is_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+        let key = real_root(&real);
+        assert_eq!(real_root(&dir.path().join("link")), key);
+        assert_eq!(real_root(&dir.path().join("real/./")), key);
+        assert_eq!(real_root(&dir.path().join("missing")), dir.path().join("missing"), "as written when it can't be resolved");
+    }
+
     fn git(dir: &Path, args: &[&str]) {
         let mut cmd = std::process::Command::new("git");
         for (key, _) in std::env::vars_os() {
@@ -428,38 +513,61 @@ mod tests {
         let root = dir.path();
         git(root, &["init", "-q"]);
         std::fs::create_dir_all(root.join("src")).unwrap();
-        for f in ["src/one.rs", "two words.txt", "skipped.log", ".gitignore"] {
+        for f in ["src/one.rs", "two words.txt", "skipped.log", ".gitignore", "gone.rs"] {
             std::fs::write(root.join(f), "x").unwrap();
         }
         std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
-        git(root, &["add", "src/one.rs"]);
+        git(root, &["add", "src/one.rs", "gone.rs"]);
+        // a tracked file deleted since, and a submodule's entry (a folder)
+        std::fs::remove_file(root.join("gone.rs")).unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        git(&sub, &["init", "-q"]);
+        std::fs::write(sub.join("inner.rs"), "x").unwrap();
+        git(&sub, &["add", "inner.rs"]);
+        git(&sub, &["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "first"]);
+        git(root, &["add", "sub"]);
         let missing = "shepherd-test-no-such-rg";
         let mut listed = list(&Host::Local, root, missing).await.unwrap().paths;
         listed.sort();
-        assert_eq!(listed, boxed(&[".gitignore", "src/one.rs", "two words.txt"]), "tracked and untracked, the ignored left out");
+        assert_eq!(listed, boxed(&[".gitignore", "src/one.rs", "two words.txt"]), "tracked and untracked; the ignored, the deleted and the submodule left out");
         // not a repository either
         let bare = tempfile::tempdir().unwrap();
         assert_eq!(list(&Host::Local, bare.path(), missing).await, Err(NO_TOOL.to_string()));
         assert_eq!(list(&Host::Ssh { target: "box".into() }, root, missing).await, Err(RunError::RemoteUnsupported.to_string()));
     }
 
-    /// 200,000 fictional paths ranked on a few keystrokes; prints the time each took (run with `--ignored
-    /// --nocapture`, best in release).
+    /// 200,000 fictional paths ranked on a few keystrokes, and on scattered letters over long paths (the scored
+    /// table runs for every path), each under a ceiling: `cargo test --release -- --ignored ranking_200k --nocapture`
+    /// prints the times. A debug build is let through a ceiling twenty times as high.
     #[test]
     #[ignore]
     fn ranking_200k_paths_takes() {
+        let ceiling_ms = if cfg!(debug_assertions) { 6000. } else { 300. };
         let words = ["core", "util", "widget", "render", "parser", "net", "store", "model", "view", "test"];
         let exts = ["rs", "ts", "py", "md", "json"];
-        let paths: Vec<Box<str>> = (0..MAX_FILES)
+        let short: Vec<Box<str>> = (0..MAX_FILES)
             .map(|i| {
                 let (a, b, c) = (words[i % 10], words[(i / 10) % 10], words[(i / 100) % 10]);
                 Box::from(format!("pkg{}/{a}/{b}_{c}/{c}{}_{a}.{}", i / 1000, i % 97, exts[i % 5]))
             })
             .collect();
-        for raw in ["w", "wid", "widget", "rend view", "pkg12/core", "zzzz", "u_t.rs"] {
+        // some 150 chars each; x, q and j only in folders and never side by side, so the name and the substring
+        // look fail and the table runs over the whole path
+        let long: Vec<Box<str>> = (0..MAX_FILES)
+            .map(|i| {
+                let (a, b) = (words[i % 10], words[(i / 10) % 10]);
+                Box::from(format!("services/{a}_xenon_cluster/{b}_handlers/internal_quartz_{a}/generated_{b}_sources/deep_jade_{i}/module_{a}_{b}/vendor_bundle_artifacts/file{i}.rs"))
+            })
+            .collect();
+        assert!(long[0].len() > 140, "{}", long[0].len());
+        let cases = [(&short, "w"), (&short, "wid"), (&short, "widget"), (&short, "rend view"), (&short, "pkg12/core"), (&short, "zzzz"), (&short, "u_t.rs"), (&long, "xq"), (&long, "xqj"), (&long, "xjq")];
+        for (paths, raw) in cases {
             let started = std::time::Instant::now();
-            let got = rank(&q(raw), &paths, &[], &[], TOP_K, &AtomicBool::new(false)).unwrap();
-            eprintln!("{raw:>12}: {:>6.1} ms, {} shown", started.elapsed().as_secs_f64() * 1000., got.len());
+            let got = rank(&q(raw), paths, &[], &[], TOP_K, &AtomicBool::new(false)).unwrap();
+            let ms = started.elapsed().as_secs_f64() * 1000.;
+            eprintln!("{raw:>12}: {ms:>7.1} ms, {} shown", got.len());
+            assert!(ms < ceiling_ms, "{raw:?} took {ms:.1} ms");
         }
     }
 }

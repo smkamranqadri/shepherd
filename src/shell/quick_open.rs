@@ -1,11 +1,13 @@
 //! Quick Open (`QuickOpen`): the command panel over the shown workspace's files (`files::quick_open`), its file tabs
-//! first. Each root's listing is kept for the app's windows and shown at once; one older than `FRESH` is listed
-//! again behind it.
+//! first. The root is resolved first (its real path keys everything, as it prefixes the file tabs' paths). Each
+//! root's listing is kept for the app's windows and shown at once; one older than `FRESH` is listed again behind it,
+//! and a listing finishes into the cache even when the panel that asked has closed.
 use super::*;
 use crate::files::quick_open as qo;
 use crate::files::runner::Host;
 use crate::files::tabs::TabKind;
 use crate::ui::command_panel::{FilesState, Kind, Panel};
+use gpui::WeakEntity;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,34 +17,29 @@ const FRESH: Duration = Duration::from_secs(10);
 const KEPT_ROOTS: usize = 4;
 /// The files opened from Quick Open this run, per root.
 const RECENT: usize = 20;
-/// How long the root's real path may take (a hung mount).
+/// How long the root's real path, and a look at whether its recent files are still there, may take (a hung mount).
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
+/// The roots as written whose real paths are remembered.
+const KEPT_SPELLINGS: usize = 64;
 
 struct Listed {
     paths: Arc<Vec<Box<str>>>,
     capped: bool,
     at: Instant,
-    /// The root with its symlinks resolved, as file tabs keep their paths.
-    real_root: PathBuf,
 }
 
-/// Every root's listing and its recent files, shared by the windows.
+/// Every root's listing and its recent files, by its real path, shared by the windows.
 #[derive(Default)]
 struct Listings {
     roots: HashMap<PathBuf, Listed>,
     recent: HashMap<PathBuf, Vec<String>>,
+    /// A root as written, to its real path.
+    real: HashMap<PathBuf, PathBuf>,
+    /// The roots being listed, and the panels waiting on each.
+    listing: HashMap<PathBuf, Vec<WeakEntity<Panel>>>,
 }
 
 impl gpui::Global for Listings {}
-
-/// Stops a listing on the runtime when dropped.
-struct AbortOnDrop(tokio::task::AbortHandle);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
 
 /// `path` from `root` (or its real path) with `/` between folders; `None` outside it.
 fn relative(path: &Path, root: &Path, real_root: Option<&Path>) -> Option<String> {
@@ -54,12 +51,8 @@ fn relative(path: &Path, root: &Path, real_root: Option<&Path>) -> Option<String
 impl Shell {
     /// `QuickOpen`: opens Quick Open over the shown workspace's files, or closes it when it is open.
     pub(super) fn quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let shown = |shell: &Self, cx: &App| shell.command_panel.as_ref().filter(|p| p.is_open() && p.value.0.read(cx).kind == Kind::Files).map(|p| p.value.0.clone());
-        if let Some(panel) = shown(self, cx) {
-            panel.update(cx, |p, _| p.stop_listing());
-        }
         self.toggle_command_panel(Kind::Files, window, cx);
-        let Some(panel) = shown(self, cx) else { return };
+        let Some(panel) = self.command_panel.as_ref().filter(|p| p.is_open() && p.value.0.read(cx).kind == Kind::Files).map(|p| p.value.0.clone()) else { return };
         let context = self.panel_context(window, cx);
         if context.remote {
             return panel.update(cx, |p, cx| p.files_unavailable(FilesState::Remote, cx));
@@ -67,62 +60,87 @@ impl Shell {
         let Some(root) = context.root.map(PathBuf::from) else {
             return panel.update(cx, |p, cx| p.files_unavailable(FilesState::NoFolder, cx));
         };
-        let listings = cx.default_global::<Listings>();
-        let listed = listings.roots.get(&root);
-        let real_root = listed.map(|l| l.real_root.clone());
-        let stale = listed.is_none_or(|l| l.at.elapsed() >= FRESH);
-        let kept = listed.map(|l| (l.paths.clone(), l.capped));
-        let recent = listings.recent.get(&root).cloned().unwrap_or_default();
+        panel.update(cx, |p, cx| p.files_root(root.clone(), cx));
         // the shown tab, then the strip's order
-        let open: Vec<String> = self
+        let tabs: Vec<PathBuf> = self
             .shown_tabs_key()
             .and_then(|key| self.file_tabs.get(&key))
             .map(|tabs| {
                 let files = tabs.files.iter().filter(|t| t.kind == TabKind::File);
                 let (active, rest): (Vec<_>, Vec<_>) = files.partition(|t| Some(t.id) == tabs.active);
-                active.into_iter().chain(rest).filter_map(|t| relative(&t.path, &root, real_root.as_deref())).collect()
+                active.into_iter().chain(rest).map(|t| t.path.clone()).collect()
             })
             .unwrap_or_default();
-        panel.update(cx, |p, cx| p.files_root(root.clone(), open, recent, kept, cx));
-        if stale {
-            self.list_files(root, &panel, cx);
-        }
-    }
-
-    /// Lists `root`'s files on the runtime; the answer is kept for every window and handed to `panel`. The listing
-    /// stops when the panel closes first.
-    fn list_files(&mut self, root: PathBuf, panel: &Entity<Panel>, cx: &mut Context<Self>) {
+        // the recent files of the root as last resolved; looked at again below, as they may have gone
+        let listings = cx.default_global::<Listings>();
+        let recent = listings.real.get(&root).and_then(|real| listings.recent.get(real)).cloned().unwrap_or_default();
         let asked = root.clone();
         let job = self.rt.spawn(async move {
-            let rg = crate::ui::statusbar::tool("rg");
-            let listed = qo::list(&Host::Local, &asked, &rg).await;
-            let resolve = asked.clone();
-            let real = tokio::time::timeout(RESOLVE_TIMEOUT, tokio::task::spawn_blocking(move || std::fs::canonicalize(&resolve))).await;
-            let real = match real {
-                Ok(Ok(Ok(real))) => real,
-                _ => asked,
-            };
-            (listed, real)
+            let fallback = asked.clone();
+            let look = tokio::task::spawn_blocking(move || {
+                let real = qo::real_root(&asked);
+                let recent = qo::existing(&real, recent);
+                (real, recent)
+            });
+            match tokio::time::timeout(RESOLVE_TIMEOUT, look).await {
+                Ok(Ok(found)) => found,
+                _ => (fallback, Vec::new()),
+            }
         });
-        panel.update(cx, |p, _| p.hold(Box::new(AbortOnDrop(job.abort_handle()))));
         let panel = panel.downgrade();
         cx.spawn(async move |this, cx| {
-            // stopped: the panel closed
-            let Ok((listed, real_root)) = job.await else { return };
+            let Ok((real, recent)) = job.await else { return };
+            let _ = this.update(cx, |shell, cx| {
+                let open = tabs.iter().filter_map(|t| relative(t, &root, Some(&real))).collect();
+                let listings = cx.default_global::<Listings>();
+                if listings.real.len() >= KEPT_SPELLINGS {
+                    listings.real.clear();
+                }
+                listings.real.insert(root, real.clone());
+                let listed = listings.roots.get(&real);
+                let stale = listed.is_none_or(|l| l.at.elapsed() >= FRESH);
+                let kept = listed.map(|l| (l.paths.clone(), l.capped));
+                let Some(panel) = panel.upgrade() else { return };
+                panel.update(cx, |p, cx| p.files_context(open, recent, kept, stale, cx));
+                if stale {
+                    shell.list_files(real, &panel, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Lists `root` (a real path) on the runtime, unless it is being listed already; the answer is kept for every
+    /// window and handed to each panel still waiting on it.
+    fn list_files(&mut self, root: PathBuf, panel: &Entity<Panel>, cx: &mut Context<Self>) {
+        let listings = cx.default_global::<Listings>();
+        let waiting = listings.listing.entry(root.clone()).or_default();
+        waiting.push(panel.downgrade());
+        if waiting.len() > 1 {
+            return;
+        }
+        let asked = root.clone();
+        let job = self.rt.spawn(async move { qo::list(&Host::Local, &asked, &crate::ui::statusbar::tool("rg")).await });
+        cx.spawn(async move |this, cx| {
+            let listed = job.await.unwrap_or_else(|e| Err(e.to_string()));
             let _ = this.update(cx, |_, cx| {
+                let listings = cx.default_global::<Listings>();
+                let waiting = listings.listing.remove(&root).unwrap_or_default();
                 let shown = listed.map(|l| {
                     let paths = Arc::new(l.paths);
-                    let listings = cx.default_global::<Listings>();
                     if !listings.roots.contains_key(&root)
                         && listings.roots.len() >= KEPT_ROOTS
                         && let Some(oldest) = listings.roots.iter().min_by_key(|(_, l)| l.at).map(|(r, _)| r.clone())
                     {
                         listings.roots.remove(&oldest);
                     }
-                    listings.roots.insert(root, Listed { paths: paths.clone(), capped: l.capped, at: Instant::now(), real_root });
+                    listings.roots.insert(root, Listed { paths: paths.clone(), capped: l.capped, at: Instant::now() });
                     (paths, l.capped)
                 });
-                let _ = panel.update(cx, |p, cx| p.files_listed(shown, cx));
+                // a panel closed meanwhile only drops the answer
+                for panel in waiting.iter().filter_map(WeakEntity::upgrade) {
+                    panel.update(cx, |p, cx| p.files_listed(shown.clone(), cx));
+                }
             });
         })
         .detach();
@@ -131,9 +149,10 @@ impl Shell {
     /// A file picked in Quick Open: opened pinned (the keyboard goes to it), at `line`, and remembered for its root.
     pub(super) fn open_quick_file(&mut self, path: PathBuf, line: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(root) = self.panel_context(window, cx).root.map(PathBuf::from) {
-            let real_root = cx.try_global::<Listings>().and_then(|l| l.roots.get(&root)).map(|l| l.real_root.clone());
-            if let Some(rel) = relative(&path, &root, real_root.as_deref()) {
-                let recent = cx.default_global::<Listings>().recent.entry(root).or_default();
+            let listings = cx.default_global::<Listings>();
+            let real = listings.real.get(&root).cloned().unwrap_or_else(|| root.clone());
+            if let Some(rel) = relative(&path, &root, Some(&real)) {
+                let recent = listings.recent.entry(real).or_default();
                 recent.retain(|r| *r != rel);
                 recent.insert(0, rel);
                 recent.truncate(RECENT);
