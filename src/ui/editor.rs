@@ -7,19 +7,36 @@
 //! The text is compared with the last version on disk on every change (its length first, then its chunks), so the
 //! tab's dot goes when an undo comes back to it. A save (`files::save`, off the main thread) makes the version it
 //! wrote the new baseline, not the buffer as it is when the save ends: typing during a save leaves the tab dirty.
-//! A save that fails says why in a banner under the header; one the file changed under offers Overwrite or Reload.
+//! A save that fails says why in a banner under the header.
+//!
+//! The file is watched on disk (its folder, through `notify`, for events naming it) and looked at when its tab
+//! shows and when the window comes to the front. A change with no unsaved changes here is taken in place: the
+//! buffer gets the disk's text as one edit (undo steps back to what it was), the cursor and scroll kept. With
+//! unsaved changes a banner asks: Reload (the disk's text, theirs dropped, though undo still has it), Keep mine
+//! (the next save writes over that version of the disk's, and only that one) or Compare (the disk's text against
+//! the buffer, read-only, in the editor's place). A file deleted or moved away keeps its buffer, says so, and Save
+//! anyway makes it again. Ctrl/Cmd+S over a newer version on disk asks Overwrite / Compare / Cancel; Save All and
+//! closing a tab leave the banner instead.
+//!
+//! Unsaved text is kept as a draft (`files::drafts`) a second after typing stops, at once when the tab goes out of
+//! sight, and first thing when Shepherd quits without asking; the draft goes when the buffer is clean again (saved,
+//! undone, reloaded) or its changes are let go (Don't Save). The next time the file opens, its draft comes back
+//! over it as one edit (undo steps back to the file), and a banner says so: a file changed since asks as a change
+//! on disk does, and a save waits for Keep mine or Overwrite.
 //!
 //! The gutter marks the lines changed against git's index, and those staged (HEAD to index) as outlines
 //! (`files::line_changes`): its blobs are fetched when the file opens and when git's state may have moved
 //! (`git_changed`), and the buffer is diffed against them a moment after typing stops.
 use crate::bindings::SaveFile;
 use crate::files::content::{self, FileKind};
+use crate::files::drafts::{self, Draft, Restore};
 use crate::files::highlight;
 use crate::files::line_changes::{self, Hunk, LineChange, Mark};
 use crate::files::runner::{self, Host, Limits};
-use crate::files::save::{self, Baseline, LineEnding, SaveError, SaveMode};
+use crate::files::save::{self, Baseline, LineEnding, SaveError, SaveMode, Seen};
 use crate::shell::widgets::{tip, titlebar_button};
 use crate::theme::Theme;
+use crate::ui::diff_view::DiffView;
 use crate::ui::editor_highlight::{SyntectHighlighter, editor_style};
 use crate::ui::markdown::{Link, Links};
 use crate::ui::review::Block;
@@ -53,6 +70,10 @@ const GUTTER_AFTER: Duration = Duration::from_millis(300);
 const GUTTER_BUDGET: Duration = Duration::from_millis(250);
 /// The padding left of the line numbers: the gutter's bars are drawn in it.
 const GUTTER_PAD: f32 = 8.;
+/// How long after the last keystroke unsaved changes are kept as a draft.
+const DRAFT_AFTER: Duration = Duration::from_secs(1);
+/// How long after the first event of a burst on disk (a checkout, a formatter's rename) the file is looked at.
+const DISK_AFTER: Duration = Duration::from_millis(300);
 
 pub enum EditorEvent {
     /// "Open in editor", at a line when there is one: the Shell shows the terminals and opens the file there.
@@ -62,6 +83,8 @@ pub enum EditorEvent {
     /// The unsaved-changes dot came or went, or a save started or ended: the tab bar draws again, and a preview is
     /// pinned on its first edit.
     Dirty(bool),
+    /// The deleted file's banner's Close: the Shell closes the tab (asking first, with unsaved changes).
+    Close,
 }
 
 /// Where the cursor and the scroll were, kept for the tab while its view is gone (dropped to save memory) and put
@@ -120,6 +143,12 @@ impl Tracker {
         std::mem::replace(&mut self.dirty, dirty) != dirty
     }
 
+    /// The buffer is about to take the disk's text in place (`saved`): that is the saved text now, which the buffer's
+    /// next change is compared with.
+    pub fn reloaded(&mut self, saved: Arc<Vec<u8>>) {
+        self.saved = saved;
+    }
+
     /// A save starts; its number, or `None` while another runs.
     pub fn start_save(&mut self) -> Option<u64> {
         if self.saving.is_some() {
@@ -164,13 +193,18 @@ struct Editable {
     blocks: Option<Vec<Block>>,
     real_root: Option<PathBuf>,
     hard_tabs: bool,
+    /// The draft of unsaved changes kept for it, and how it stands against the file.
+    draft: Option<(Draft, Restore)>,
 }
 
 /// Why text opened in the viewer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Note {
-    LongLines,
+    /// `draft`: unsaved changes of it are kept too, which Edit anyway brings back.
+    LongLines { draft: bool },
     TooLarge,
+    /// It has a draft of unsaved changes, which the viewer can't show: where it is kept.
+    Draft,
 }
 
 #[cfg(unix)]
@@ -219,7 +253,7 @@ fn read_for_edit(path: &Path, root: Option<&Path>, force: bool) -> Loaded {
         return Loaded::View(Some(Note::TooLarge));
     }
     if !force && text.lines().any(|l| l.len() > MAX_EDIT_LINE && l.chars().count() > MAX_EDIT_LINE) {
-        return Loaded::View(Some(Note::LongLines));
+        return Loaded::View(Some(Note::LongLines { draft: false }));
     }
     let readonly = if !writable(path) {
         Some("You can't write to this file")
@@ -239,18 +273,172 @@ fn read_for_edit(path: &Path, root: Option<&Path>, force: bool) -> Loaded {
     let real_root = blocks.as_ref().and(root).and_then(|r| r.canonicalize().ok());
     let sample = || text.lines().take(2000);
     let hard_tabs = sample().filter(|l| l.starts_with('\t')).count() > sample().filter(|l| l.starts_with("  ")).count();
-    let normal = if text.text.contains('\r') { text.text.replace("\r\n", "\n").replace('\r', "\n") } else { text.text };
-    Loaded::Edit(Box::new(Editable { text: normal, baseline, syntax, readonly, blocks, real_root, hard_tabs }))
+    Loaded::Edit(Box::new(Editable { text: lf(text.text), baseline, syntax, readonly, blocks, real_root, hard_tabs, draft: None }))
 }
 
-/// A save that failed, as the banner under the header says it.
+/// `read_for_edit`, with the file's draft in `drafts` (if any) found and weighed against the file. A file gone from
+/// disk whose draft is kept opens editable over nothing, the draft its text; one that no longer opens editable says
+/// where its draft is.
+fn read_with_draft(path: &Path, root: Option<&Path>, force: bool, drafts: Option<&Path>) -> Loaded {
+    let read = read_for_edit(path, root, force);
+    let Some(draft) = drafts.and_then(|d| drafts::read(d, path)) else { return read };
+    match read {
+        Loaded::Edit(mut file) => {
+            let on = drafts::classify(&draft.header, Some(&file.baseline));
+            file.draft = Some((draft, on));
+            Loaded::Edit(file)
+        }
+        Loaded::View(_) if std::fs::metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {
+            let nothing = save::Stamp { len: 0, mtime_ns: 0, ctime_ns: 0, ino: 0, dev: 0 };
+            let syntax = highlight::syntax_for(path, draft.text.lines().next().unwrap_or_default());
+            Loaded::Edit(Box::new(Editable {
+                text: String::new(),
+                baseline: Baseline::new(Vec::new(), nothing),
+                syntax,
+                readonly: None,
+                blocks: None,
+                real_root: None,
+                hard_tabs: false,
+                draft: Some((draft, Restore::Deleted)),
+            }))
+        }
+        // Edit anyway stays on offer: opened so, the draft comes back
+        Loaded::View(Some(Note::LongLines { .. })) => Loaded::View(Some(Note::LongLines { draft: true })),
+        Loaded::View(_) => Loaded::View(Some(Note::Draft)),
+    }
+}
+
+/// `text` with its line ends made `\n`, as the editor holds it.
+fn lf(text: String) -> String {
+    if text.contains('\r') { text.replace("\r\n", "\n").replace('\r', "\n") } else { text }
+}
+
+/// The saved text for the tracker: the baseline's own bytes when they are `text` (no BOM, `\n` ends), so they are kept
+/// once.
+fn saved_text(baseline: &Baseline, text: &str) -> Arc<Vec<u8>> {
+    if baseline.bytes.as_slice() == text.as_bytes() { baseline.bytes.clone() } else { Arc::new(text.as_bytes().to_vec()) }
+}
+
+/// The buffer is about to take `file`'s text in place (a reload that keeps undo): the baseline and the tracker's saved
+/// text become the file's first, so the change the buffer then hears compares clean against them.
+fn rebase(tracker: &mut Tracker, baseline: &mut Baseline, file: &Editable) {
+    *baseline = file.baseline.clone();
+    tracker.reloaded(saved_text(baseline, &file.text));
+}
+
+/// What a look at the disk found, against the baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disk {
+    /// The baseline's bytes (touched, maybe, but not changed).
+    Same,
+    /// Another version, by its length and digest.
+    Changed(Seen),
+    /// Nothing there, or no file: deleted, or moved away.
+    Gone,
+}
+
+/// What the editor does about a look at the disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnDisk {
+    Nothing,
+    /// The disk is as opened: a banner about it goes.
+    Clear,
+    /// No unsaved changes: the buffer takes the disk's text in place.
+    Reload,
+    /// Unsaved changes: the banner asks what to do.
+    Banner,
+    Deleted,
+}
+
+/// What to do about `disk`, with unsaved changes or not (`dirty`), when the user chose to keep their text over the
+/// version `kept`: that version again asks nothing, any other does.
+pub fn decide(dirty: bool, disk: Disk, kept: Option<Seen>) -> OnDisk {
+    match disk {
+        Disk::Same => OnDisk::Clear,
+        Disk::Gone => OnDisk::Deleted,
+        Disk::Changed(_) if !dirty => OnDisk::Reload,
+        Disk::Changed(seen) if kept == Some(seen) => OnDisk::Nothing,
+        Disk::Changed(_) => OnDisk::Banner,
+    }
+}
+
+/// Looks at the file on disk against `b` (blocking); `None` when it can't tell (an error reading it).
+fn look(path: &Path, b: &Baseline) -> Option<Disk> {
+    let gone = |e: &std::io::Error| matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput);
+    match save::changed_on_disk(path, b) {
+        Ok(false) => Some(Disk::Same),
+        // a folder or a FIFO in its place is no file either
+        Ok(true) => match save::fingerprint(path) {
+            Ok(seen) => Some(Disk::Changed(seen)),
+            Err(e) if gone(&e) => Some(Disk::Gone),
+            Err(_) => None,
+        },
+        Err(e) if gone(&e) => Some(Disk::Gone),
+        Err(_) => None,
+    }
+}
+
+/// `save::save`, but a save that finds the disk changed writes over it when the disk holds the version the user
+/// chose to keep their text over (`kept`), and only then: checked again at the rename, as any save.
+fn save_kept(root: &Path, path: &Path, text: &str, b: &Baseline, mode: SaveMode, kept: Option<Seen>) -> Result<Baseline, SaveError> {
+    let saved = save::save(root, path, text, b, mode);
+    let (Err(SaveError::Conflict), Some(kept), SaveMode::Safe | SaveMode::InPlace) = (&saved, kept, mode) else { return saved };
+    match Baseline::read(path) {
+        Ok(disk) if Seen::of(&disk.bytes) == kept => save::save(root, path, text, &b.over(&disk), mode),
+        _ => saved,
+    }
+}
+
+/// The disk's version of `path` as the editor would hold it, for a Compare; why not, when it can't be (too large to
+/// read whole, not text).
+fn disk_text(path: &Path) -> Result<String, &'static str> {
+    const NOT_TEXT: &str = "Can't compare: the file on disk isn't text";
+    let meta = std::fs::metadata(path).map_err(|_| "Can't compare: the file is no longer on disk")?;
+    if meta.len() > MAX_EDIT {
+        return Err("Can't compare: the file on disk is over 4 MB");
+    }
+    let b = Baseline::read(path).map_err(|_| NOT_TEXT)?;
+    let text = content::decode(&b.bytes).ok_or(NOT_TEXT)?;
+    Ok(lf(text.text))
+}
+
+/// The editors with unsaved changes, by file, in this process: another editor of one of these files (another
+/// window's) does not restore its draft over them.
+fn dirty_editors() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<u64>>> {
+    static DIRTY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<u64>>>> = std::sync::OnceLock::new();
+    DIRTY.get_or_init(Default::default)
+}
+
+/// Notes in `map` whether editor `id` of `path` has unsaved changes.
+fn note_dirty(map: &mut std::collections::HashMap<PathBuf, Vec<u64>>, path: &Path, id: u64, dirty: bool) {
+    let ids = map.entry(path.to_path_buf()).or_default();
+    ids.retain(|&i| i != id);
+    if dirty {
+        ids.push(id);
+    }
+    if ids.is_empty() {
+        map.remove(path);
+    }
+}
+
+/// Whether an editor other than `id` has unsaved changes of `path`.
+fn dirty_elsewhere(map: &std::collections::HashMap<PathBuf, Vec<u64>>, path: &Path, id: u64) -> bool {
+    map.get(path).is_some_and(|ids| ids.iter().any(|&i| i != id))
+}
+
+/// A save that failed, or the disk's news, as the banner under the header says it.
 #[derive(Debug, Clone, PartialEq)]
 enum Banner {
     Failed(String),
-    /// The file changed on disk since it was opened (or saved): Overwrite or Reload.
-    Conflict,
-    /// The file was deleted on disk: Save anyway recreates it.
+    /// The file changed on disk (to `disk`) while the buffer has unsaved changes: Compare, Keep mine or Reload.
+    /// `save`: a save found it so and wrote nothing (Overwrite then stands for Keep mine).
+    Changed { disk: Seen, save: bool },
+    /// The file was deleted or moved away on disk: Save anyway makes it again; Close closes the tab.
     Deleted,
+    /// Unsaved changes kept `ago` came back from their draft, over the file as it stands (`on`).
+    Restored { ago: String, on: Restore },
+    /// Something worth knowing, with Dismiss.
+    Info(String),
 }
 
 /// The open file in the editor.
@@ -263,6 +451,8 @@ struct Edit {
     blocks: Option<Vec<Block>>,
     real_root: Option<PathBuf>,
     _events: Subscription,
+    /// The window coming to the front looks at the disk.
+    _activation: Subscription,
 }
 
 enum Body {
@@ -324,13 +514,49 @@ pub struct FileEditor {
     gutter_diff: Option<Task<()>>,
     /// git changed while the tab was out of sight: the blobs are fetched again when it shows.
     gutter_stale: bool,
+    /// The watch on the file's folder (its watcher lives in the task), the look at the disk under way, and the read
+    /// of a reload in place (apart, so a look never cancels a Reload asked for).
+    disk_watch: Option<Task<()>>,
+    disk_check: Option<Task<()>>,
+    disk_reload: Option<Task<()>>,
+    /// The version on disk the user chose to keep their text over ("Keep mine"): the next save writes over it.
+    kept: Option<Seen>,
+    /// The disk's text against the buffer, shown in the text's place.
+    compare: Option<Entity<DiffView>>,
+    /// The save under way was asked for by Ctrl/Cmd+S: a newer version on disk is asked about, not bannered.
+    explicit: bool,
+    /// The drafts' folder (none: no drafts), this file's draft, and the timer of its next write.
+    drafts: Option<PathBuf>,
+    draft: Option<drafts::Slot>,
+    draft_wait: Option<Task<()>>,
+    /// Counts the buffer's changes, and the count the last draft was written at: a hidden tab unchanged since is not
+    /// written again.
+    edits: u64,
+    drafted: u64,
+    /// The draft brought back and how it stood, until the banner about it is answered (Dismiss, Keep mine,
+    /// Overwrite, Discard): its drafts keep the version it was typed over, and the tab counts as unsaved.
+    restored: Option<(drafts::Header, Restore)>,
+    /// Ctrl/Cmd+S found the disk changed: the look that follows asks Overwrite / Compare / Cancel.
+    ask_on_look: bool,
+    /// Tells this editor apart in `dirty_editors`.
+    id: u64,
     _theme: Subscription,
+}
+
+impl Drop for FileEditor {
+    fn drop(&mut self) {
+        let mut map = dirty_editors().lock().unwrap_or_else(|e| e.into_inner());
+        note_dirty(&mut map, &self.path, self.id, false);
+    }
 }
 
 impl EventEmitter<EditorEvent> for FileEditor {}
 
 impl Focusable for FileEditor {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
+        if let (Body::Edit(_), Some(compare)) = (&self.body, &self.compare) {
+            return compare.read(cx).focus_handle(cx);
+        }
         match &self.body {
             Body::Edit(e) if !self.preview_shown() => e.state.read(cx).focus_handle(cx),
             Body::View { viewer, .. } => viewer.read(cx).focus_handle(cx),
@@ -341,6 +567,13 @@ impl Focusable for FileEditor {
 
 impl FileEditor {
     pub fn new(rt: Handle, cx: &mut Context<Self>) -> FileEditor {
+        // drafts no file opened for a month, and what a crash left, go once a run
+        static SWEEP: std::sync::Once = std::sync::Once::new();
+        if !cfg!(test) {
+            SWEEP.call_once(|| {
+                rt.spawn_blocking(|| drafts::sweep(&drafts::dir(), std::time::SystemTime::now(), drafts::MAX_AGE));
+            });
+        }
         let theme = cx.observe_global::<Theme>(|e: &mut FileEditor, cx| {
             if let Body::Edit(edit) = &e.body {
                 let style = editor_style(Theme::of(cx));
@@ -373,12 +606,38 @@ impl FileEditor {
             gutter_fetch: None,
             gutter_diff: None,
             gutter_stale: false,
+            disk_watch: None,
+            disk_check: None,
+            disk_reload: None,
+            kept: None,
+            compare: None,
+            explicit: false,
+            // a test never touches the user's drafts
+            drafts: (!cfg!(test)).then(drafts::dir),
+            draft: None,
+            draft_wait: None,
+            edits: 0,
+            drafted: 0,
+            restored: None,
+            ask_on_look: false,
+            id: {
+                static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             _theme: theme,
         }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The editor's text state, while the file is open editable: what a find bar searches and selects in.
+    pub(crate) fn editor_state(&self) -> Option<&Entity<EditorState>> {
+        match &self.body {
+            Body::Edit(e) => Some(&e.state),
+            _ => None,
+        }
     }
 
     /// Markdown's preview is on screen (in the editor, or the viewer's).
@@ -394,8 +653,33 @@ impl FileEditor {
         matches!(&self.body, Body::Edit(e) if e.blocks.is_some() && self.preview)
     }
 
+    /// Unsaved changes, or a restored draft not yet answered (undone to the file's text, it is still asked about
+    /// before the tab closes).
     pub fn is_dirty(&self) -> bool {
-        matches!(&self.body, Body::Edit(e) if e.tracker.is_dirty())
+        matches!(&self.body, Body::Edit(e) if e.tracker.is_dirty() || self.restored.is_some())
+    }
+
+    /// Notes in `dirty_editors` whether this editor has unsaved changes.
+    fn note_dirty(&self) {
+        let mut map = dirty_editors().lock().unwrap_or_else(|e| e.into_inner());
+        note_dirty(&mut map, &self.path, self.id, self.is_dirty());
+    }
+
+    /// A draft's header for the buffer now: over the baseline, or, while a restored draft is unanswered, over the
+    /// version that draft was typed over (so a draft restored over a changed file stays known as one).
+    fn draft_header(&self, e: &Edit) -> drafts::Header {
+        let mut header = drafts::Header::new(&self.path, &e.baseline, drafts::epoch_secs(std::time::SystemTime::now()));
+        if let Some((was, _)) = &self.restored {
+            (header.base_len, header.base_hash, header.base_mtime_ns) = (was.base_len, was.base_hash, was.base_mtime_ns);
+        }
+        header
+    }
+
+    /// Whether the buffer is not to be replaced by the disk's text now: a save is under way, or (unless `discard`)
+    /// it has unsaved changes or an unanswered restored draft.
+    fn keeps_buffer(&self, discard: bool) -> bool {
+        let Body::Edit(e) = &self.body else { return false };
+        e.tracker.saving() || (!discard && (e.tracker.is_dirty() || self.restored.is_some()))
     }
 
     /// A save is under way: quitting waits for it.
@@ -408,27 +692,45 @@ impl FileEditor {
         self.saving.clone()
     }
 
-    /// Quitting without asking (the Dock's Quit, logging out): the write under way, and a save of unsaved changes
-    /// started now off the main thread, as one future the app's quit waits on (for as long as it lets it). Nothing
-    /// in the view is updated: it is going.
-    // ponytail: E4's drafts keep what a quit this short cannot write
-    pub fn flush(&self, cx: &App) -> Option<BoxFuture<'static, ()>> {
+    /// Quitting without asking (the Dock's Quit, logging out): the write under way, and off the main thread the
+    /// unsaved changes' draft and then a save of them (the draft going once it is written), as one future the app's
+    /// quit waits on (for as long as it lets it): a quit too short to save still leaves the draft. Nothing in the
+    /// view is updated: it is going.
+    /// `save` false (another window's Don't Save let the quit go): the draft only.
+    pub fn flush(&self, save: bool, cx: &App) -> Option<BoxFuture<'static, ()>> {
         let writing = self.writing.clone();
-        let save = match &self.body {
-            Body::Edit(e) if e.tracker.is_dirty() && e.readonly.is_none() && self.saving.is_none() => {
+        let job = match &self.body {
+            Body::Edit(e) if e.tracker.is_dirty() => {
                 let rope: Rope = e.state.read(cx).text().clone();
-                let (root, path, baseline) = (self.save_root(), self.path.clone(), e.baseline.clone());
+                let header = self.draft_header(e);
+                let draft = self.draft.clone().filter(|_| rope.len() as u64 <= MAX_EDIT && !drafts::secret(&self.path)).map(|slot| (slot.ticket(), slot));
                 let mode = if self.in_place { SaveMode::InPlace } else { SaveMode::Safe };
+                // a draft restored over a file changed since is never saved over it unasked: only kept
+                let stale = matches!(self.restored, Some((_, Restore::Stale)));
+                let save = (save && !stale && e.readonly.is_none() && self.saving.is_none()).then(|| (self.save_root(), self.path.clone(), e.baseline.clone(), self.kept));
                 let job = self.rt.spawn_blocking(move || {
-                    if let Err(err) = save::save(&root, &path, &rope_text(&rope), &baseline, mode) {
-                        eprintln!("shepherd: quitting, couldn't save {}: {err}", path.display());
+                    let text = rope_text(&rope);
+                    // the draft first: it is what a quit too short to save leaves
+                    if let Some((ticket, slot)) = &draft
+                        && let Err(err) = slot.write(*ticket, &header, &text)
+                    {
+                        eprintln!("shepherd: quitting, couldn't keep a draft of {}: {err}", header.path);
+                    }
+                    let Some((root, path, baseline, kept)) = save else { return };
+                    match save_kept(&root, &path, &text, &baseline, mode, kept) {
+                        Ok(_) => {
+                            if let Some((_, slot)) = &draft {
+                                let _ = slot.remove(slot.ticket());
+                            }
+                        }
+                        Err(err) => eprintln!("shepherd: quitting, couldn't save {}: {err}", path.display()),
                     }
                 });
                 Some(job)
             }
             _ => None,
         };
-        if writing.is_none() && save.is_none() {
+        if writing.is_none() && job.is_none() {
             return None;
         }
         Some(
@@ -436,8 +738,8 @@ impl FileEditor {
                 if let Some(writing) = writing {
                     writing.await;
                 }
-                if let Some(save) = save {
-                    let _ = save.await;
+                if let Some(job) = job {
+                    let _ = job.await;
                 }
             }
             .boxed(),
@@ -446,8 +748,7 @@ impl FileEditor {
 
     /// The cursor and the scroll, to put back if the view is made again.
     pub fn place(&self, cx: &App) -> Option<Place> {
-        let Body::Edit(e) = &self.body else { return None };
-        let state = e.state.read(cx);
+        let state = self.editor_state()?.read(cx);
         let at = state.cursor_position();
         Some(Place { line: at.line, column: at.character, scroll_y: f32::from(state.scroll_offset().y) })
     }
@@ -475,6 +776,9 @@ impl FileEditor {
         }
         self.release(Some(window), cx);
         self.generation += 1;
+        // this editor no longer holds the file it showed
+        self.restored = None;
+        self.note_dirty();
         // the choice to save in place is the file's: another file asks again
         self.in_place &= path == self.path;
         (self.path, self.root, self.body) = (path.clone(), root.clone(), Body::Loading);
@@ -482,9 +786,12 @@ impl FileEditor {
         (self.saving, self.queued) = (None, None);
         (self.preview, self.preview_scroll) = (true, ScrollHandle::new());
         (self.gutter, self.blobs, self.gutter_stale) = (Arc::default(), Blobs::default(), false);
+        (self.kept, self.explicit, self.ask_on_look) = (None, false, false);
+        (self.draft, self.draft_wait) = (None, None);
         let generation = self.generation;
+        let drafts = self.drafts.clone();
         let job = self.rt.spawn(async move {
-            let read = tokio::task::spawn_blocking(move || read_for_edit(&path, root.as_deref(), force));
+            let read = tokio::task::spawn_blocking(move || read_with_draft(&path, root.as_deref(), force, drafts.as_deref()));
             // ponytail: a read that never ends keeps its blocking thread; the viewer then says so
             tokio::time::timeout(LOAD_TIMEOUT, read).await.ok().and_then(Result::ok).unwrap_or(Loaded::View(None))
         });
@@ -516,9 +823,12 @@ impl FileEditor {
 
     /// The file in the editor.
     fn edit(&mut self, file: Editable, window: &mut Window, cx: &mut Context<Self>) {
-        let Editable { text, baseline, syntax, readonly, blocks, real_root, hard_tabs } = file;
+        let Editable { text, baseline, syntax, readonly, blocks, real_root, hard_tabs, draft } = file;
         // the bytes on disk are the text as edited (no BOM, `\n` ends): one copy for both
-        let saved = if baseline.bytes.as_slice() == text.as_bytes() { baseline.bytes.clone() } else { Arc::new(text.clone().into_bytes()) };
+        let saved = saved_text(&baseline, &text);
+        // a draft that kept what the file holds now has nothing to bring back
+        let kept_same = draft.as_ref().is_some_and(|(d, _)| d.text == text);
+        let can_save = readonly.is_none();
         let style = editor_style(Theme::of(cx));
         let state = cx.new(|cx| {
             let mut state = EditorState::new(window, cx)
@@ -544,8 +854,38 @@ impl FileEditor {
                 e.changed(cx);
             }
         });
+        let activation = cx.observe_window_activation(window, |e: &mut FileEditor, window, cx| {
+            if window.is_window_active() {
+                e.check_disk(false, window, cx);
+            }
+        });
         let markdown = blocks.is_some();
-        self.body = Body::Edit(Box::new(Edit { state, baseline, tracker: Tracker::new(saved), readonly, blocks, real_root, _events: events }));
+        let tracker = Tracker::new(saved);
+        self.body = Body::Edit(Box::new(Edit { state: state.clone(), baseline, tracker, readonly, blocks, real_root, _events: events, _activation: activation }));
+        self.watch_disk(window, cx);
+        self.draft = self.drafts.clone().map(|dir| drafts::Slot::new(dir, self.path.clone()));
+        let mut restored = false;
+        if let Some((draft, on)) = draft {
+            let elsewhere = dirty_elsewhere(&dirty_editors().lock().unwrap_or_else(|e| e.into_inner()), &self.path, self.id);
+            let kept_in = self.draft.as_ref().map(|s| s.file().display().to_string()).unwrap_or_default();
+            if kept_same {
+                // what it kept is what the file holds now
+                self.remove_draft();
+            } else if !can_save {
+                // a buffer that can't be saved would only hold them: the draft stays where it is
+                self.banner = Some(Banner::Info(format!("This file can't be saved here; your unsaved changes to it are kept in {kept_in}.")));
+            } else if elsewhere {
+                // another window has the file open with its changes: those are the ones to keep
+                self.banner = Some(Banner::Info("This file has unsaved changes in another window; this one shows it as it is on disk.".into()));
+            } else {
+                // over the file as one edit: undo steps back to it
+                state.update(cx, |s, cx| s.replace_all(draft.text, window, cx));
+                let ago = drafts::ago(drafts::epoch_secs(std::time::SystemTime::now()), draft.header.saved_at);
+                self.banner = Some(Banner::Restored { ago, on });
+                self.restored = Some((draft.header, on));
+                restored = true;
+            }
+        }
         match self.goto.take() {
             Some(Goto::Line(line)) => self.go_to_line(line, window, cx),
             Some(Goto::Fragment(fragment)) => self.go_to_fragment(&fragment, window, cx),
@@ -557,6 +897,10 @@ impl FileEditor {
                     self.preview = !markdown || place.line == 0;
                 }
             }
+        }
+        // the preview draws the file on disk: restored changes show in the source
+        if restored {
+            self.preview = false;
         }
         self.fetch_blobs(cx);
     }
@@ -586,20 +930,26 @@ impl FileEditor {
             viewer.update(cx, |v, cx| v.release(window, cx));
         }
         (self.gutter_wait, self.gutter_fetch, self.gutter_diff) = (None, None, None);
+        (self.disk_watch, self.disk_check, self.disk_reload) = (None, None, None);
+        if let Some(compare) = self.compare.take() {
+            compare.update(cx, |v, _| v.release());
+        }
     }
 
-    /// Out of sight: the viewer's image leaves gpui's cache.
+    /// Out of sight: the viewer's image leaves gpui's cache, and unsaved changes are kept as a draft now.
     pub fn hide(&mut self, window: Option<&mut Window>, cx: &mut App) {
+        self.write_draft(cx);
         if let Body::View { viewer, .. } = &self.body {
             viewer.update(cx, |v, cx| v.evict_image(window, cx));
         }
     }
 
-    /// Back in sight: the gutter catches up with git if it moved meanwhile.
-    pub fn show(&mut self, cx: &mut Context<Self>) {
+    /// Back in sight: the gutter catches up with git if it moved meanwhile, and the disk is looked at.
+    pub fn show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if std::mem::take(&mut self.gutter_stale) {
             self.fetch_blobs(cx);
         }
+        self.check_disk(false, window, cx);
     }
 
     /// git's state may have moved (a Changes poll, a watch on `.git`): the gutter's blobs are fetched again, now if
@@ -616,14 +966,80 @@ impl FileEditor {
     fn changed(&mut self, cx: &mut Context<Self>) {
         let Body::Edit(e) = &mut self.body else { return };
         let text = e.state.read(cx).text();
-        if e.tracker.changed(text.len(), text.chunks()) {
-            cx.emit(EditorEvent::Dirty(e.tracker.is_dirty()));
+        let flipped = e.tracker.changed(text.len(), text.chunks());
+        let dirty = e.tracker.is_dirty();
+        let pending = self.restored.is_some();
+        if flipped {
+            cx.emit(EditorEvent::Dirty(dirty || pending));
             cx.notify();
+        }
+        self.edits += 1;
+        self.note_dirty();
+        if !dirty {
+            // clean again (undone, reloaded): nothing to keep, but a restored draft not yet answered (an undo of
+            // the restore) stays until it is
+            if flipped && !pending {
+                self.remove_draft();
+            }
+        } else {
+            self.draft_wait = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(DRAFT_AFTER).await;
+                let _ = this.update(cx, |e, cx| e.write_draft(cx));
+            }));
         }
         self.gutter_wait = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(GUTTER_AFTER).await;
             let _ = this.update(cx, |e, cx| e.diff_gutter(cx));
         }));
+    }
+
+    /// Keeps the unsaved changes as a draft, off the main thread, unless the last one has them already (or they are
+    /// past the editing limit).
+    fn write_draft(&mut self, cx: &App) {
+        self.draft_wait = None;
+        let (Body::Edit(e), Some(slot)) = (&self.body, &self.draft) else { return };
+        if !e.tracker.is_dirty() || self.edits == self.drafted {
+            return;
+        }
+        let rope: Rope = e.state.read(cx).text().clone();
+        // too large to keep, or a file whose text should not be copied anywhere
+        if rope.len() as u64 > MAX_EDIT || drafts::secret(&self.path) {
+            return;
+        }
+        let header = self.draft_header(e);
+        let (slot, ticket) = (slot.clone(), slot.ticket());
+        self.drafted = self.edits;
+        self.rt.spawn_blocking(move || {
+            // a full disk, say: the buffer is still here, and saving still works
+            if let Err(err) = slot.write(ticket, &header, &rope_text(&rope)) {
+                eprintln!("shepherd: couldn't keep a draft of {}: {err}", header.path);
+            }
+        });
+    }
+
+    /// The draft goes, off the main thread (after any write still running): the buffer is clean.
+    fn remove_draft(&mut self) {
+        self.draft_wait = None;
+        self.drafted = self.edits;
+        if let Some(slot) = self.draft.clone() {
+            let ticket = slot.ticket();
+            self.rt.spawn_blocking(move || {
+                if let Err(err) = slot.remove(ticket) {
+                    eprintln!("shepherd: couldn't remove the draft {}: {err}", slot.file().display());
+                }
+            });
+        }
+    }
+
+    /// The unsaved changes are let go (Don't Save): their draft goes now, before a quit or the tab closing.
+    pub fn discard_draft(&mut self) {
+        self.draft_wait = None;
+        self.drafted = self.edits;
+        if let Some(slot) = &self.draft
+            && let Err(err) = slot.remove(slot.ticket())
+        {
+            eprintln!("shepherd: couldn't remove the draft {}: {err}", slot.file().display());
+        }
     }
 
     fn go_to_line(&mut self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
@@ -747,12 +1163,25 @@ impl FileEditor {
     /// one runs, one more is queued (typing since is saved too) and the task answers for that one. `None` when there
     /// is nothing to save it from (read-only, not text).
     pub fn save(&mut self, mode: SaveMode, window: &mut Window, cx: &mut Context<Self>) -> Option<Saving> {
+        self.save_as(mode, false, window, cx)
+    }
+
+    /// `save`; `explicit` (Ctrl/Cmd+S) asks about a newer version on disk rather than leaving the banner.
+    fn save_as(&mut self, mode: SaveMode, explicit: bool, window: &mut Window, cx: &mut Context<Self>) -> Option<Saving> {
         let Body::Edit(e) = &self.body else { return None };
         if e.readonly.is_some() {
             return None;
         }
+        // restored over a file changed since it was kept: the disk's version is not written over unasked
+        if matches!(self.restored, Some((_, Restore::Stale))) && matches!(mode, SaveMode::Safe | SaveMode::InPlace) {
+            if explicit {
+                self.ask_overwrite(None, window, cx);
+            }
+            return Some(futures::future::ready(false).boxed_local().shared());
+        }
         if let Some(current) = self.saving.clone() {
             self.queued = Some(mode);
+            self.explicit |= explicit;
             let follow = cx.spawn_in(window, async move |this, cx| {
                 let first = current.await;
                 // the queued one started as that one ended (`saved`), unless that one failed or left nothing to save
@@ -763,6 +1192,7 @@ impl FileEditor {
             });
             return Some(follow.boxed_local().shared());
         }
+        self.explicit = explicit;
         self.start_save(mode, window, cx)
     }
 
@@ -777,13 +1207,18 @@ impl FileEditor {
         let Body::Edit(e) = &mut self.body else { return None };
         let ticket = e.tracker.start_save()?;
         let rope: Rope = e.state.read(cx).text().clone();
-        let (baseline, path, generation) = (e.baseline.clone(), self.path.clone(), self.generation);
-        let job = self.rt.spawn_blocking(move || {
-            let text = rope_text(&rope);
-            let saved = save::save(&root, &path, &text, &baseline, mode);
-            (Arc::new(text), saved)
+        let (baseline, path, generation, kept) = (e.baseline.clone(), self.path.clone(), self.generation, self.kept);
+        // the answer comes from a runtime task, not the blocking thread itself (gpui's test scheduler hears tasks
+        // woken from its own thread only)
+        let job = self.rt.spawn(async move {
+            let save = tokio::task::spawn_blocking(move || {
+                let text = rope_text(&rope);
+                let saved = save_kept(&root, &path, &text, &baseline, mode, kept);
+                (Arc::new(text), saved)
+            });
+            save.await.ok()
         });
-        let job = job.map(|done| done.ok()).boxed().shared();
+        let job = job.map(|done| done.ok().flatten()).boxed().shared();
         self.writing = Some(job.clone().map(|_| ()).boxed().shared());
         cx.emit(EditorEvent::Dirty(e.tracker.is_dirty()));
         cx.notify();
@@ -806,6 +1241,7 @@ impl FileEditor {
         }
         (self.saving, self.writing) = (None, None);
         let queued = self.queued.take();
+        let explicit = std::mem::take(&mut self.explicit);
         let Body::Edit(e) = &mut self.body else { return false };
         let (written, result) = match done {
             Ok((text, Ok(baseline))) => {
@@ -832,15 +1268,34 @@ impl FileEditor {
         };
         match result {
             Ok(()) => {
-                self.banner = None;
+                // what was kept over is written over, and a restored draft's question answered
+                (self.banner, self.kept, self.restored) = (None, None, None);
+                self.note_dirty();
+                if dirty {
+                    // typed during the save: the draft again, over the version just written
+                    self.drafted = 0;
+                    self.write_draft(cx);
+                } else {
+                    self.remove_draft();
+                }
                 // typed during it and asked again: one more
                 if let Some(mode) = queued.filter(|_| dirty) {
+                    self.explicit = explicit;
                     let _ = self.start_save(mode, window, cx);
+                } else {
+                    // anything written meanwhile by another program is heard now, not only at its next event
+                    self.check_disk(false, window, cx);
                 }
                 true
             }
+            Err(SaveError::Conflict) if explicit => {
+                // the look tells which version is there, the one Overwrite may write over
+                self.ask_on_look = true;
+                self.check_disk(true, window, cx);
+                false
+            }
             Err(SaveError::Conflict) => {
-                self.banner = Some(Banner::Conflict);
+                self.check_disk(true, window, cx);
                 false
             }
             Err(SaveError::Deleted) => {
@@ -880,38 +1335,322 @@ impl FileEditor {
         .detach();
     }
 
-    /// The conflict banner's Overwrite and the deleted one's Save anyway: the buffer is written over what changed
-    /// on disk, or where the file was.
-    fn overwrite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.save(SaveMode::Overwrite, window, cx);
-    }
-
-    /// The conflict banner's Reload: the file as it is on disk, the cursor and scroll kept; unsaved changes are
-    /// dropped only once that is confirmed.
-    fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.is_dirty() {
-            return self.reload_now(window, cx);
-        }
-        let detail = "The file is read again from disk; your changes here are lost.";
-        let answer = window.prompt(PromptLevel::Warning, "Discard your changes?", Some(detail), &["Discard", "Cancel"], cx);
+    /// Ctrl/Cmd+S found a newer version on disk (`seen`; none: a restored draft's file, changed since it was kept):
+    /// Overwrite that version, Compare the two, or Cancel (the banner stays).
+    fn ask_overwrite(&mut self, seen: Option<Seen>, window: &mut Window, cx: &mut Context<Self>) {
+        let detail = "The file changed on disk since you opened it. Overwrite writes your text over it; Compare shows the two side by side.";
+        let answer = window.prompt(PromptLevel::Warning, "Overwrite the newer version on disk?", Some(detail), &["Overwrite", "Compare", "Cancel"], cx);
         let generation = self.generation;
         cx.spawn_in(window, async move |this, cx| {
-            if answer.await == Ok(0) {
-                let _ = this.update_in(cx, |e, window, cx| {
-                    if e.generation == generation {
-                        e.reload_now(window, cx);
-                    }
-                });
-            }
+            let answer = answer.await.ok();
+            let _ = this.update_in(cx, |e, window, cx| {
+                if e.generation != generation {
+                    return;
+                }
+                match answer {
+                    Some(0) => e.overwrite(seen, window, cx),
+                    Some(1) => e.compare(window, cx),
+                    _ => {}
+                }
+            });
         })
         .detach();
     }
 
+    /// The banner's and the prompt's Overwrite: the buffer is written over the version on disk the user saw
+    /// (`seen`; none: the one it was opened over), and only that one; another change since shows the banner again.
+    fn overwrite(&mut self, seen: Option<Seen>, window: &mut Window, cx: &mut Context<Self>) {
+        if seen.is_some() {
+            self.kept = seen;
+        }
+        if self.restored.take().is_some() && matches!(self.banner, Some(Banner::Restored { .. })) {
+            self.banner = None;
+        }
+        let _ = self.save(SaveMode::Safe, window, cx);
+    }
+
+    /// The deleted file's Save anyway: the file made again where it was, unless one is there again meanwhile.
+    fn save_anyway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.save(SaveMode::Recreate, window, cx);
+    }
+
+    /// The banner's Keep mine: the version on disk it names is the one the next save writes over; another change
+    /// on disk asks again.
+    fn keep_mine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.banner {
+            Some(Banner::Changed { disk, .. }) => (self.kept, self.banner) = (Some(disk), None),
+            // restored over the disk's newer version: saving writes over it now
+            Some(Banner::Restored { .. }) => (self.banner, self.restored) = (None, None),
+            _ => {}
+        }
+        self.note_dirty();
+        self.end_compare(window, cx);
+        cx.notify();
+    }
+
+    /// A restored draft's Dismiss: answered, so from here on the buffer's own changes are what counts.
+    fn dismiss_restored(&mut self, cx: &mut Context<Self>) {
+        (self.banner, self.restored) = (None, None);
+        self.note_dirty();
+        cx.emit(EditorEvent::Dirty(self.is_dirty()));
+        cx.notify();
+    }
+
+    /// A restored draft's Discard: the draft goes, and the buffer is the file's again.
+    fn discard_restored(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.discard_draft();
+        (self.banner, self.restored) = (None, None);
+        self.discard(window, cx);
+    }
+
+    /// The banner's Reload: the disk's text in place, the unsaved changes dropped (undo still has them).
+    fn discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.end_compare(window, cx);
+        self.reload_in_place(true, window, cx);
+    }
+
+    /// Reads the file again and puts its text in the buffer as one edit, the cursor and scroll kept; `discard`
+    /// drops unsaved changes, else a buffer edited meanwhile is left alone (and the banner asks). Text that no
+    /// longer opens editable (binary now, too large) goes to the viewer.
+    fn reload_in_place(&mut self, discard: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let (path, root, generation) = (self.path.clone(), self.root.clone(), self.generation);
+        let job = self.rt.spawn(async move {
+            let read = tokio::task::spawn_blocking(move || read_for_edit(&path, root.as_deref(), false));
+            tokio::time::timeout(LOAD_TIMEOUT, read).await.ok().and_then(Result::ok)
+        });
+        self.disk_reload = Some(cx.spawn_in(window, async move |this, cx| {
+            let Ok(Some(loaded)) = job.await else { return };
+            let _ = this.update_in(cx, |e, window, cx| {
+                if e.generation != generation {
+                    return;
+                }
+                match loaded {
+                    Loaded::Edit(file) => e.put_in_place(*file, discard, window, cx),
+                    // typed (or saving) meanwhile: kept, and the banner asks
+                    Loaded::View(_) if e.keeps_buffer(discard) => e.check_disk(false, window, cx),
+                    Loaded::View(_) => e.reload_now(window, cx),
+                }
+            });
+        }));
+    }
+
+    fn put_in_place(&mut self, file: Editable, discard: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let place = self.place(cx);
+        // a save began meanwhile (it looks again when it ends), or typing did and nothing is to be dropped
+        if self.keeps_buffer(discard) {
+            return self.check_disk(false, window, cx);
+        }
+        // the disk's text chosen over a restored draft: the draft goes with it
+        if self.restored.take().is_some() {
+            self.remove_draft();
+        }
+        let Body::Edit(e) = &mut self.body else { return };
+        // the baseline and the saved text first: the buffer's change below is compared with them
+        rebase(&mut e.tracker, &mut e.baseline, &file);
+        let Editable { text, readonly, blocks, real_root, .. } = file;
+        (e.readonly, e.blocks, e.real_root) = (readonly, blocks, real_root);
+        e.state.update(cx, |s, cx| {
+            s.set_readonly(readonly.is_some(), cx);
+            s.replace_all(text, window, cx);
+            if let Some(place) = place {
+                // the cursor where it was, on a line the text still has
+                let last = s.text().lines_len().saturating_sub(1) as u32;
+                let offset = s.text().position_to_offset(&Position::new(place.line.min(last), place.column));
+                s.set_selected_range(offset..offset, cx);
+                s.set_scroll_offset(point(px(0.), px(place.scroll_y)), cx);
+            }
+        });
+        if matches!(self.banner, Some(Banner::Changed { .. } | Banner::Deleted | Banner::Restored { .. })) {
+            self.banner = None;
+        }
+        self.kept = None;
+        // the dot now, not only when the buffer's change is heard
+        self.changed(cx);
+        cx.notify();
+    }
+
+    /// Reads the file again from scratch (as opening it): for text that no longer opens editable in place.
     fn reload_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let place = self.place(cx);
         let (path, root) = (self.path.clone(), self.root.clone());
         self.load(path, None, root, place, false, window, cx);
         cx.emit(EditorEvent::Dirty(false));
+    }
+
+    /// The banner's Compare: the disk's text (left) against the buffer (right) in the text's place, read again
+    /// when the disk changes while it shows.
+    fn compare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Body::Edit(e) = &self.body else { return };
+        let rope: Rope = e.state.read(cx).text().clone();
+        let (path, generation) = (self.path.clone(), self.generation);
+        let read = path.clone();
+        let job = self.rt.spawn(async move {
+            let texts = tokio::task::spawn_blocking(move || disk_text(&read).map(|disk| (disk, rope_text(&rope))));
+            tokio::time::timeout(LOAD_TIMEOUT, texts).await.ok().and_then(Result::ok).unwrap_or(Err("Can't compare: the file on disk didn't answer"))
+        });
+        let rt = self.rt.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let texts = job.await.unwrap_or(Err("Can't compare: the file on disk didn't answer"));
+            let _ = this.update_in(cx, |e, window, cx| {
+                if e.generation != generation {
+                    return;
+                }
+                let (disk, mine) = match texts {
+                    Ok(texts) => texts,
+                    Err(why) => return crate::ui::toast::error(cx, why),
+                };
+                let (disk, mine) = (Arc::new(disk), Arc::new(mine));
+                if let Some(view) = &e.compare {
+                    view.update(cx, |v, cx| v.set_texts(disk, mine, cx));
+                    return;
+                }
+                let had = e.focus_handle(cx).contains_focused(window, cx);
+                let view = cx.new(|cx| DiffView::compare(rt, path, disk, mine, ("On disk", "Yours"), cx));
+                e.compare = Some(view);
+                if had {
+                    let handle = e.focus_handle(cx);
+                    window.focus(&handle, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Back from a Compare to the text.
+    fn end_compare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.compare.take() else { return };
+        let had = view.read(cx).focus_handle(cx).contains_focused(window, cx);
+        view.update(cx, |v, _| v.release());
+        if had {
+            let handle = self.focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+        cx.notify();
+    }
+
+    /// Hears of changes to the file through its folder's shared watch (`files::dir_watch`), subscribed on the
+    /// runtime's blocking pool (a dead mount can hang it); a burst is heard `DISK_AFTER` after its first event, on
+    /// the runtime, and the editor looks at the disk then. The subscription goes with the editor's task (the
+    /// runtime's sees its channel close). A folder that can't be watched, or one made again since, leaves the looks
+    /// to the tab showing and the window coming to the front.
+    fn watch_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(dir), Some(name)) = (self.path.parent().map(PathBuf::from), self.path.file_name().map(std::ffi::OsString::from)) else { return };
+        let (out, mut heard) = tokio::sync::mpsc::unbounded_channel::<()>();
+        self.rt.spawn(async move {
+            let subscribe = tokio::task::spawn_blocking(move || crate::files::dir_watch::global().subscribe(&dir, &name));
+            let Ok(Ok((subscription, mut events))) = tokio::time::timeout(LOAD_TIMEOUT, subscribe).await else { return };
+            loop {
+                tokio::select! {
+                    got = events.recv() => if got.is_none() { break },
+                    _ = out.closed() => break,
+                }
+                tokio::time::sleep(DISK_AFTER).await;
+                while events.try_recv().is_ok() {}
+                if out.send(()).is_err() {
+                    break;
+                }
+            }
+            // the last editor of a folder takes its watch away: off the runtime's threads
+            let _ = tokio::task::spawn_blocking(move || drop(subscription)).await;
+        });
+        let generation = self.generation;
+        self.disk_watch = Some(cx.spawn_in(window, async move |this, cx| {
+            while heard.recv().await.is_some() {
+                let looked = this.update_in(cx, |e, window, cx| {
+                    if e.generation == generation {
+                        e.check_disk(false, window, cx);
+                    }
+                });
+                if looked.is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// Looks at the file on disk off the main thread and acts on it (`decide`): not while a save runs (it looks when
+    /// it ends). `after_save`: a save found the disk changed, which the banner says.
+    fn check_disk(&mut self, after_save: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Body::Edit(e) = &self.body else { return };
+        if e.tracker.saving() {
+            return;
+        }
+        let (path, baseline, generation) = (self.path.clone(), e.baseline.clone(), self.generation);
+        let checked = baseline.bytes.clone();
+        let job = self.rt.spawn(async move {
+            let look = tokio::task::spawn_blocking(move || look(&path, &baseline));
+            tokio::time::timeout(LOAD_TIMEOUT, look).await.ok().and_then(Result::ok).flatten()
+        });
+        self.disk_check = Some(cx.spawn_in(window, async move |this, cx| {
+            match job.await {
+                Ok(Some(disk)) => {
+                    let _ = this.update_in(cx, |e, window, cx| e.on_disk(generation, &checked, disk, after_save, window, cx));
+                }
+                // a save that wrote nothing still says so when the disk can't tell why
+                _ if after_save => {
+                    let _ = this.update(cx, |e, cx| e.save_not_written(generation, cx));
+                }
+                _ => {}
+            }
+        }));
+    }
+
+    /// A save found the disk changed, and the look after can't say how (it failed, or the disk is back as opened):
+    /// the banner says the save was not written.
+    fn save_not_written(&mut self, generation: u64, cx: &mut Context<Self>) {
+        if generation == self.generation {
+            self.ask_on_look = false;
+            self.banner = Some(Banner::Failed(SaveError::Conflict.to_string()));
+            cx.notify();
+        }
+    }
+
+    fn on_disk(&mut self, generation: u64, checked: &Arc<Vec<u8>>, disk: Disk, after_save: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Body::Edit(e) = &self.body else { return };
+        // another file since, or a save began or ended since the look: that one looks again
+        if generation != self.generation || e.tracker.saving() || !Arc::ptr_eq(&e.baseline.bytes, checked) {
+            return;
+        }
+        // an unanswered restored draft counts as unsaved: never reloaded over
+        let dirty = e.tracker.is_dirty() || self.restored.is_some();
+        let ask = std::mem::take(&mut self.ask_on_look);
+        match decide(dirty, disk, self.kept) {
+            OnDisk::Nothing => {}
+            OnDisk::Clear if after_save => self.save_not_written(generation, cx),
+            OnDisk::Clear => {
+                self.kept = None;
+                if matches!(self.banner, Some(Banner::Changed { .. } | Banner::Deleted)) {
+                    self.banner = None;
+                    cx.notify();
+                }
+            }
+            OnDisk::Reload => self.reload_in_place(false, window, cx),
+            OnDisk::Banner => {
+                let Disk::Changed(seen) = disk else { return };
+                let save = after_save || matches!(self.banner, Some(Banner::Changed { save: true, .. }));
+                let banner = Some(Banner::Changed { disk: seen, save });
+                if self.banner != banner {
+                    self.banner = banner;
+                    cx.notify();
+                }
+                if ask {
+                    self.ask_overwrite(Some(seen), window, cx);
+                }
+            }
+            // a draft restored over nothing says so already
+            OnDisk::Deleted if matches!(self.banner, Some(Banner::Restored { on: Restore::Deleted, .. })) => {}
+            OnDisk::Deleted => {
+                if self.banner != Some(Banner::Deleted) {
+                    self.banner = Some(Banner::Deleted);
+                    cx.notify();
+                }
+            }
+        }
+        // a Compare showing takes the disk's new text
+        if self.compare.is_some() && matches!(disk, Disk::Changed(_)) {
+            self.compare(window, cx);
+        }
     }
 
     fn open_in_editor(&mut self, cx: &mut Context<Self>) {
@@ -1117,7 +1856,7 @@ impl FileEditor {
             .hover(move |s| s.bg(hover))
     }
 
-    /// The strip under the header for a save's trouble (E2 puts the disk's changes here too).
+    /// The strip under the header for a save's trouble or the disk's changes.
     fn banner(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let banner = self.banner.as_ref()?;
         let strip = div()
@@ -1134,14 +1873,70 @@ impl FileEditor {
             .font_family(theme.font_ui.clone())
             .text_size(px(12.5));
         Some(match banner {
-            Banner::Conflict => strip
-                .child(div().flex_1().min_w_0().text_color(theme.text).child("The file changed on disk since it was opened."))
-                .child(Self::button(theme, "editor-overwrite").child("Overwrite").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.overwrite(window, cx))))
-                .child(Self::button(theme, "editor-reload").child("Reload").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.reload(window, cx))))
-                .into_any_element(),
+            Banner::Changed { disk, save } => {
+                let disk = *disk;
+                let said = if *save { "The file changed on disk, so your save was not written." } else { "The file changed on disk." };
+                let keep = if *save {
+                    Self::button(theme, "editor-overwrite").child("Overwrite").on_click(cx.listener(move |e, _: &ClickEvent, window, cx| e.overwrite(Some(disk), window, cx)))
+                } else {
+                    Self::button(theme, "editor-keep-mine").child("Keep mine").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.keep_mine(window, cx)))
+                };
+                let compare = if self.compare.is_some() {
+                    Self::button(theme, "editor-back").child("Back to editor").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.end_compare(window, cx)))
+                } else {
+                    Self::button(theme, "editor-compare").child("Compare").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.compare(window, cx)))
+                };
+                strip
+                    .child(div().flex_1().min_w_0().text_color(theme.text).child(said))
+                    .child(compare)
+                    .child(keep)
+                    .child(
+                        Self::button(theme, "editor-reload")
+                            .child("Reload")
+                            .tooltip(tip("Take the disk's version; undo brings yours back", None))
+                            .on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.discard(window, cx))),
+                    )
+                    .into_any_element()
+            }
             Banner::Deleted => strip
-                .child(div().flex_1().min_w_0().text_color(theme.text).child("Deleted on disk."))
-                .child(Self::button(theme, "editor-save-anyway").child("Save anyway").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.overwrite(window, cx))))
+                .child(div().flex_1().min_w_0().text_color(theme.text).child("Deleted or moved on disk."))
+                .child(Self::button(theme, "editor-save-anyway").child("Save anyway").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.save_anyway(window, cx))))
+                .child(Self::button(theme, "editor-close").child("Close").on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(EditorEvent::Close))))
+                .into_any_element(),
+            Banner::Restored { ago, on } => {
+                let said = match on {
+                    Restore::Fresh => format!("Restored unsaved changes kept {ago}."),
+                    Restore::Stale => format!("Restored unsaved changes kept {ago}; the file changed on disk since."),
+                    Restore::Deleted => format!("Restored unsaved changes kept {ago}; the file is no longer on disk."),
+                };
+                let discard = Self::button(theme, "editor-discard-draft")
+                    .child("Discard")
+                    .tooltip(tip("Drop the restored changes and show the file as it is on disk", None))
+                    .on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.discard_restored(window, cx)));
+                let strip = strip.child(div().flex_1().min_w_0().text_color(theme.text).child(said));
+                match on {
+                    Restore::Fresh => strip.child(Self::button(theme, "editor-dismiss").child("Dismiss").on_click(cx.listener(|e, _: &ClickEvent, _, cx| e.dismiss_restored(cx)))),
+                    Restore::Stale => {
+                        let compare = if self.compare.is_some() {
+                            Self::button(theme, "editor-back").child("Back to editor").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.end_compare(window, cx)))
+                        } else {
+                            Self::button(theme, "editor-compare").child("Compare").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.compare(window, cx)))
+                        };
+                        strip
+                            .child(compare)
+                            .child(Self::button(theme, "editor-keep-mine").child("Keep mine").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.keep_mine(window, cx))))
+                    }
+                    Restore::Deleted => strip.child(Self::button(theme, "editor-save-anyway").child("Save anyway").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.save_anyway(window, cx)))),
+                }
+                .child(discard)
+                .into_any_element()
+            }
+            Banner::Info(said) => strip
+                .child(div().flex_1().min_w_0().text_color(theme.text).child(said.clone()))
+                .child(Self::button(theme, "editor-dismiss").child("Dismiss").on_click(cx.listener(|e, _: &ClickEvent, _, cx| {
+                    e.banner = None;
+                    cx.notify();
+                })))
                 .into_any_element(),
             Banner::Failed(why) => strip
                 .child(div().flex_1().min_w_0().text_color(theme.text).child(format!("Couldn't save: {why}")))
@@ -1168,8 +1963,12 @@ impl FileEditor {
             .text_size(px(12.5))
             .text_color(theme.text_muted);
         match note {
-            Note::LongLines => strip
-                .child(div().flex_1().min_w_0().truncate().child(format!("A line is longer than {} characters: shown read-only.", group(MAX_EDIT_LINE))))
+            Note::LongLines { draft } => strip
+                .child(div().flex_1().min_w_0().truncate().child(if draft {
+                    format!("A line is longer than {} characters: shown read-only. Your unsaved changes are kept; Edit anyway brings them back.", group(MAX_EDIT_LINE))
+                } else {
+                    format!("A line is longer than {} characters: shown read-only.", group(MAX_EDIT_LINE))
+                }))
                 .child(Self::button(theme, "editor-edit-anyway").child("Edit anyway").on_click(cx.listener(|e, _: &ClickEvent, window, cx| {
                     let (path, root) = (e.path.clone(), e.root.clone());
                     e.load(path, None, root, None, true, window, cx);
@@ -1182,6 +1981,10 @@ impl FileEditor {
                     group(MAX_EDIT_LINES)
                 )))
                 .into_any_element(),
+            Note::Draft => {
+                let file = self.drafts.as_deref().map(|d| d.join(drafts::key(&self.path))).unwrap_or_default();
+                strip.child(div().flex_1().min_w_0().truncate().child(format!("It no longer opens for editing; your unsaved changes are kept in {}", file.display()))).into_any_element()
+            }
         }
     }
 
@@ -1240,6 +2043,52 @@ impl FileEditor {
             .into_any_element()
     }
 
+    /// The strips under the header, in order: a save's trouble, the disk's changes.
+    fn banners(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out: Vec<AnyElement> = self.banner(theme, cx).into_iter().collect();
+        // a Compare with no banner to leave it by (the disk went back, or Keep mine came from elsewhere)
+        if self.compare.is_some() && !matches!(self.banner, Some(Banner::Changed { .. } | Banner::Restored { on: Restore::Stale, .. })) {
+            let strip = div()
+                .flex_none()
+                .min_h(px(32.))
+                .px(px(12.))
+                .py(px(4.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .border_b_1()
+                .border_color(theme.border)
+                .font_family(theme.font_ui.clone())
+                .text_size(px(12.5))
+                .child(div().flex_1().min_w_0().text_color(theme.text_muted).child("The file on disk against your text."))
+                .child(Self::button(theme, "editor-back").child("Back to editor").on_click(cx.listener(|e, _: &ClickEvent, window, cx| e.end_compare(window, cx))));
+            out.push(strip.into_any_element());
+        }
+        out
+    }
+
+    /// What sits between the banners and the text (a find bar): none yet.
+    fn overlays(&self, _theme: &Theme, _cx: &mut Context<Self>) -> Vec<AnyElement> {
+        Vec::new()
+    }
+
+    /// The text: a Compare, markdown's preview, or the editor.
+    fn body_element(&self, e: &Edit, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(compare) = &self.compare {
+            compare.clone().into_any_element()
+        } else if self.preview_shown() {
+            // a press in the preview gives it the keyboard (its selection is ui::markdown's)
+            let preview = self.preview_body(e, theme, cx);
+            div()
+                .size_full()
+                .on_mouse_down(MouseButton::Left, cx.listener(|e, _, window, cx| window.focus(&e.focus, cx)))
+                .child(preview)
+                .into_any_element()
+        } else {
+            self.code(e, theme)
+        }
+    }
+
     fn preview_body(&self, e: &Edit, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let blocks = e.blocks.as_deref().unwrap_or_default();
         let links = match &e.real_root {
@@ -1287,7 +2136,7 @@ impl Render for FileEditor {
             .on_key_down(cx.listener(|e, ev: &KeyDownEvent, window, cx| e.key(ev, window, cx)))
             // the editor's text and a markdown preview's alike
             .on_action(cx.listener(|e, _: &SaveFile, window, cx| {
-                let _ = e.save(SaveMode::Safe, window, cx);
+                let _ = e.save_as(SaveMode::Safe, true, window, cx);
             }))
             .size_full()
             .flex()
@@ -1300,20 +2149,15 @@ impl Render for FileEditor {
                 root.children(note).child(div().flex_1().min_h_0().child(viewer.clone())).into_any_element()
             }
             Body::Edit(e) => {
-                let body = if self.preview_shown() {
-                    // a press in the preview gives it the keyboard (its selection is ui::markdown's)
-                    let preview = self.preview_body(e, theme, cx);
-                    div()
-                        .size_full()
-                        .on_mouse_down(MouseButton::Left, cx.listener(|e, _, window, cx| window.focus(&e.focus, cx)))
-                        .child(preview)
-                        .into_any_element()
-                } else {
-                    self.code(e, theme)
-                };
                 let header = self.header(theme, cx);
-                let banner = self.banner(theme, cx);
-                root.child(header).children(banner).child(div().flex_1().min_h_0().overflow_hidden().child(body)).into_any_element()
+                let banners = self.banners(theme, cx);
+                let overlays = self.overlays(theme, cx);
+                let body = self.body_element(e, theme, cx);
+                root.child(header)
+                    .children(banners)
+                    .children(overlays)
+                    .child(div().flex_1().min_h_0().overflow_hidden().child(body))
+                    .into_any_element()
             }
         }
     }
@@ -1395,7 +2239,7 @@ mod tests {
             Loaded::View(_) => panic!("editable"),
         }
         let long = file("min.js", format!("{}\n", "x".repeat(MAX_EDIT_LINE + 1)).as_bytes());
-        assert!(matches!(read_for_edit(&long, Some(dir.path()), false), Loaded::View(Some(Note::LongLines))));
+        assert!(matches!(read_for_edit(&long, Some(dir.path()), false), Loaded::View(Some(Note::LongLines { draft: false }))));
         assert!(matches!(read_for_edit(&long, Some(dir.path()), true), Loaded::Edit(_)), "Edit anyway");
         let binary = file("b.bin", b"\0\x01\x02");
         assert!(matches!(read_for_edit(&binary, Some(dir.path()), false), Loaded::View(None)));
@@ -1405,6 +2249,567 @@ mod tests {
             Loaded::Edit(e) => assert!(e.readonly.is_some()),
             Loaded::View(_) => panic!("editable"),
         }
+    }
+
+    #[test]
+    fn the_disk_s_changes_are_decided_by_dirt_and_what_was_kept() {
+        let (v1, v2) = (Seen { len: 3, hash: 1 }, Seen { len: 3, hash: 2 });
+        use OnDisk::*;
+        let table = [
+            // (dirty, disk, kept) -> what happens
+            (false, Disk::Same, None, Clear),
+            (true, Disk::Same, Some(v1), Clear),
+            (false, Disk::Changed(v1), None, Reload),
+            (false, Disk::Changed(v1), Some(v1), Reload),
+            (true, Disk::Changed(v1), None, Banner),
+            (true, Disk::Changed(v1), Some(v1), Nothing),
+            (true, Disk::Changed(v2), Some(v1), Banner),
+            (false, Disk::Gone, None, Deleted),
+            (true, Disk::Gone, Some(v1), Deleted),
+        ];
+        for (dirty, disk, kept, want) in table {
+            assert_eq!(decide(dirty, disk, kept), want, "dirty {dirty}, {disk:?}, kept {kept:?}");
+        }
+    }
+
+    #[test]
+    fn a_look_at_the_disk_tells_same_changed_and_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let b = Baseline::read(&path).unwrap();
+        assert_eq!(look(&path, &b), Some(Disk::Same));
+        std::fs::write(&path, "two\n").unwrap();
+        assert_eq!(look(&path, &b), Some(Disk::Changed(Seen::of(b"two\n"))));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(look(&path, &b), Some(Disk::Gone), "deleted");
+        // a folder in its place is no file
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(look(&path, &b), Some(Disk::Gone));
+        std::fs::remove_dir(&path).unwrap();
+        // back as it was: the same
+        std::fs::write(&path, "one\n").unwrap();
+        assert_eq!(look(&path, &b), Some(Disk::Same));
+    }
+
+    #[test]
+    fn a_save_writes_over_the_version_kept_and_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let b = Baseline::read(&path).unwrap();
+        std::fs::write(&path, "theirs\n").unwrap();
+        // nothing kept: a conflict
+        assert_eq!(save_kept(dir.path(), &path, "mine\n", &b, SaveMode::Safe, None), Err(SaveError::Conflict));
+        // their version kept: written over
+        let kept = Some(Seen::of(b"theirs\n"));
+        let saved = save_kept(dir.path(), &path, "mine\n", &b, SaveMode::Safe, kept).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine\n");
+        assert_eq!(*saved.bytes, b"mine\n");
+        // a newer version than the one kept: a conflict again
+        std::fs::write(&path, "theirs again\n").unwrap();
+        assert_eq!(save_kept(dir.path(), &path, "mine 2\n", &saved, SaveMode::Safe, kept), Err(SaveError::Conflict));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs again\n");
+        // an Overwrite needs nothing kept
+        save_kept(dir.path(), &path, "mine 2\n", &saved, SaveMode::Overwrite, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine 2\n");
+    }
+
+    #[test]
+    fn a_reload_in_place_leaves_the_tracker_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn a() {}\r\n").unwrap();
+        let Loaded::Edit(old) = read_for_edit(&path, Some(dir.path()), false) else { panic!("editable") };
+        let mut baseline = old.baseline.clone();
+        let mut tracker = Tracker::new(saved_text(&baseline, &old.text));
+        // unsaved changes, then the disk's new text taken in place
+        tracker.changed(5, ["mine\n"]);
+        assert!(tracker.is_dirty());
+        std::fs::write(&path, "fn b() {}\r\n").unwrap();
+        let Loaded::Edit(file) = read_for_edit(&path, Some(dir.path()), false) else { panic!("editable") };
+        rebase(&mut tracker, &mut baseline, &file);
+        assert_eq!(*baseline.bytes, b"fn b() {}\r\n", "the disk's version is the baseline");
+        // the buffer's change to that text is heard after: clean, the dot going
+        assert!(tracker.changed(file.text.len(), [file.text.as_str()]));
+        assert!(!tracker.is_dirty());
+        // undo back to what was typed: dirty again
+        assert!(tracker.changed(5, ["mine\n"]));
+    }
+
+    /// A runtime driven on the test's thread (`settle`): gpui's test scheduler hears tasks woken from there only.
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    /// Runs a runtime future, failing in seconds rather than hanging (and holding the build lock).
+    fn guarded<T>(rt: &tokio::runtime::Runtime, f: impl std::future::Future<Output = T>) -> T {
+        rt.block_on(async { tokio::time::timeout(Duration::from_secs(10), f).await.expect("timed out") })
+    }
+
+    /// Runs the window's tasks and the runtime's until `done` holds (at most a few seconds).
+    fn settle(rt: &tokio::runtime::Runtime, cx: &mut gpui::VisualTestContext, mut done: impl FnMut(&mut gpui::VisualTestContext) -> bool) {
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            rt.block_on(async { tokio::time::sleep(Duration::from_millis(5)).await });
+        }
+        panic!("never settled");
+    }
+
+    /// A window with an editor on `path` (in `root`), once its text is in.
+    fn editor_on(cx: &mut gpui::TestAppContext, rt: &tokio::runtime::Runtime, root: &Path, path: &Path) -> (Entity<FileEditor>, &'static mut gpui::VisualTestContext) {
+        editor_with_drafts(cx, rt, root, path, None)
+    }
+
+    fn editor_with_drafts(
+        cx: &mut gpui::TestAppContext,
+        rt: &tokio::runtime::Runtime,
+        root: &Path,
+        path: &Path,
+        drafts: Option<&Path>,
+    ) -> (Entity<FileEditor>, &'static mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(crate::settings::Settings::default().theme(gpui::WindowAppearance::Dark));
+        });
+        let handle = rt.handle().clone();
+        let (editor, cx) = cx.add_window_view(|_, cx| FileEditor::new(handle, cx));
+        let cx: &'static mut gpui::VisualTestContext = Box::leak(Box::new(cx.clone()));
+        open_again(&editor, cx, rt, root, path, drafts);
+        (editor, cx)
+    }
+
+    /// `editor` on `path` once more, from scratch (as the next run would), its drafts in `drafts`.
+    fn open_again(editor: &Entity<FileEditor>, cx: &mut gpui::VisualTestContext, rt: &tokio::runtime::Runtime, root: &Path, path: &Path, drafts: Option<&Path>) {
+        let (path, root, drafts) = (path.to_path_buf(), root.to_path_buf(), drafts.map(PathBuf::from));
+        editor.update_in(cx, |e, window, cx| {
+            e.drafts = drafts;
+            // another path first, so this one is read afresh
+            e.path = PathBuf::new();
+            e.open(path, None, Some(root), None, window, cx)
+        });
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| matches!(e.body, Body::Edit(_))));
+    }
+
+    fn type_text(editor: &Entity<FileEditor>, cx: &mut gpui::VisualTestContext, rt: &tokio::runtime::Runtime, text: &'static str) {
+        editor.update_in(cx, |e, window, cx| {
+            let state = e.editor_state().unwrap().clone();
+            state.update(cx, |s, cx| s.replace_all(text, window, cx));
+        });
+        settle(rt, cx, |cx| text_of(editor, cx) == text);
+    }
+
+    /// Lets the runtime's writes and removals run.
+    fn rounds(rt: &tokio::runtime::Runtime, cx: &mut gpui::VisualTestContext, n: usize) {
+        let mut k = 0;
+        settle(rt, cx, |_| {
+            k += 1;
+            k > n
+        });
+    }
+
+    #[gpui::test]
+    fn a_draft_kept_on_hiding_comes_back_and_goes_when_undone_to_clean(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let (dir, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let drafts = home.path().join("drafts");
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let (editor, cx) = editor_with_drafts(cx, rt, dir.path(), &path, Some(&drafts));
+        let kept = drafts.join(drafts::key(&path));
+        type_text(&editor, cx, rt, "mine\n");
+        assert!(!kept.exists(), "not before typing stops or the tab hides");
+        editor.update(cx, |e, cx| e.hide(None, cx));
+        settle(rt, cx, |_| kept.exists());
+        // the next run: the draft over the file, unsaved, saying so
+        open_again(&editor, cx, rt, dir.path(), &path, Some(&drafts));
+        assert_eq!(text_of(&editor, cx), "mine\n");
+        editor.read_with(cx, |e, _| {
+            assert!(e.is_dirty());
+            assert!(matches!(&e.banner, Some(Banner::Restored { on: Restore::Fresh, .. })), "{:?}", e.banner);
+        });
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\n", "the file is untouched");
+        // answered, then typed back to the file's text: clean, and the draft goes
+        editor.update(cx, |e, cx| e.dismiss_restored(cx));
+        type_text(&editor, cx, rt, "one\n");
+        settle(rt, cx, |_| !kept.exists());
+    }
+
+    #[gpui::test]
+    fn a_draft_goes_with_a_save_and_with_dont_save(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let (dir, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let drafts = home.path().join("drafts");
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let (editor, cx) = editor_with_drafts(cx, rt, dir.path(), &path, Some(&drafts));
+        let kept = drafts.join(drafts::key(&path));
+        type_text(&editor, cx, rt, "mine\n");
+        editor.update(cx, |e, cx| e.hide(None, cx));
+        settle(rt, cx, |_| kept.exists());
+        drop(editor.update_in(cx, |e, window, cx| e.save(SaveMode::Safe, window, cx)).unwrap());
+        settle(rt, cx, |_| !kept.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine\n");
+        // Don't Save: gone at once, before the quit or the close goes on
+        type_text(&editor, cx, rt, "more\n");
+        editor.update(cx, |e, cx| e.hide(None, cx));
+        settle(rt, cx, |_| kept.exists());
+        editor.update(cx, |e, _| e.discard_draft());
+        assert!(!kept.exists());
+        rounds(rt, cx, 20);
+        assert!(!kept.exists(), "no write lands after it");
+    }
+
+    #[gpui::test]
+    fn a_draft_over_a_changed_or_deleted_file_says_so_and_a_save_waits(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let (dir, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let drafts = home.path().join("drafts");
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let (editor, cx) = editor_with_drafts(cx, rt, dir.path(), &path, Some(&drafts));
+        let kept = drafts.join(drafts::key(&path));
+        type_text(&editor, cx, rt, "mine\n");
+        editor.update(cx, |e, cx| e.hide(None, cx));
+        settle(rt, cx, |_| kept.exists());
+        // changed on disk before the next run
+        std::fs::write(&path, "theirs\n").unwrap();
+        open_again(&editor, cx, rt, dir.path(), &path, Some(&drafts));
+        assert_eq!(text_of(&editor, cx), "mine\n");
+        editor.read_with(cx, |e, _| assert!(matches!(&e.banner, Some(Banner::Restored { on: Restore::Stale, .. })), "{:?}", e.banner));
+        let save = editor.update_in(cx, |e, window, cx| e.save(SaveMode::Safe, window, cx)).unwrap();
+        assert_eq!(save.now_or_never(), Some(false), "not written over unasked");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs\n");
+        // Keep mine: then it saves
+        editor.update_in(cx, |e, window, cx| e.keep_mine(window, cx));
+        drop(editor.update_in(cx, |e, window, cx| e.save(SaveMode::Safe, window, cx)).unwrap());
+        settle(rt, cx, |_| std::fs::read_to_string(&path).unwrap() == "mine\n");
+        // deleted before the next run: the draft over nothing
+        type_text(&editor, cx, rt, "again\n");
+        editor.update(cx, |e, cx| e.hide(None, cx));
+        settle(rt, cx, |_| kept.exists());
+        std::fs::remove_file(&path).unwrap();
+        open_again(&editor, cx, rt, dir.path(), &path, Some(&drafts));
+        assert_eq!(text_of(&editor, cx), "again\n");
+        editor.read_with(cx, |e, _| assert!(matches!(&e.banner, Some(Banner::Restored { on: Restore::Deleted, .. })), "{:?}", e.banner));
+    }
+
+    /// Keeps `text` as `path`'s draft through `editor` (typed, then the tab hidden), and waits for it on disk.
+    fn keep_draft(editor: &Entity<FileEditor>, cx: &mut gpui::VisualTestContext, rt: &tokio::runtime::Runtime, drafts: &Path, path: &Path, text: &'static str) {
+        type_text(editor, cx, rt, text);
+        editor.update(cx, |e, cx| e.hide(None, cx));
+        settle(rt, cx, |_| drafts::read(drafts, path).is_some_and(|d| d.text == text));
+    }
+
+    #[gpui::test]
+    fn a_stale_restore_stays_stale_through_a_rewrite_and_a_quit_never_saves_over_it(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let (dir, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let drafts = home.path().join("drafts");
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let (editor, cx) = editor_with_drafts(cx, rt, dir.path(), &path, Some(&drafts));
+        keep_draft(&editor, cx, rt, &drafts, &path, "mine\n");
+        std::fs::write(&path, "theirs\n").unwrap();
+        open_again(&editor, cx, rt, dir.path(), &path, Some(&drafts));
+        editor.read_with(cx, |e, _| assert!(matches!(e.restored, Some((_, Restore::Stale)))));
+        // typed on and hidden: the draft is written again, still over the version it was typed over
+        keep_draft(&editor, cx, rt, &drafts, &path, "mine, more\n");
+        let disk = Baseline::read(&path).unwrap();
+        assert_eq!(drafts::classify(&drafts::read(&drafts, &path).unwrap().header, Some(&disk)), Restore::Stale);
+        // a crash, and the next run: still stale
+        open_again(&editor, cx, rt, dir.path(), &path, Some(&drafts));
+        assert_eq!(text_of(&editor, cx), "mine, more\n");
+        editor.read_with(cx, |e, _| assert!(matches!(&e.banner, Some(Banner::Restored { on: Restore::Stale, .. })), "{:?}", e.banner));
+        // quitting without asking keeps the draft and leaves the newer file alone
+        let flush = editor.read_with(cx, |e, cx| e.flush(true, cx)).expect("something to flush");
+        guarded(rt, flush);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs\n");
+        assert_eq!(drafts::read(&drafts, &path).unwrap().text, "mine, more\n");
+    }
+
+    #[gpui::test]
+    fn undoing_a_restore_keeps_its_draft_and_still_asks(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let (dir, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let drafts = home.path().join("drafts");
+        let path = dir.path().join("a.md");
+        std::fs::write(&path, "# One\n").unwrap();
+        let (editor, cx) = editor_with_drafts(cx, rt, dir.path(), &path, Some(&drafts));
+        keep_draft(&editor, cx, rt, &drafts, &path, "# Mine\n");
+        open_again(&editor, cx, rt, dir.path(), &path, Some(&drafts));
+        editor.read_with(cx, |e, _| assert!(!e.preview, "the restored text shows, not the preview of the file"));
+        // undone to the file's text
+        type_text(&editor, cx, rt, "# One\n");
+        rounds(rt, cx, 20);
+        editor.read_with(cx, |e, _| assert!(e.is_dirty(), "the close still asks"));
+        assert!(drafts::read(&drafts, &path).is_some(), "the draft stays while its banner is unanswered");
+    }
+
+    #[gpui::test]
+    fn another_window_s_unsaved_changes_are_not_restored_over(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let (dir, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let drafts = home.path().join("drafts");
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let (editor, cx) = editor_with_drafts(cx, rt, dir.path(), &path, Some(&drafts));
+        keep_draft(&editor, cx, rt, &drafts, &path, "mine\n");
+        let handle = rt.handle().clone();
+        let other = cx.new(|cx| FileEditor::new(handle, cx));
+        open_again(&other, cx, rt, dir.path(), &path, Some(&drafts));
+        assert_eq!(text_of(&other, cx), "one\n");
+        other.read_with(cx, |e, _| {
+            assert!(matches!(e.banner, Some(Banner::Info(_))), "{:?}", e.banner);
+            assert!(!e.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    fn a_read_only_file_keeps_its_draft_on_disk(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let (dir, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let drafts = home.path().join("drafts");
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let (editor, cx) = editor_with_drafts(cx, rt, dir.path(), &path, Some(&drafts));
+        keep_draft(&editor, cx, rt, &drafts, &path, "mine\n");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+        open_again(&editor, cx, rt, dir.path(), &path, Some(&drafts));
+        assert_eq!(text_of(&editor, cx), "one\n");
+        editor.read_with(cx, |e, _| assert!(matches!(e.banner, Some(Banner::Info(_))), "{:?}", e.banner));
+        assert!(drafts::read(&drafts, &path).is_some());
+    }
+
+    #[gpui::test]
+    fn a_secret_looking_file_gets_no_draft(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let (dir, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let drafts = home.path().join("drafts");
+        let path = dir.path().join(".env");
+        std::fs::write(&path, "TOKEN=one\n").unwrap();
+        let (editor, cx) = editor_with_drafts(cx, rt, dir.path(), &path, Some(&drafts));
+        type_text(&editor, cx, rt, "TOKEN=two\n");
+        editor.update(cx, |e, cx| e.hide(None, cx));
+        rounds(rt, cx, 20);
+        assert!(!drafts.exists() || std::fs::read_dir(&drafts).unwrap().next().is_none(), "nothing copied");
+    }
+
+    #[gpui::test]
+    fn a_reload_falling_back_to_the_viewer_keeps_fresh_typing(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let (editor, cx) = editor_on(cx, rt, dir.path(), &path);
+        type_text(&editor, cx, rt, "typed\n");
+        // binary now: a reload in place would go to the viewer
+        std::fs::write(&path, b"\0\x01\x02").unwrap();
+        editor.update_in(cx, |e, window, cx| e.reload_in_place(false, window, cx));
+        rounds(rt, cx, 40);
+        assert!(editor.read_with(cx, |e, _| matches!(e.body, Body::Edit(_))), "still the editor");
+        assert_eq!(text_of(&editor, cx), "typed\n");
+    }
+
+    #[gpui::test]
+    fn overwrite_writes_over_only_the_version_seen(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let (editor, cx) = editor_on(cx, rt, dir.path(), &path);
+        type_text(&editor, cx, rt, "mine\n");
+        std::fs::write(&path, "theirs\n").unwrap();
+        drop(editor.update_in(cx, |e, window, cx| e.save(SaveMode::Safe, window, cx)).unwrap());
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| matches!(e.banner, Some(Banner::Changed { save: true, .. }))));
+        // newer again before Overwrite is pressed: not written over, the banner names the newer one
+        std::fs::write(&path, "theirs, newer\n").unwrap();
+        editor.update_in(cx, |e, window, cx| e.overwrite(Some(Seen::of(b"theirs\n")), window, cx));
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| e.banner == Some(Banner::Changed { disk: Seen::of(b"theirs, newer\n"), save: true })));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs, newer\n");
+        // over the version seen: written
+        editor.update_in(cx, |e, window, cx| e.overwrite(Some(Seen::of(b"theirs, newer\n")), window, cx));
+        settle(rt, cx, |_| std::fs::read_to_string(&path).unwrap() == "mine\n");
+    }
+
+    #[gpui::test]
+    fn a_save_the_disk_turned_down_says_so_when_the_look_finds_nothing(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let (editor, cx) = editor_on(cx, rt, dir.path(), &path);
+        type_text(&editor, cx, rt, "mine\n");
+        editor.update_in(cx, |e, window, cx| {
+            let (generation, checked) = (e.generation, match &e.body {
+                Body::Edit(edit) => edit.baseline.bytes.clone(),
+                _ => unreachable!(),
+            });
+            // the disk back as opened by the time the look after a refused save ran
+            e.on_disk(generation, &checked, Disk::Same, true, window, cx);
+        });
+        editor.read_with(cx, |e, _| assert!(matches!(e.banner, Some(Banner::Failed(_))), "{:?}", e.banner));
+    }
+
+    #[test]
+    fn a_draft_of_a_file_with_long_lines_waits_for_edit_anyway() {
+        let (dir, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let path = dir.path().join("min.js");
+        std::fs::write(&path, format!("{}\n", "x".repeat(MAX_EDIT_LINE + 1))).unwrap();
+        let base = Baseline::read(&path).unwrap();
+        let header = drafts::Header::new(&path, &base, 1);
+        drafts::write_atomic(home.path(), &drafts::key(&path), &drafts::encode(&header, "mine\n")).unwrap();
+        assert!(matches!(read_with_draft(&path, Some(dir.path()), false, Some(home.path())), Loaded::View(Some(Note::LongLines { draft: true }))));
+        assert!(matches!(read_with_draft(&path, Some(dir.path()), false, None), Loaded::View(Some(Note::LongLines { draft: false }))));
+        match read_with_draft(&path, Some(dir.path()), true, Some(home.path())) {
+            Loaded::Edit(e) => assert_eq!(e.draft.map(|(d, on)| (d.text, on)), Some(("mine\n".to_string(), Restore::Fresh)), "Edit anyway brings it back"),
+            Loaded::View(_) => panic!("editable when forced"),
+        }
+    }
+
+    #[test]
+    fn an_editor_s_unsaved_changes_are_known_to_the_others_of_its_file() {
+        let mut map = std::collections::HashMap::new();
+        let (a, b) = (Path::new("/w/a.rs"), Path::new("/w/b.rs"));
+        note_dirty(&mut map, a, 1, true);
+        assert!(dirty_elsewhere(&map, a, 2));
+        assert!(!dirty_elsewhere(&map, a, 1), "its own are not another's");
+        assert!(!dirty_elsewhere(&map, b, 2));
+        note_dirty(&mut map, a, 3, true);
+        note_dirty(&mut map, a, 1, false);
+        assert!(dirty_elsewhere(&map, a, 1));
+        note_dirty(&mut map, a, 3, false);
+        assert!(!dirty_elsewhere(&map, a, 1));
+        assert!(map.is_empty(), "nothing kept for a clean file");
+    }
+
+    #[gpui::test]
+    fn quitting_keeps_the_draft_then_saves(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let (dir, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let drafts = home.path().join("drafts");
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let (editor, cx) = editor_with_drafts(cx, rt, dir.path(), &path, Some(&drafts));
+        type_text(&editor, cx, rt, "mine\n");
+        let flush = editor.read_with(cx, |e, cx| e.flush(true, cx)).expect("something to flush");
+        guarded(rt, flush);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine\n");
+        assert!(!drafts.join(drafts::key(&path)).exists(), "saved: no draft left");
+        // a file that can't be saved now (another program's change): its draft stays for the next run
+        type_text(&editor, cx, rt, "more\n");
+        std::fs::write(&path, "theirs\n").unwrap();
+        let flush = editor.read_with(cx, |e, cx| e.flush(true, cx)).expect("something to flush");
+        guarded(rt, flush);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs\n");
+        assert_eq!(drafts::read(&drafts, &path).unwrap().text, "more\n");
+    }
+
+    fn text_of(editor: &Entity<FileEditor>, cx: &mut gpui::VisualTestContext) -> String {
+        editor.read_with(cx, |e, cx| e.editor_state().map(|s| rope_text(s.read(cx).text())).unwrap_or_default())
+    }
+
+    #[gpui::test]
+    fn a_clean_buffer_takes_the_disk_s_change_in_place_and_undo_steps_back(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let (editor, cx) = editor_on(cx, rt, dir.path(), &path);
+        std::fs::write(&path, "one\nTWO\nthree\n").unwrap();
+        editor.update_in(cx, |e, window, cx| e.check_disk(false, window, cx));
+        settle(rt, cx, |cx| text_of(&editor, cx) == "one\nTWO\nthree\n");
+        editor.read_with(cx, |e, _| {
+            assert!(!e.is_dirty(), "the disk's text is the saved text");
+            assert_eq!(e.banner, None);
+            let Body::Edit(edit) = &e.body else { panic!("editable") };
+            assert_eq!(*edit.baseline.bytes, b"one\nTWO\nthree\n");
+        });
+        // the reload was one edit: undo brings the old text back, unsaved against the disk's
+        editor.update_in(cx, |e, window, cx| {
+            let handle = e.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(gpui_base::input::Undo);
+        settle(rt, cx, |cx| text_of(&editor, cx) == "one\ntwo\n");
+        editor.read_with(cx, |e, _| assert!(e.is_dirty()));
+    }
+
+    #[gpui::test]
+    fn a_write_heard_by_the_watch_is_taken_in_and_a_neighbour_s_is_not(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let (editor, cx) = editor_on(cx, rt, dir.path(), &path);
+        // the watch is made on the blocking pool: a moment for it
+        let mut rounds = 0;
+        settle(rt, cx, |_| {
+            rounds += 1;
+            rounds > 20
+        });
+        let looks = |cx: &mut gpui::VisualTestContext| editor.read_with(cx, |e, _| e.disk_check.is_some());
+        assert!(!looks(cx), "nothing looked yet");
+        std::fs::write(dir.path().join("b.txt"), "other\n").unwrap();
+        let mut rounds = 0;
+        settle(rt, cx, |_| {
+            rounds += 1;
+            rounds > 100
+        });
+        assert!(!looks(cx), "another file's write is not this one's");
+        // renamed over it, as an editor saves
+        std::fs::write(dir.path().join("a.tmp"), "two\n").unwrap();
+        std::fs::rename(dir.path().join("a.tmp"), &path).unwrap();
+        settle(rt, cx, |cx| text_of(&editor, cx) == "two\n");
+        editor.read_with(cx, |e, _| assert!(!e.is_dirty()));
+    }
+
+    #[gpui::test]
+    fn unsaved_changes_ask_and_keep_mine_writes_over_that_version_only(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let (editor, cx) = editor_on(cx, rt, dir.path(), &path);
+        editor.update_in(cx, |e, window, cx| {
+            let state = e.editor_state().unwrap().clone();
+            state.update(cx, |s, cx| s.replace_all("mine\n", window, cx));
+        });
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| e.is_dirty()));
+        std::fs::write(&path, "theirs\n").unwrap();
+        editor.update_in(cx, |e, window, cx| e.check_disk(false, window, cx));
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| e.banner.is_some()));
+        editor.read_with(cx, |e, _| assert_eq!(e.banner, Some(Banner::Changed { disk: Seen::of(b"theirs\n"), save: false })));
+        assert_eq!(text_of(&editor, cx), "mine\n", "the buffer is left alone");
+        // Keep mine: the same version again asks nothing; the save writes over it
+        editor.update_in(cx, |e, window, cx| e.keep_mine(window, cx));
+        editor.update_in(cx, |e, window, cx| e.check_disk(false, window, cx));
+        let mut rounds = 0;
+        settle(rt, cx, |_| {
+            rounds += 1;
+            rounds > 20
+        });
+        editor.read_with(cx, |e, _| assert_eq!(e.banner, None));
+        let saved = editor.update_in(cx, |e, window, cx| e.save(SaveMode::Safe, window, cx)).unwrap();
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| !e.is_saving()));
+        assert_eq!(saved.now_or_never(), Some(true), "settled: written");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine\n");
+        // deleted: the buffer stays, and says so
+        std::fs::remove_file(&path).unwrap();
+        editor.update_in(cx, |e, window, cx| e.check_disk(false, window, cx));
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| e.banner.is_some()));
+        editor.read_with(cx, |e, _| assert_eq!(e.banner, Some(Banner::Deleted)));
+        assert_eq!(text_of(&editor, cx), "mine\n");
+        // back as saved: the banner goes
+        std::fs::write(&path, "mine\n").unwrap();
+        editor.update_in(cx, |e, window, cx| e.check_disk(false, window, cx));
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| e.banner.is_none()));
     }
 
     #[test]

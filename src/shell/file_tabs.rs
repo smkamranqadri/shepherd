@@ -10,7 +10,8 @@
 //! A file's view is its editor (`ui::editor`), which shows what it cannot edit in the read-only viewer. A tab with
 //! unsaved changes has a dot, is pinned on its first edit, is never closed to make room nor replaced as a preview,
 //! and asks Save / Don't Save / Cancel before it closes; quitting or closing the window with any asks Save All /
-//! Don't Save / Cancel. The cursor and scroll of a view dropped to save memory are put back when it is made again.
+//! Don't Save / Cancel; Don't Save lets their drafts go too (`files::drafts`). The cursor and scroll of a view
+//! dropped to save memory are put back when it is made again.
 //!
 //! A change in the Changes tab opens its diff (`ui::diff_view`) as a file tab of its own kind (`TabKind::Diff`),
 //! by the same preview rules, never kept for the next run; the shown one reads its diff again on every Changes
@@ -86,9 +87,9 @@ impl TabView {
     }
 
     /// Back in view.
-    fn show(&self, cx: &mut App) {
+    fn show(&self, window: &mut Window, cx: &mut App) {
         if let TabView::File(v) = self {
-            v.update(cx, |v, cx| v.show(cx));
+            v.update(cx, |v, cx| v.show(window, cx));
         }
     }
 
@@ -432,6 +433,12 @@ impl Shell {
                 }
                 cx.notify();
             }
+            // a deleted file's banner's Close: as the tab's own close, asking first with unsaved changes
+            EditorEvent::Close => {
+                if let Some(key) = s.file_tabs.iter().find(|(_, t)| t.get(id).is_some()).map(|(k, _)| k.clone()) {
+                    s.close_file_tab(&key, id, window, cx);
+                }
+            }
         })
         .detach();
         let place = self.tab_places.remove(&id);
@@ -509,7 +516,11 @@ impl Shell {
         cx.spawn_in(window, async move |this, cx| {
             let close = match closing(answer.await.ok()) {
                 Closing::Keep => false,
-                Closing::Discard => true,
+                Closing::Discard => {
+                    // its changes let go: their draft too
+                    let _ = this.update(cx, |_, cx| editor.update(cx, |e, _| e.discard_draft()));
+                    true
+                }
                 Closing::Save => {
                     let save = this.update_in(cx, |_, window, cx| editor.update(cx, |e, cx| e.save(SaveMode::Safe, window, cx)));
                     match save {
@@ -637,7 +648,7 @@ impl Shell {
                 self.reload_shown_diff(false, cx);
             }
             if let Some(view) = &view {
-                view.show(cx);
+                view.show(window, cx);
             }
         }
         let hidden_focused = self.tab_views.iter().any(|(id, v)| Some(*id) != drawn && v.focus_handle(cx).contains_focused(window, cx));
@@ -866,6 +877,11 @@ pub(super) enum Exit {
     Close,
 }
 
+/// A quit's Don't Save was answered in one window: the others' unsaved changes are kept as drafts, not saved.
+struct QuitLetGo;
+
+impl gpui::Global for QuitLetGo {}
+
 /// What runs once Shepherd quits, however it quits (the updater's relaunch): kept until a quit goes through.
 #[derive(Default)]
 pub struct AfterQuit(Vec<Box<dyn FnOnce()>>);
@@ -947,6 +963,16 @@ impl Shell {
             let go = match answer {
                 Closing::Keep => false,
                 Closing::Discard => {
+                    // the unsaved changes let go: their drafts too, so the next run does not bring them back; the
+                    // other windows' (not asked about) are kept as drafts, not saved
+                    let _ = this.update(cx, |s, cx| {
+                        for e in s.editors(false, cx) {
+                            e.update(cx, |e, _| e.discard_draft());
+                        }
+                        if exit == Exit::Quit {
+                            cx.set_global(QuitLetGo);
+                        }
+                    });
                     // what is being written finishes first, whatever was answered
                     let writes = this.update(cx, |s, cx| s.editors(true, cx).iter().filter_map(|e| e.read(cx).saving()).collect::<Vec<_>>()).unwrap_or_default();
                     for write in writes {
@@ -1028,7 +1054,9 @@ impl Shell {
             // Don't Save was the answer; what was being written was waited for then
             return Vec::new();
         }
-        self.editors(true, cx).iter().filter_map(|e| e.read(cx).flush(cx)).collect()
+        // another window's Don't Save let the quit go: this one's changes are not saved unasked, only kept as drafts
+        let save = !cx.has_global::<QuitLetGo>();
+        self.editors(true, cx).iter().filter_map(|e| e.read(cx).flush(save, cx)).collect()
     }
 
     /// The view of a tab that went with its workspace, unsaved, for the file a tab now opens: that tab takes it over

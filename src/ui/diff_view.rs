@@ -12,6 +12,10 @@
 //!
 //! No text selection (the viewer's needs every row's layout and its own hit-testing): a right-click on a row copies
 //! its line or its hunk.
+//!
+//! The editor's Compare shows two texts git has never seen (the file on disk against the buffer) in the same view
+//! (`DiffView::compare`): their diff is made here (`diff::unified`) and read like git's, with no git, no polls and
+//! no file to open.
 use crate::files::content::{self, Text};
 use crate::files::diff::{self, Diff, DiffLine, Entries, Gap, LineKind, Scope};
 use crate::files::highlight::{self, Highlights, Span, Token};
@@ -52,6 +56,19 @@ const KEEP_HIDDEN: usize = 512 << 10;
 const HIGHLIGHT_PAST: usize = 400;
 /// What the header says when a version has lone CR line ends, which git does not split lines at.
 const LONE_CR: &str = "No unchanged lines or colours: the file ends lines with a lone CR, which git does not split at";
+
+/// Unchanged lines around each change in a Compare, as git shows them.
+const COMPARE_CONTEXT: usize = 3;
+/// How long a Compare's diff may take before it settles for fewer, larger hunks.
+const COMPARE_BUDGET: Duration = Duration::from_millis(500);
+
+/// Where a view's diff comes from.
+enum Source {
+    /// git, for a change's tab.
+    Git,
+    /// Two texts (`\n` line ends), for the editor's Compare: the old one left, the new one right, as `labels` name them.
+    Texts { old: Arc<String>, new: Arc<String>, labels: (&'static str, &'static str) },
+}
 
 /// A Changes poll reads the shown diff again only once five times the last read's time has passed since it ended:
 /// a diff git takes seconds over is not read back to back.
@@ -353,6 +370,7 @@ pub struct DiffView {
     focus: FocusHandle,
     rt: Handle,
     spec: DiffSpec,
+    source: Source,
     /// What it compares; its change's group's own unless the switch picked another.
     scope: Scope,
     /// The file's entries in the list (both: the switch shows), each scope's rename source.
@@ -405,13 +423,19 @@ impl Drop for DiffView {
 
 impl DiffView {
     pub fn new(rt: Handle, spec: DiffSpec, entries: Entries, cx: &mut Context<Self>) -> DiffView {
+        Self::with_source(rt, spec, entries, Source::Git, cx)
+    }
+
+    fn with_source(rt: Handle, spec: DiffSpec, entries: Entries, source: Source, cx: &mut Context<Self>) -> DiffView {
         let scope = Scope::of(spec.change.group);
-        let exists = !spec.change.absent();
+        // two texts have no file to open
+        let exists = !spec.change.absent() && matches!(source, Source::Git);
         let split = crate::settings::SettingsGlobal::of(cx).settings.diff_split;
         let mut view = DiffView {
             focus: cx.focus_handle(),
             rt,
             spec,
+            source,
             scope,
             entries: Entries::default(),
             exists,
@@ -436,6 +460,24 @@ impl DiffView {
         view.set_entries(entries);
         view.load(cx);
         view
+    }
+
+    /// The editor's Compare: `old` (the file on disk) against `new` (the buffer) of the file at `path`, both with
+    /// `\n` line ends, read-only and with nothing to open.
+    pub fn compare(rt: Handle, path: PathBuf, old: Arc<String>, new: Arc<String>, labels: (&'static str, &'static str), cx: &mut Context<Self>) -> DiffView {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        // no change in a list: one in the shape of a work tree's edit, so nothing asks git for more
+        let change = Change { group: Group::Changes, path: name, orig: None, code: 'M', xy: ['.', 'M'], submodule: false, moved_to: None };
+        let root = path.parent().map(PathBuf::from).unwrap_or_default();
+        Self::with_source(rt, DiffSpec { root, path, change }, Entries::default(), Source::Texts { old, new, labels }, cx)
+    }
+
+    /// A Compare's texts again (the disk or the buffer moved): the diff is made afresh.
+    pub fn set_texts(&mut self, old: Arc<String>, new: Arc<String>, cx: &mut Context<Self>) {
+        if let Source::Texts { old: was_old, new: was_new, .. } = &mut self.source {
+            (*was_old, *was_new) = (old, new);
+            self.load(cx);
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -543,6 +585,24 @@ impl DiffView {
         self.stop();
         self.generation += 1;
         self.cancel = Arc::default();
+        if let Source::Texts { old, new, .. } = &self.source {
+            let (old, new, path, cancel) = (old.clone(), new.clone(), self.spec.path.clone(), self.cancel.clone());
+            let task = self.rt.spawn_blocking(move || {
+                let raw = diff::unified(&old, &new, COMPARE_CONTEXT, Instant::now() + COMPARE_BUDGET).into_bytes();
+                let loaded = build(raw, &path, Some(new.as_bytes().to_vec()), Some(old.as_bytes().to_vec()), None, &cancel);
+                Read { top: None, exists: false, answer: Answer::Loaded(Box::new(loaded)) }
+            });
+            self.started = Instant::now();
+            self.job = Some(task.abort_handle());
+            let generation = self.generation;
+            cx.spawn(async move |this, cx| {
+                if let Ok(answer) = task.await {
+                    let _ = this.update(cx, |v, cx| v.landed(generation, answer, cx));
+                }
+            })
+            .detach();
+            return;
+        }
         let loaded = self.result.as_ref().and_then(|r| r.as_ref().ok());
         let ask = Ask {
             spec: self.spec.clone(),
@@ -716,11 +776,12 @@ impl DiffView {
         let tag = |label: SharedString| {
             div().flex_none().px(px(5.)).rounded(px(4.)).border_1().border_color(theme.border).text_size(px(10.5)).text_color(theme.text_faint).child(label)
         };
-        let group = match self.spec.change.group {
-            Group::Conflicts => "Merge",
-            Group::Staged => "Staged",
-            Group::Changes => "Changes",
-            Group::Untracked => "Untracked",
+        let group = match (&self.source, self.spec.change.group) {
+            (Source::Texts { labels: (old, new), .. }, _) => format!("{old} → {new}"),
+            (Source::Git, Group::Conflicts) => "Merge".into(),
+            (Source::Git, Group::Staged) => "Staged".into(),
+            (Source::Git, Group::Changes) => "Changes".into(),
+            (Source::Git, Group::Untracked) => "Untracked".into(),
         };
         let counts = self.loaded().filter(|l| !l.diff.binary && !l.diff.combined).map(|l| l.diff.counts());
         let renamed = self.spec.change.orig.as_ref().filter(|o| **o != self.spec.change.path).map(|o| format!("from {o}"));

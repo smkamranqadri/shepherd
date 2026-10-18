@@ -1,6 +1,8 @@
 //! The right panel's Files, Changes and Search work without gpui: processes, parsers and rankers, tested on strings.
 pub mod content;
 pub mod diff;
+pub mod dir_watch;
+pub mod drafts;
 pub mod fuzzy;
 pub mod git_ops;
 pub mod highlight;

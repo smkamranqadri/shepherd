@@ -185,6 +185,12 @@ impl Baseline {
         Ok(Baseline { mode: os::mode(&meta), ..Baseline::new(bytes, Stamp::of(&meta)) })
     }
 
+    /// This baseline's way of writing the text (its line end, BOM, mode) over `disk`'s bytes and stamp: a save with
+    /// it checks the disk against `disk`, the version the user chose to write over, and writes as before.
+    pub fn over(&self, disk: &Baseline) -> Baseline {
+        Baseline { bytes: disk.bytes.clone(), stamp: disk.stamp, settled: Arc::new(AtomicBool::new(false)), ..self.clone() }
+    }
+
     /// The baseline after writing `bytes` (encoded from this one) to the file now `meta`: same ending and BOM, mixed
     /// no more.
     fn saved(&self, bytes: Vec<u8>, meta: &fs::Metadata) -> Baseline {
@@ -215,6 +221,9 @@ pub enum SaveMode {
     InPlace,
     /// As `InPlace`, whatever is on disk now; recreates a deleted file.
     OverwriteInPlace,
+    /// Makes a deleted file again, and only that: a file there now (made again meanwhile) is a conflict, never
+    /// written over.
+    Recreate,
 }
 
 impl SaveMode {
@@ -289,6 +298,63 @@ pub fn encode(text: &str, b: &Baseline) -> Vec<u8> {
     }
     out.extend_from_slice(&bytes[start..]);
     out
+}
+
+/// FNV-1a, 64 bits: a stable digest of a file's bytes (the same on every run and platform, unlike std's hasher),
+/// to tell one version of a file from another without keeping it.
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    Fnv::default().add(bytes).0
+}
+
+/// FNV-1a fed in chunks.
+#[derive(Clone, Copy)]
+struct Fnv(u64);
+
+impl Default for Fnv {
+    fn default() -> Fnv {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Fnv {
+    fn add(mut self, bytes: &[u8]) -> Fnv {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+        self
+    }
+}
+
+/// One version of a file on disk, by its length and digest: what the user saw when they chose to keep their own
+/// text over it ("Keep mine"), so the next save may write over that version, and only that one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Seen {
+    pub len: u64,
+    pub hash: u64,
+}
+
+impl Seen {
+    pub fn of(bytes: &[u8]) -> Seen {
+        Seen { len: bytes.len() as u64, hash: fnv1a64(bytes) }
+    }
+}
+
+/// The version of the file at `path` (following links) as it is now, read in chunks (a file past the editing
+/// limits is not held whole for it). Blocking.
+pub fn fingerprint(path: &Path) -> io::Result<Seen> {
+    let mut file = retry(|| File::open(path))?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} is not a file", path.display())));
+    }
+    let (mut buf, mut fnv, mut len) = (vec![0u8; 64 << 10], Fnv::default(), 0u64);
+    loop {
+        let n = retry(|| file.read(&mut buf))?;
+        if n == 0 {
+            return Ok(Seen { len, hash: fnv.0 });
+        }
+        fnv = fnv.add(&buf[..n]);
+        len += n as u64;
+    }
 }
 
 /// `path`'s stamp (following links).
@@ -477,6 +543,8 @@ fn save_with(root: &Path, path: &Path, text: &str, b: &Baseline, mode: SaveMode,
     let target = contained(root, path)?;
     let bytes = encode(text, b);
     let meta = match fs::metadata(&target) {
+        // made again meanwhile: not the deleted file's to write over
+        Ok(_) if mode == SaveMode::Recreate => return Err(SaveError::Conflict),
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return if mode.checks() { Err(SaveError::Deleted) } else { recreate(&target, bytes, b, hooks) };
@@ -491,7 +559,7 @@ fn save_with(root: &Path, path: &Path, text: &str, b: &Baseline, mode: SaveMode,
         return Err(SaveError::ReadOnly);
     }
     match mode {
-        SaveMode::Safe | SaveMode::Overwrite => {
+        SaveMode::Safe | SaveMode::Overwrite | SaveMode::Recreate => {
             let links = os::links(&meta);
             if links > 1 {
                 return Err(SaveError::HardLinked(links));
@@ -1273,6 +1341,59 @@ mod tests {
             assert!(matches!(save_with(dir.path(), &gone, "x", &b, SaveMode::Overwrite, &mut hooks), Err(SaveError::Io(_))));
             assert!(!gone.exists());
         }
+    }
+
+    #[test]
+    fn recreating_makes_a_deleted_file_and_never_writes_over_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "one\n").unwrap();
+        let b = Baseline::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        save(dir.path(), &path, "mine\n", &b, SaveMode::Recreate).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "mine\n");
+        // made again by someone else meanwhile: theirs stays
+        fs::write(&path, "theirs\n").unwrap();
+        assert_eq!(save(dir.path(), &path, "mine 2\n", &b, SaveMode::Recreate), Err(SaveError::Conflict));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "theirs\n");
+    }
+
+    #[test]
+    fn a_version_on_disk_is_known_by_its_length_and_digest() {
+        // FNV-1a's published values: stable across runs and platforms
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        // past one read's chunk, so the digest is fed in pieces
+        let big = "0123456789abcdef".repeat(10_000);
+        fs::write(&path, &big).unwrap();
+        assert_eq!(fingerprint(&path).unwrap(), Seen::of(big.as_bytes()));
+        fs::write(&path, "two\n").unwrap();
+        assert_eq!(fingerprint(&path).unwrap(), Seen { len: 4, hash: fnv1a64(b"two\n") });
+        assert_ne!(Seen::of(b"two\n"), Seen::of(b"owt\n"), "same length, other bytes");
+        fs::remove_file(&path).unwrap();
+        assert_eq!(fingerprint(&path).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(fingerprint(dir.path()).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn a_save_over_a_kept_version_writes_only_over_that_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, b"\xEF\xBB\xBFone\r\n").unwrap();
+        let b = Baseline::read(&path).unwrap();
+        fs::write(&path, "two\n").unwrap();
+        let disk = Baseline::read(&path).unwrap();
+        let over = b.over(&disk);
+        assert_eq!((over.ending, over.bom, &*over.bytes), (LineEnding::Crlf, true, &b"two\n".to_vec()), "ours to write, the disk's to check");
+        assert_eq!(save(dir.path(), &path, "mine\n", &b, SaveMode::Safe), Err(SaveError::Conflict));
+        // another write since: still a conflict
+        fs::write(&path, "three\n").unwrap();
+        assert_eq!(save(dir.path(), &path, "mine\n", &over, SaveMode::Safe), Err(SaveError::Conflict));
+        fs::write(&path, "two\n").unwrap();
+        save(dir.path(), &path, "mine\n", &over, SaveMode::Safe).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"\xEF\xBB\xBFmine\r\n");
     }
 
     #[test]
