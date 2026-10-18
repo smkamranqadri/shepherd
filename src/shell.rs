@@ -1678,14 +1678,16 @@ impl Render for Shell {
         let active_dir = crate::ui::statusbar::pane_dir(snapshot.as_ref(), self.active_pane(window, cx).as_deref());
         self.panel_has_pr = active_dir.as_deref().is_some_and(|d| crate::ui::statusbar::has_origin(d, cx));
         let pr_shown = self.panel_open && self.shown_panel_tab() == crate::settings::PanelTab::Pr;
-        let shown = if show_bar || pr_shown {
+        let gate = crate::ui::statusbar::gate(show_bar, pr_shown);
+        let shown = if gate.review {
             self.shown_review(snapshot.as_ref(), window, cx)
         } else {
             // nothing shows the review: its checks are not polled
             self.review_poll = None;
             Default::default()
         };
-        let statusbar = show_bar.then(|| {
+        // hidden, the bar's own lookups (git status, tokens, plan limits) are not asked: only drawing it asks
+        let statusbar = gate.bar.then(|| {
             let pane = self.active_pane(window, cx);
             let on_branch = cx.listener(|this, _: &ClickEvent, window, cx| {
                 this.toggle_command_panel(crate::ui::command_panel::Kind::Branches, window, cx)
@@ -1837,6 +1839,8 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ShowChanges, w, cx| this.show_panel_tab(crate::settings::PanelTab::Changes, w, cx)))
             .on_action(cx.listener(|this, _: &ShowSearch, w, cx| this.show_panel_tab(crate::settings::PanelTab::Search, w, cx)))
             .on_action(cx.listener(|this, _: &ShowPullRequest, w, cx| this.show_panel_tab(crate::settings::PanelTab::Pr, w, cx)))
+            // the shown pane's repo: also the status bar branch's click
+            .on_action(cx.listener(|this, _: &SwitchBranch, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Branches, w, cx)))
             // ponytail: until Quick Open (M7) and reveal (M8) land, these open the Files tab
             .on_action(cx.listener(|this, _: &QuickOpen, w, cx| this.open_panel_tab(crate::settings::PanelTab::Files, w, cx)))
             .on_action(cx.listener(|this, _: &RevealActiveFile, w, cx| this.open_panel_tab(crate::settings::PanelTab::Files, w, cx)))

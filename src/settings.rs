@@ -57,7 +57,8 @@ pub struct Settings {
     pub agent_sort: AgentSort,
     /// The sidebar's Agents section; General settings hide it.
     pub show_agents: bool,
-    /// The bottom status bar; General settings hide it.
+    /// The bottom status bar; off by default, General settings show it. Off, its own lookups (the shown pane's git
+    /// status, the agent's tokens, the plan limits) are not asked.
     pub show_status_bar: bool,
     /// Which of its labels the status bar shows: its right-click menu.
     pub status_bar_show: StatusBarShow,
@@ -334,7 +335,7 @@ impl Default for Settings {
             workspace_roots: BTreeMap::new(),
             agent_sort: AgentSort::default(),
             show_agents: true,
-            show_status_bar: true,
+            show_status_bar: false,
             status_bar_show: StatusBarShow::default(),
             usage_agent: UsageAgent::default(),
             workspace_show: WorkspaceShow::default(),
@@ -735,6 +736,19 @@ mod tests {
         let off = Settings { sidebar_peek: false, ..Default::default() };
         off.save(&path).unwrap();
         assert!(!Settings::load(&path).0.sidebar_peek, "off is kept");
+    }
+
+    #[test]
+    fn the_status_bar_is_hidden_unless_turned_on() {
+        let (_d, path) = tmp();
+        assert!(!Settings::default().show_status_bar, "off by default");
+        std::fs::write(&path, r#"{"show_agents": true}"#).unwrap();
+        assert!(!Settings::load(&path).0.show_status_bar, "a file without the key loads it off");
+        let on = Settings { show_status_bar: true, ..Default::default() };
+        on.save(&path).unwrap();
+        assert!(Settings::load(&path).0.show_status_bar, "on is kept");
+        Settings::default().save(&path).unwrap();
+        assert!(!Settings::load(&path).0.show_status_bar, "off is kept");
     }
 
     #[test]

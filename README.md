@@ -20,7 +20,7 @@ It's written in Rust on [GPUI](https://github.com/zeronsh/zui) and styled after 
 - `⌥⌘B` opens the right panel: the workspace folder's files (to view or edit in a tab), its git changes and diffs, a search in its files, and the branch's PR (gh) or MR (glab) with its description, checks or pipeline jobs and their logs. The PR tab works for SSH machines too.
 - `⌘K` opens a command panel with every action, workspace and tab of the session shown. `⇧⌘A` opens the agents panel and Workspaces the workspaces panel, which list every session's, going there as a click in the sidebar does; a session out of reach is listed from what it last said, marked so.
 - Hold `⌘` for a moment and each tab shows its number; hold `⌃` and each workspace does (Ctrl and Ctrl+Shift on Linux). Settings can turn the hints off.
-- The status bar shows the branch, its PR and CI, the current folder, the focused agent and your Claude and Codex plan limits.
+- A status bar along the bottom, off until General settings turn it on, shows the branch, its PR and CI, the current folder, the focused agent's tokens and your Claude and Codex plan limits. Switch branch is in the command panel either way, and Usage settings show the limits.
 - Settings cover fonts, themes, key bindings and usage. They also edit herdr's own `config.toml` for notifications and integrations, keeping your comments.
 
 ## Install

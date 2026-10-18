@@ -783,6 +783,19 @@ fn on_click_at(
         .on_click(move |_, window, cx| on_click(&bounds.get(), window, cx))
 }
 
+/// What the main area draws and asks for, from the bar's setting and whether the right panel shows its PR tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gate {
+    /// The bar is drawn; its git, token and plan-limit lookups run only while it is, as drawing it asks for them.
+    pub bar: bool,
+    /// The shown branch's PR or MR and CI are looked up (gh or glab), for the bar's label or the PR tab.
+    pub review: bool,
+}
+
+pub fn gate(show_bar: bool, pr_shown: bool) -> Gate {
+    Gate { bar: show_bar, review: show_bar || pr_shown }
+}
+
 /// The bar's labels that open a popup.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Item {
@@ -890,6 +903,14 @@ mod tests {
             assert_eq!(lookup.ttl_on(false), base, "{lookup:?}");
             assert_eq!(lookup.ttl_on(true), base * 2, "{lookup:?}");
         }
+    }
+
+    #[test]
+    fn the_bar_and_its_review_lookup_follow_the_setting() {
+        assert_eq!(gate(false, false), Gate { bar: false, review: false }, "hidden: nothing drawn, gh not asked");
+        assert_eq!(gate(false, true), Gate { bar: false, review: true }, "the PR tab still asks");
+        assert_eq!(gate(true, false), Gate { bar: true, review: true });
+        assert_eq!(gate(true, true), Gate { bar: true, review: true });
     }
 
     #[test]

@@ -65,6 +65,7 @@ app_actions! {
     ShowChanges: "Changes",
     ShowSearch: "Search in files",
     ShowPullRequest: "Pull request",
+    SwitchBranch: "Switch branch",
     QuickOpen: "Go to file",
     RevealActiveFile: "Reveal file in sidebar",
     ChooseRoot: "Choose sidebar folder",

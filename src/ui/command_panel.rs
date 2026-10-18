@@ -198,7 +198,7 @@ impl Kind {
             Kind::Commands => "CommandPanel",
             Kind::Agents => "AgentsPanel",
             Kind::Workspaces => "WorkspacesPanel",
-            Kind::Branches => "", // opened from the status bar, no chord
+            Kind::Branches => "SwitchBranch",
             Kind::Worktrees => "", // opened from a workspace's menu, no chord
             Kind::Themes => "ChangeTheme",
             Kind::Places => "SwitchSession",
@@ -246,6 +246,7 @@ fn action_icon(name: &str) -> &'static str {
         "ShowChanges" => "icons/git-branch.svg",
         "ShowSearch" => "icons/solar/magnifier.svg",
         "ShowPullRequest" => "icons/git-pull-request.svg",
+        "SwitchBranch" => "icons/git-branch.svg",
         "QuickOpen" => "icons/solar/file-search.svg",
         "RevealActiveFile" => "icons/solar/folder-with-files.svg",
         "ChooseRoot" => "icons/solar/folder-open.svg",
