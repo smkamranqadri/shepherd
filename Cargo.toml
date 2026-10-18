@@ -44,6 +44,8 @@ notify = "8.2"
 # The Search tab's include and exclude globs, matched against each result's whole path (rg's --type-add sees only
 # the file's name); ripgrep's own (MIT OR Unlicense), no log.
 globset = { version = "0.4.20", default-features = false }
+# The editor's find bar in regex mode (MIT OR Apache-2.0; already in the tree, through gpui and gpui-base).
+regex = "1"
 # An image's size from its header, for the viewer's pixel budget (already in the tree, through gpui).
 imagesize = "0.14"
 # A PDF tab's pages: a pure-Rust rasterizer (Apache-2.0 OR MIT; no system library to ship). Its default features

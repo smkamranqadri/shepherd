@@ -81,6 +81,9 @@ app_actions! {
     WorkspacesPanel: "Workspaces",
     SaveFile: "Save file",
     SaveAllFiles: "Save all files",
+    FindInFile: "Find in file",
+    ReplaceInFile: "Replace in file",
+    GoToLine: "Go to line",
     ShowShortcuts: "Keyboard shortcuts",
     Quit: "Quit",
 }
@@ -96,9 +99,15 @@ pub const FILE_VIEW: &str = "FileEditor";
 /// it would win in the editor (Cmd+Shift+Up would switch workspace, not select to the start).
 pub const NOT_IN_TEXT: &str = "!Input";
 
-/// The key context `action`'s chords are bound in, if it has one of its own: the save actions in a file's view.
+/// The key context `action`'s chords are bound in, if it has one of its own: the save actions in a file's view, and
+/// find, replace and Go to Line in the editor's text (and its find bar's fields), so a pane's Ctrl+F, Ctrl+H (its
+/// backspace) and Ctrl+G stay the shell's.
 pub fn context_of(action: &str) -> Option<&'static str> {
-    matches!(action, "SaveFile" | "SaveAllFiles").then_some(FILE_VIEW)
+    match action {
+        "SaveFile" | "SaveAllFiles" => Some(FILE_VIEW),
+        "FindInFile" | "ReplaceInFile" | "GoToLine" => Some(EDITOR),
+        _ => None,
+    }
 }
 
 /// App actions whose chords are bound in the editor's text as well, over a gpui-base "Input" binding of the same
@@ -207,6 +216,10 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("NextNeedsYou", "cmd-shift-j"),
     ("SaveFile", "cmd-s"),
     ("SaveAllFiles", "cmd-alt-s"),
+    // in the editor only (`context_of`), over gpui-base's own Cmd+F; Cmd+Shift+F stays Search in Files
+    ("FindInFile", "cmd-f"),
+    ("ReplaceInFile", "cmd-alt-f"),
+    ("GoToLine", "ctrl-g"),
     ("Quit", "cmd-q"),
     ("ShowShortcuts", "cmd-/"),
 ];
@@ -287,6 +300,10 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // in the editor only (`context_of`): a pane's Ctrl+S is the terminal's
     ("SaveFile", "ctrl-s"),
     ("SaveAllFiles", "ctrl-alt-s"),
+    // in the editor only (`context_of`), over gpui-base's own Ctrl+F and Ctrl+H: a pane's stay the shell's
+    ("FindInFile", "ctrl-f"),
+    ("ReplaceInFile", "ctrl-h"),
+    ("GoToLine", "ctrl-g"),
     ("Quit", "ctrl-shift-q"),
     // Ctrl+Shift+/ as a US layout reports it: the shifted key, without shift. Ctrl+/ stays the terminal's.
     ("ShowShortcuts", "ctrl-?"),
@@ -383,6 +400,23 @@ gpui::actions!(shepherd, [PdfZoomIn, PdfZoomOut, PdfZoomReset]);
 /// Where a PDF tab's zoom chords are bound: its pages' view, which has the keyboard while the tab shows.
 pub const PDF_VIEW: &str = "PdfView";
 
+// The editor's find bar's next and previous match, in the bar only (`EDITOR_FIND`); not rebindable, so outside
+// `app_actions!`. Enter and Shift+Enter in its query do the same.
+gpui::actions!(shepherd, [FindNext, FindPrevious]);
+
+/// Where the find bar's own chords are bound: the bar under the editor's header, its fields included.
+pub const EDITOR_FIND: &str = "EditorFind";
+
+/// The find bar's next and previous: F3 and Shift+F3, and on macOS Cmd+G and Cmd+Shift+G as well.
+fn find_keys() -> Vec<KeyBinding> {
+    let mut keys = vec![KeyBinding::new("f3", FindNext, Some(EDITOR_FIND)), KeyBinding::new("shift-f3", FindPrevious, Some(EDITOR_FIND))];
+    if cfg!(target_os = "macos") {
+        keys.push(KeyBinding::new("cmd-g", FindNext, Some(EDITOR_FIND)));
+        keys.push(KeyBinding::new("cmd-shift-g", FindPrevious, Some(EDITOR_FIND)));
+    }
+    keys
+}
+
 /// A PDF tab's zoom: Cmd/Ctrl with +, − and 0, the text size's chords everywhere else. Bound after the app's
 /// (`apply`), so in the PDF view, where both match as deep, these win; anywhere else the app's stay.
 fn pdf_keys() -> Vec<KeyBinding> {
@@ -421,6 +455,9 @@ fn menus(secure_input: bool) -> Vec<gpui::Menu> {
             I::action("Close Pane", ClosePane),
             I::action("Close Tab", CloseTab),
         ]),
+        // on actions of their own, bound to no keys: macOS would take an item's chord before the view, and Cmd+F in a
+        // pane is the pane's own find (`menu_actions` runs the editor's)
+        Menu::new("Edit").items([I::action("Find…", MenuFind), I::action("Replace…", MenuReplace), I::action("Go to Line…", MenuGoToLine)]),
         Menu::new("View").items([
             I::action("Toggle Sidebar", ToggleSidebar),
             I::action("Toggle Right Panel", ToggleReview),
@@ -471,6 +508,9 @@ fn menus(secure_input: bool) -> Vec<gpui::Menu> {
     ]
 }
 
+// The Edit menu's items: the editor's find actions without their chords (see `menus`); not rebindable.
+gpui::actions!(shepherd, [MenuFind, MenuReplace, MenuGoToLine]);
+
 /// Handlers for the window-management menu items.
 pub fn init_menu_actions(cx: &mut App) {
     fn window(cx: &mut App, f: fn(&mut gpui::Window)) {
@@ -484,6 +524,15 @@ pub fn init_menu_actions(cx: &mut App) {
     cx.on_action(|_: &Minimize, cx| window(cx, |w| w.minimize_window()));
     cx.on_action(|_: &Zoom, cx| window(cx, |w| w.zoom_window()));
     cx.on_action(|_: &ToggleFullScreen, cx| window(cx, |w| w.toggle_fullscreen()));
+    // the Edit menu's items, as the chords would: to whatever has the keyboard (the editor takes them)
+    fn dispatch(cx: &mut App, action: Box<dyn gpui::Action>) {
+        if let Some(w) = cx.active_window() {
+            let _ = w.update(cx, |_, window, cx| window.dispatch_action(action, cx));
+        }
+    }
+    cx.on_action(|_: &MenuFind, cx| dispatch(cx, Box::new(FindInFile)));
+    cx.on_action(|_: &MenuReplace, cx| dispatch(cx, Box::new(ReplaceInFile)));
+    cx.on_action(|_: &MenuGoToLine, cx| dispatch(cx, Box::new(GoToLine)));
 }
 
 /// Each binding of `bound` as (chord, context, action), in every context its action binds in.
@@ -503,6 +552,7 @@ pub fn apply(cx: &mut App, previous: &[(String, String)], next: &[(String, Strin
         .collect();
     bindings.extend(after.iter().filter_map(|(chord, context, action)| binding(action, chord, *context)));
     bindings.extend(pdf_keys());
+    bindings.extend(find_keys());
     cx.bind_keys(bindings);
 }
 
@@ -515,6 +565,12 @@ impl gpui::Global for HerdrBindings {}
 /// second key would get in the way of typing elsewhere.
 const TERMINAL: &str = "Terminal";
 
+/// Whether herdr's `chord` is bound in the panes beside Shepherd's bindings `shepherd`: unless one of Shepherd's
+/// takes it there. One bound in a file's view only (Ctrl+S, Ctrl+F) leaves it to herdr in the panes.
+fn herdr_keeps(chord: &str, shepherd: &[(String, String)]) -> bool {
+    !shepherd.iter().any(|(action, k)| k == chord && context_of(action).is_none())
+}
+
 /// Binds herdr's keymap from its config.toml (`[keys]`, `[[keys.command]]`) in the panes, under Shepherd's
 /// own: a chord `shepherd` uses stays Shepherd's.
 fn rebind_herdr(cx: &mut App, shepherd: &[(String, String)]) {
@@ -523,7 +579,7 @@ fn rebind_herdr(cx: &mut App, shepherd: &[(String, String)]) {
     let config = crate::herdr::HerdrConfig::load(&crate::herdr::config_path()).unwrap_or_default();
     let next: Vec<_> = crate::herdr::keys::bindings(&config)
         .into_iter()
-        .filter(|(_, chord)| !shepherd.iter().any(|(_, k)| k == chord))
+        .filter(|(_, chord)| herdr_keeps(chord, shepherd))
         .collect();
     let previous = cx.try_global::<HerdrBindings>().map(|b| b.0.clone()).unwrap_or_default();
     let mut bindings: Vec<KeyBinding> = previous
@@ -763,8 +819,12 @@ mod tests {
     #[test]
     fn editor_actions_bind_in_the_editor_only() {
         for (action, _) in ACTIONS {
-            let editor = matches!(*action, "SaveFile" | "SaveAllFiles");
-            assert_eq!(context_of(action), editor.then_some(FILE_VIEW), "{action}");
+            let wanted = match *action {
+                "SaveFile" | "SaveAllFiles" => Some(FILE_VIEW),
+                "FindInFile" | "ReplaceInFile" | "GoToLine" => Some(EDITOR),
+                _ => None,
+            };
+            assert_eq!(context_of(action), wanted, "{action}");
         }
         let view = gpui::KeyBindingContextPredicate::parse(FILE_VIEW).unwrap();
         assert!(view.depth_of(&stack(&["FileEditor", "Input"])).is_some(), "the editor's text");
@@ -782,6 +842,10 @@ mod tests {
         assert_eq!(contexts("ShowSearch", "x", &text), [None, Some(EDITOR)]);
         assert_eq!(contexts("SaveFile", "x", &text), [Some(FILE_VIEW)]);
         assert_eq!(contexts("NewTab", "x", &text), [None]);
+        // find's chords are gpui-base text chords too, and still the editor's only
+        for (action, keys) in FIND_CHORDS {
+            assert_eq!(contexts(action, &normalize(keys).unwrap(), &text), [Some(EDITOR)], "{action}");
+        }
     }
 
     /// gpui-base's text chords (its `input::init`) that Shepherd's defaults could meet, as GPUI spells them.
@@ -818,9 +882,17 @@ mod tests {
         for chord in &text {
             let Some((action, _)) = eff.iter().find(|(_, k)| k == chord) else { continue };
             met += 1;
-            let wanted = if GLOBAL_IN_TEXT.contains(&action.as_str()) || OVER_THE_EDITOR.contains(&action.as_str()) { format!("shepherd::{action}") } else { "input::SelectToStart".into() };
+            let ours = format!("shepherd::{action}");
+            // the editor's own app actions (find, replace) take its chord there, and are nothing in a pane
+            let (wanted, in_pane) = if context_of(action) == Some(EDITOR) {
+                (ours.clone(), None)
+            } else if GLOBAL_IN_TEXT.contains(&action.as_str()) || OVER_THE_EDITOR.contains(&action.as_str()) {
+                (ours.clone(), Some(ours))
+            } else {
+                ("input::SelectToStart".into(), Some(ours))
+            };
             assert_eq!(fired(chord, &editor).as_deref(), Some(wanted.as_str()), "{chord} ({action}) in the editor");
-            assert_eq!(fired(chord, &pane).as_deref(), Some(format!("shepherd::{action}").as_str()), "{chord} ({action}) in a pane");
+            assert_eq!(fired(chord, &pane), in_pane, "{chord} ({action}) in a pane");
         }
         assert!(met >= 2, "the defaults meet the editor's chords: {met}");
         #[cfg(target_os = "macos")]
@@ -856,12 +928,114 @@ mod tests {
         }
     }
 
+    /// Find, Replace and Go to Line, as the user chose them on each OS.
+    #[cfg(target_os = "macos")]
+    const FIND_CHORDS: [(&str, &str); 3] = [("FindInFile", "cmd-f"), ("ReplaceInFile", "cmd-alt-f"), ("GoToLine", "ctrl-g")];
+    #[cfg(not(target_os = "macos"))]
+    const FIND_CHORDS: [(&str, &str); 3] = [("FindInFile", "ctrl-f"), ("ReplaceInFile", "ctrl-h"), ("GoToLine", "ctrl-g")];
+
+    /// Find, Replace and Go to Line fire in the editor's text and in its find bar's fields, over gpui-base's own
+    /// chords, and never in a pane, a markdown preview or another input; the bar's next and previous only in the bar.
+    /// A keymap in `apply`'s order, over gpui-base's Input bindings.
+    #[test]
+    fn the_find_chords_fire_in_the_editor_only() {
+        let text = text_chords_here();
+        let eff = effective(&user(&[]));
+        let mut keymap = gpui::Keymap::new(text.iter().map(|c| KeyBinding::new(c, gpui_base::input::SelectToStart, Some("Input"))).collect());
+        keymap.add_bindings(placed(&eff, &text).into_iter().filter_map(|(chord, context, action)| binding(action, chord, context)));
+        keymap.add_bindings(pdf_keys());
+        keymap.add_bindings(find_keys());
+        let fired = |chord: &str, at: &[gpui::KeyContext]| {
+            let typed = gpui::Keystroke::parse(chord).unwrap();
+            keymap.bindings_for_input(&[typed], at).0.first().map(|b| b.action().name().to_string())
+        };
+        let editor = stack(&["Workspace", "FileEditor", "Input"]);
+        let bar = stack(&["Workspace", "FileEditor", EDITOR_FIND, "Input"]);
+        let pane = stack(&["Workspace", "Terminal"]);
+        let preview = stack(&["Workspace", "FileEditor"]);
+        let other = stack(&["Workspace", "Input"]);
+        for (action, keys) in FIND_CHORDS {
+            assert_eq!(chord(&eff, action), normalize(keys).as_deref(), "{action}'s default");
+            let ours = format!("shepherd::{action}");
+            assert_eq!(fired(keys, &editor).as_deref(), Some(ours.as_str()), "{keys} in the editor");
+            assert_eq!(fired(keys, &bar).as_deref(), Some(ours.as_str()), "{keys} in the find bar");
+            assert_eq!(fired(keys, &pane), None, "{keys} reaches a pane");
+            assert_ne!(fired(keys, &preview).as_deref(), Some(ours.as_str()), "{keys} in a preview");
+            assert_ne!(fired(keys, &other).as_deref(), Some(ours.as_str()), "{keys} in another input");
+        }
+        let mut steps = vec![("f3", "FindNext"), ("shift-f3", "FindPrevious")];
+        if cfg!(target_os = "macos") {
+            steps.extend([("cmd-g", "FindNext"), ("cmd-shift-g", "FindPrevious")]);
+        }
+        for (keys, action) in steps {
+            assert_eq!(fired(keys, &bar).as_deref(), Some(format!("shepherd::{action}").as_str()), "{keys} in the find bar");
+            for at in [&editor, &pane] {
+                assert_eq!(fired(keys, at), None, "{keys} in {at:?}");
+            }
+        }
+    }
+
+    /// The Edit menu's items carry no chord: macOS would take Cmd+F for the menu before a pane's own find heard it.
+    /// Their actions are bound to nothing, by default or by a user (not in `ACTIONS`), so no key equivalent shows.
+    #[test]
+    fn the_edit_menu_items_have_no_key_equivalent() {
+        let edit = menus(false).into_iter().find(|m| m.name == "Edit").expect("an Edit menu");
+        let names: Vec<String> = edit
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                gpui::MenuItem::Action { action, .. } => Some(action.name().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["shepherd::MenuFind", "shepherd::MenuReplace", "shepherd::MenuGoToLine"]);
+        let eff = effective(&user(&[]));
+        let mut keymap = gpui::Keymap::new(placed(&eff, &text_chords_here()).into_iter().filter_map(|(chord, context, action)| binding(action, chord, context)).collect());
+        keymap.add_bindings(pdf_keys());
+        keymap.add_bindings(find_keys());
+        for i in &edit.items {
+            if let gpui::MenuItem::Action { action, .. } = i {
+                let short = action.name().trim_start_matches("shepherd::");
+                assert!(!known(short), "{short} is rebindable");
+                assert_eq!(keymap.bindings_for_action(action.as_ref()).count(), 0, "{short} has a chord");
+            }
+        }
+    }
+
+    /// herdr's chords in the panes, as `rebind_herdr` binds them (under Shepherd's), are dropped only for a Shepherd
+    /// chord bound in the panes too: an editor-only one (find, save) leaves herdr's.
+    #[test]
+    fn a_herdr_chord_on_an_editor_only_chord_still_reaches_a_pane() {
+        let text = text_chords_here();
+        let eff = effective(&user(&[]));
+        let (find, _) = FIND_CHORDS[0];
+        let find = chord(&eff, find).unwrap().to_string();
+        let save = chord(&eff, "SaveFile").unwrap().to_string();
+        let new_tab = chord(&eff, "NewTab").unwrap().to_string();
+        let herdr = [("SplitRight", find.clone()), ("SplitDown", save.clone()), ("ToggleZoom", new_tab.clone())];
+        let mut keymap = gpui::Keymap::new(text.iter().map(|c| KeyBinding::new(c, gpui_base::input::SelectToStart, Some("Input"))).collect());
+        keymap.add_bindings(placed(&eff, &text).into_iter().filter_map(|(chord, context, action)| binding(action, chord, context)));
+        keymap.add_bindings(herdr.iter().filter(|(_, c)| herdr_keeps(c, &eff)).filter_map(|(a, c)| binding(a, c, Some(TERMINAL))));
+        let fired = |chord: &str, at: &[gpui::KeyContext]| {
+            let typed = gpui::Keystroke::parse(chord).unwrap();
+            keymap.bindings_for_input(&[typed], at).0.first().map(|b| b.action().name().to_string())
+        };
+        let pane = stack(&["Workspace", "Terminal"]);
+        let editor = stack(&["Workspace", "FileEditor", "Input"]);
+        assert_eq!(fired(&find, &pane).as_deref(), Some("shepherd::SplitRight"), "herdr's {find} in a pane");
+        assert_eq!(fired(&find, &editor).as_deref(), Some("shepherd::FindInFile"), "{find} in the editor");
+        assert_eq!(fired(&save, &pane).as_deref(), Some("shepherd::SplitDown"), "herdr's {save} in a pane");
+        // a chord Shepherd binds in the panes stays Shepherd's there
+        assert!(!herdr_keeps(&new_tab, &eff));
+        assert_eq!(fired(&new_tab, &pane).as_deref(), Some("shepherd::NewTab"));
+    }
+
     #[test]
     #[cfg(not(target_os = "macos"))]
     fn editor_chords_never_fire_in_a_pane() {
         let eff = effective(&user(&[]));
         let pane = stack(&["Terminal"]);
-        for key in ["s", "z", "y", "a", "c", "v", "x"] {
+        for key in ["s", "z", "y", "a", "c", "v", "x", "f", "h", "g"] {
             let typed = normalize(&format!("ctrl-{key}")).unwrap();
             for (chord, context, action) in placed(&eff, &text_chords_here()) {
                 if chord != typed {
@@ -872,6 +1046,9 @@ mod tests {
             }
         }
         assert_eq!(chord(&eff, "SaveFile"), normalize("ctrl-s").as_deref());
+        for (action, keys) in FIND_CHORDS {
+            assert_eq!(chord(&eff, action), normalize(keys).as_deref(), "{action}");
+        }
         // the panes' own chords stay theirs: none of the editor's takes Ctrl+Shift+C, V, F or G
         for key in ["c", "v", "f", "g"] {
             let taken = normalize(&format!("ctrl-shift-{key}")).unwrap();
@@ -1162,7 +1339,9 @@ mod tests {
     fn ctrl_shift_h_folds_the_session_and_ctrl_h_stays_the_shells() {
         assert_eq!(chord(&effective(&user(&[])), "ToggleSessionCollapsed"), normalize("ctrl-shift-h").as_deref());
         assert_eq!(fired(&from_xkb("h", true, Some("H"))), ["ToggleSessionCollapsed"]);
-        assert!(fired(&from_xkb("h", false, None)).is_empty(), "Ctrl+H is a backspace to the pane");
+        // Ctrl+H is the editor's Replace, and a backspace to the pane (`editor_chords_never_fire_in_a_pane`)
+        assert_eq!(fired(&from_xkb("h", false, None)), ["ReplaceInFile"]);
+        assert_eq!(context_of("ReplaceInFile"), Some(EDITOR));
     }
 
     #[test]

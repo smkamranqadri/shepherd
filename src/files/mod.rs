@@ -3,6 +3,7 @@ pub mod content;
 pub mod diff;
 pub mod dir_watch;
 pub mod drafts;
+pub mod find;
 pub mod fuzzy;
 pub mod git_ops;
 pub mod highlight;

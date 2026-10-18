@@ -451,12 +451,17 @@ fn match_at(text: &str, at: usize, needle: &str, case: bool) -> Option<usize> {
 /// The matches of `needle` in `text`, as rg's fixed-string search finds them: left to right, not overlapping,
 /// `case` exact or not, `word` with no word character either side.
 pub fn find_ranges(text: &str, needle: &str, case: bool, word: bool) -> Vec<Range<usize>> {
+    find_ranges_capped(text, needle, case, word, usize::MAX)
+}
+
+/// `find_ranges`, stopping once it has `cap` of them (the editor's find bar counts to a cap).
+pub fn find_ranges_capped(text: &str, needle: &str, case: bool, word: bool, cap: usize) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     if needle.is_empty() {
         return out;
     }
     let mut at = 0;
-    while at < text.len() {
+    while at < text.len() && out.len() < cap {
         if let Some(end) = match_at(text, at, needle, case) {
             let before = text[..at].chars().next_back().is_some_and(is_word);
             let after = text[end..].chars().next().is_some_and(is_word);

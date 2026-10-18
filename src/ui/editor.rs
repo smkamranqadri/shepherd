@@ -27,7 +27,7 @@
 //! The gutter marks the lines changed against git's index, and those staged (HEAD to index) as outlines
 //! (`files::line_changes`): its blobs are fetched when the file opens and when git's state may have moved
 //! (`git_changed`), and the buffer is diffed against them a moment after typing stops.
-use crate::bindings::SaveFile;
+use crate::bindings::{FindInFile, GoToLine, ReplaceInFile, SaveFile};
 use crate::files::content::{self, FileKind};
 use crate::files::drafts::{self, Draft, Restore};
 use crate::files::highlight;
@@ -540,6 +540,8 @@ pub struct FileEditor {
     ask_on_look: bool,
     /// Tells this editor apart in `dirty_editors`.
     id: u64,
+    /// The find bar and Go to Line (`editor_find`).
+    find: crate::ui::editor_find::Find,
     _theme: Subscription,
 }
 
@@ -558,7 +560,8 @@ impl Focusable for FileEditor {
             return compare.read(cx).focus_handle(cx);
         }
         match &self.body {
-            Body::Edit(e) if !self.preview_shown() => e.state.read(cx).focus_handle(cx),
+            // the find bar's or Go to Line's field while it has the keyboard, else the text
+            Body::Edit(e) if !self.preview_shown() => self.find.focus_handle(&e.state, cx).unwrap_or_else(|| e.state.read(cx).focus_handle(cx)),
             Body::View { viewer, .. } => viewer.read(cx).focus_handle(cx),
             _ => self.focus.clone(),
         }
@@ -624,6 +627,7 @@ impl FileEditor {
                 static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
+            find: Default::default(),
             _theme: theme,
         }
     }
@@ -638,6 +642,13 @@ impl FileEditor {
             Body::Edit(e) => Some(&e.state),
             _ => None,
         }
+    }
+
+    /// The text for Find and Go to Line, a markdown file's source shown first; none while a Compare is in its place.
+    pub(crate) fn show_source(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<EditorState>> {
+        let state = self.editor_state().filter(|_| self.compare.is_none()).cloned()?;
+        self.set_preview(false, window, cx);
+        Some(state)
     }
 
     /// Markdown's preview is on screen (in the editor, or the viewer's).
@@ -836,7 +847,7 @@ impl FileEditor {
                 .folding(false)
                 .soft_wrap(false)
                 .tab_size(TabSize { tab_size: 4, hard_tabs });
-            // ponytail: its find bar is gpui-component's; Shepherd's own comes with E3
+            // its find bar is gpui-component's: Shepherd's is `editor_find`'s
             state.set_searchable(false, cx);
             state.set_editor_style(style);
             state.set_editor_paddings(gpui::Edges { left: px(GUTTER_PAD), top: px(4.), ..Default::default() });
@@ -2067,9 +2078,11 @@ impl FileEditor {
         out
     }
 
-    /// What sits between the banners and the text (a find bar): none yet.
-    fn overlays(&self, _theme: &Theme, _cx: &mut Context<Self>) -> Vec<AnyElement> {
-        Vec::new()
+    /// What sits between the banners and the text: the find bar, and Go to Line drawn over the text. Neither while
+    /// the preview or a Compare is in the text's place.
+    fn overlays(&self, _theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(state) = self.editor_state() else { return Vec::new() };
+        self.find.elements(state, !self.preview_shown() && self.compare.is_none(), cx)
     }
 
     /// The text: a Compare, markdown's preview, or the editor.
@@ -2137,6 +2150,18 @@ impl Render for FileEditor {
             // the editor's text and a markdown preview's alike
             .on_action(cx.listener(|e, _: &SaveFile, window, cx| {
                 let _ = e.save_as(SaveMode::Safe, true, window, cx);
+            }))
+            .on_action(cx.listener(|e, _: &FindInFile, window, cx| e.show_source(window, cx).into_iter().for_each(|s| e.find.find(s, false, window, cx))))
+            .on_action(cx.listener(|e, _: &ReplaceInFile, window, cx| e.show_source(window, cx).into_iter().for_each(|s| e.find.find(s, true, window, cx))))
+            .on_action(cx.listener(|e, _: &GoToLine, window, cx| e.show_source(window, cx).into_iter().for_each(|s| e.find.go_to_line(s, window, cx))))
+            // Esc in the text, the find bar or Go to Line closes them, before the input takes it; else it is the text's
+            .capture_action(cx.listener(|e, _: &gpui_base::input::Escape, window, cx| {
+                let shown = !e.preview_shown() && e.compare.is_none();
+                if let Body::Edit(b) = &e.body
+                    && e.find.escape(&b.state, shown, window, cx)
+                {
+                    cx.stop_propagation();
+                }
             }))
             .size_full()
             .flex()
