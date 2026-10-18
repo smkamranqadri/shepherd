@@ -429,9 +429,54 @@ pub(super) fn saved_folds(s: &crate::settings::Settings) -> HashSet<String> {
     s.collapsed_sessions.iter().cloned().chain(s.collapsed_machines.iter().map(|id| group_key(id))).collect()
 }
 
-/// A click on a machine's row: its group folds when it is open, opens when it is folded, in the settings.
-pub(super) fn fold_machine(s: &mut crate::settings::Settings, id: &str) {
-    toggle_in(&mut s.collapsed_machines, id);
+/// A click on a machine's row: its group folds when it is open, opens when it is folded, in the settings; and
+/// whether it changed: never while a search is on (`searching`), which shows every group open.
+pub(super) fn fold_machine(s: &mut crate::settings::Settings, id: &str, searching: bool) -> bool {
+    fold_saved(&mut s.collapsed_machines, id, searching)
+}
+
+/// The machine `id`'s group opens, if it is folded: a session of it is shown now. Whether it was.
+pub(super) fn unfold_machine(s: &mut crate::settings::Settings, id: &str) -> bool {
+    let before = s.collapsed_machines.len();
+    s.collapsed_machines.retain(|m| m != id);
+    s.collapsed_machines.len() != before
+}
+
+/// What Fold or unfold the session does: the shown session's machine folded (`machine`) opens first, so the session
+/// shows; else the session folds or opens, when the tree gives it a header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ShownFold {
+    UnfoldMachine(String),
+    FoldSession,
+    Nothing,
+}
+
+pub(super) fn shown_fold(rows: &[TreeRow], shown: &SessionKey, machine: Option<&str>) -> ShownFold {
+    match machine {
+        Some(m) if rows.iter().any(|r| matches!(r, TreeRow::Machine { id, collapsed: true, .. } if id == m)) => ShownFold::UnfoldMachine(m.to_string()),
+        _ if foldable(rows, shown) => ShownFold::FoldSession,
+        _ => ShownFold::Nothing,
+    }
+}
+
+/// A folded machine's ●N is faded while none of its sessions answers: the count is their last word.
+pub(super) fn pill_faded(status: Status) -> bool {
+    status == Status::Unreachable
+}
+
+/// The agent that has waited longest among `sessions` (each its key, snapshot and clocks), else the first that
+/// waits: its session, tab and pane. A folded machine's ●N goes there.
+pub(super) fn longest_waiting_among<'a>(sessions: impl IntoIterator<Item = (SessionKey, &'a Snapshot, &'a crate::model::Since)>) -> Option<(SessionKey, String, String)> {
+    sessions
+        .into_iter()
+        .flat_map(|(key, s, since)| {
+            s.panes
+                .iter()
+                .filter(|p| p.agent.is_some() && crate::notify::wants_attention(p.agent_status))
+                .map(move |p| (key.clone(), crate::model::waiting_since(since, p), p))
+        })
+        .min_by_key(|(_, at, _)| (at.is_none(), *at))
+        .map(|(key, _, p)| (key, p.tab_id.clone(), p.pane_id.clone()))
 }
 
 /// The tree's rows for `places` (in [`tree_order`]), their watchers and the folds (`saved_folds`: sessions, and
@@ -697,22 +742,38 @@ impl Shell {
     /// A click on a machine's row folds or unfolds its group, as a session's row folds its workspaces; never while a
     /// search shows every group open.
     fn toggle_machine_fold(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self.search_query(cx).is_some() {
+        let searching = self.search_query(cx).is_some();
+        let mut settings = SettingsGlobal::of(cx).settings.clone();
+        if !fold_machine(&mut settings, id, searching) {
             return;
         }
         // a drop aimed mid drag: the rows under it fold away or come in
         self.tree.drop = None;
-        let id = id.to_string();
-        save_from_sidebar(cx, move |s| fold_machine(s, &id));
+        let folded = settings.collapsed_machines;
+        save_from_sidebar(cx, move |s| s.collapsed_machines = folded);
         cx.notify();
+    }
+
+    /// A session of the machine `id` is shown: its group opens if it was folded, so the session is not hidden.
+    pub(super) fn reveal_machine(&mut self, id: &str, cx: &mut Context<Self>) {
+        if SettingsGlobal::of(cx).settings.collapsed_machines.iter().any(|m| m == id) {
+            let id = id.to_string();
+            save_from_sidebar(cx, move |s| {
+                unfold_machine(s, &id);
+            });
+            cx.notify();
+        }
     }
 
     /// Fold or unfold the session: the shown one's header, as a click on it does, whether the sidebar shows, peeks
     /// or is hidden (it is not brought out); nothing when the tree gives it no header.
     pub(super) fn toggle_shown_session(&mut self, cx: &mut Context<Self>) {
         let (view, shown, _) = self.shown_tree(cx);
-        if foldable(&view.rows, &shown) {
-            self.toggle_collapsed(&shown, cx);
+        let machine = self.places.iter().find(|p| SessionKey::of(p) == shown).map(|p| machine_of(p).to_string());
+        match shown_fold(&view.rows, &shown, machine.as_deref()) {
+            ShownFold::UnfoldMachine(m) => self.reveal_machine(&m, cx),
+            ShownFold::FoldSession => self.toggle_collapsed(&shown, cx),
+            ShownFold::Nothing => {}
         }
     }
 
@@ -898,6 +959,7 @@ impl Shell {
         let badge = (waiting > 0).then(|| {
             let target = id.clone();
             waiting_pill(theme, waiting)
+                .when(pill_faded(status), |el| el.opacity(0.5))
                 .id(SharedString::from(format!("tree-machine-waiting-{id}")))
                 .cursor_pointer()
                 .tooltip(tip("Go to the agent that has waited longest", None))
@@ -951,19 +1013,19 @@ impl Shell {
             .into_any_element()
     }
 
-    /// A folded machine's ●N: the agent that has waited longest in the first of its sessions with one waiting.
+    /// A folded machine's ●N: the agent that has waited longest in any of its sessions.
     fn go_to_longest_waiting_on(&mut self, machine: &str, cx: &mut Context<Self>) {
         let shown = self.shown_key();
-        let found = self.places.iter().filter(|p| machine_of(p) == machine).find_map(|p| {
+        let sessions = self.places.iter().filter(|p| machine_of(p) == machine).filter_map(|p| {
             let key = SessionKey::of(p);
-            let at = if shown.as_ref() == Some(&key) {
-                self.snapshot.as_ref().and_then(|s| longest_waiting(s, &self.since))
+            if shown.as_ref() == Some(&key) {
+                Some((key, self.snapshot.as_ref()?, &self.since))
             } else {
-                self.watchers.get(&key).and_then(|w| longest_waiting(w.snapshot.as_ref()?, &w.since))
-            };
-            at.map(|(tab, pane)| (key, tab, pane))
+                let w = self.watchers.get(&key)?;
+                Some((key, w.snapshot.as_ref()?, &w.since))
+            }
         });
-        if let Some((key, tab, pane)) = found {
+        if let Some((key, tab, pane)) = longest_waiting_among(sessions) {
             self.go_to(key, Goal::Pane { tab, pane }, cx);
         }
     }
@@ -1910,13 +1972,13 @@ mod tests {
         assert!(old.collapsed_machines.is_empty(), "a file from before machine folds");
         let mut s = crate::settings::Settings::default();
         assert!(s.collapsed_machines.is_empty());
-        fold_machine(&mut s, "you@box");
-        fold_machine(&mut s, LOCAL);
+        fold_machine(&mut s, "you@box", false);
+        fold_machine(&mut s, LOCAL, false);
         let back: crate::settings::Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.collapsed_machines, ["you@box", LOCAL]);
         assert!(back.collapsed_sessions.is_empty());
         assert_eq!(saved_folds(&back), HashSet::from([group_key("you@box"), group_key(LOCAL)]));
-        fold_machine(&mut s, "you@box");
+        fold_machine(&mut s, "you@box", false);
         assert_eq!(s.collapsed_machines, [LOCAL], "a second click opens it");
         let both = crate::settings::Settings { collapsed_sessions: vec!["/tmp/a.sock".into()], ..back };
         assert_eq!(saved_folds(&both).len(), 3);
@@ -1934,5 +1996,74 @@ mod tests {
         // focus mode on a machine's session shows its workspaces whatever its machine's fold
         let focused = tree_view(&places, &w, &folds, Some(&shown), &SessionKey("machine:a".into()), true, None);
         assert_eq!(kinds(&focused.rows), ["W machine:a"]);
+    }
+
+    #[test]
+    fn a_click_during_a_search_folds_no_machine() {
+        let mut s = crate::settings::Settings::default();
+        assert!(!fold_machine(&mut s, "you@box", true));
+        assert!(s.collapsed_machines.is_empty(), "the search shows it open: nothing saved");
+        assert!(fold_machine(&mut s, "you@box", false));
+        assert!(!fold_machine(&mut s, "you@box", true));
+        assert_eq!(s.collapsed_machines, ["you@box"], "nor opened");
+    }
+
+    #[test]
+    fn a_session_switched_to_opens_its_machine() {
+        let mut s = crate::settings::Settings { collapsed_machines: vec![LOCAL.into(), "you@box".into()], ..Default::default() };
+        assert!(unfold_machine(&mut s, "you@box"));
+        assert_eq!(s.collapsed_machines, [LOCAL]);
+        assert!(!unfold_machine(&mut s, "you@box"), "open already");
+        assert!(unfold_machine(&mut s, LOCAL));
+        assert!(s.collapsed_machines.is_empty());
+    }
+
+    #[test]
+    fn fold_or_unfold_the_session_opens_its_folded_machine_first() {
+        let (places, w, shown) = two_machines();
+        let folded = tree(&places, &w, &[group_key(LOCAL)].into(), Some(&shown));
+        assert_eq!(shown_fold(&folded, &key("default"), Some(LOCAL)), ShownFold::UnfoldMachine(LOCAL.into()));
+        let open = tree(&places, &w, &HashSet::new(), Some(&shown));
+        assert_eq!(shown_fold(&open, &key("default"), Some(LOCAL)), ShownFold::FoldSession);
+        // another machine folded: only the shown session folds
+        let other = tree(&places, &w, &[group_key("you@box")].into(), Some(&shown));
+        assert_eq!(shown_fold(&other, &key("default"), Some(LOCAL)), ShownFold::FoldSession);
+        // a socket of one's own: no header, nothing
+        assert_eq!(shown_fold(&open, &key("own"), None), ShownFold::Nothing);
+    }
+
+    #[test]
+    fn a_folded_machine_out_of_reach_fades_its_count() {
+        let (places, mut w, shown) = two_machines();
+        let now = Instant::now();
+        for k in ["machine:a", "machine:c"] {
+            for _ in 0..2 {
+                w.apply(&SessionKey(k.into()), Err(anyhow::anyhow!("timed out")), now);
+            }
+        }
+        let rows = tree(&places, &w, &[group_key("you@box")].into(), Some(&shown));
+        assert!(matches!(rows[4], TreeRow::Machine { status: Status::Unreachable, collapsed: true, waiting: 2, .. }), "{:?}", rows[4]);
+        assert!(pill_faded(Status::Unreachable));
+        assert!(!pill_faded(Status::Live));
+        // one session still answering: the machine is live, its count not faded
+        w.apply(&SessionKey("machine:a".into()), Ok(snapshot(&[("w1", None)])), now);
+        let rows = tree(&places, &w, &[group_key("you@box")].into(), Some(&shown));
+        assert!(matches!(rows[4], TreeRow::Machine { status: Status::Live, .. }));
+    }
+
+    #[test]
+    fn a_folded_machine_s_count_goes_to_its_longest_wait() {
+        let s = snapshot(&[("w1", None)]);
+        let (mut early, mut late) = (crate::model::Since::new(), crate::model::Since::new());
+        let t0 = Instant::now();
+        late.insert("p1".into(), (crate::model::AgentStatus::Blocked, t0 + Duration::from_secs(60)));
+        early.insert("p1".into(), (crate::model::AgentStatus::Blocked, t0));
+        let (a, c) = (SessionKey("machine:a".into()), SessionKey("machine:c".into()));
+        let found = longest_waiting_among([(a.clone(), &s, &late), (c.clone(), &s, &early)]);
+        assert_eq!(found, Some((c.clone(), "t1".to_string(), "p1".to_string())), "not the first session's");
+        let none = crate::model::Since::new();
+        assert_eq!(longest_waiting_among([(a.clone(), &s, &none), (c.clone(), &s, &early)]).map(|f| f.0), Some(c), "a known wait before an unknown one");
+        assert_eq!(longest_waiting_among([(a.clone(), &s, &none)]).map(|f| f.0), Some(a), "else the first that waits");
+        assert_eq!(longest_waiting_among(std::iter::empty()), None);
     }
 }

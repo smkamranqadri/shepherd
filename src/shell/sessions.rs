@@ -468,6 +468,7 @@ impl Shell {
         // the default session is where Shepherd looks without a socket set, so it leaves the setting empty
         let socket = (!session.default).then_some(session.socket_path);
         self.move_to(socket, None, cx);
+        self.reveal_machine(sidebar_tree::LOCAL, cx);
     }
 
     /// Moves the window to a saved machine, through its relay.
@@ -476,6 +477,7 @@ impl Shell {
             Ok(socket) => {
                 self.move_to(Some(socket.to_string_lossy().into_owned()), Some(machine.id.clone()), cx);
                 crate::herdr::show_machine(Some(machine.target.clone()));
+                self.reveal_machine(&machine.target, cx);
                 self.machine_label = Some(machine.label);
                 self.machine_id = Some(machine.id);
             }
