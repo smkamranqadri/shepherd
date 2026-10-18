@@ -1464,7 +1464,7 @@ impl Render for Shell {
         let (viewer, _) = self.sync_file_tabs(window, cx);
         // a file tab shown in the grid's place keeps the keyboard from herdr's focused pane, as an overlay does
         let file_shown = self.shown_file_tab().is_some();
-        let covered = self.settings.is_some() || self.command_panel.as_ref().is_some_and(|p| p.is_open()) || self.floating_open() || file_shown;
+        let covered = self.settings.is_some() || self.command_panel.as_ref().is_some_and(|p| p.is_open()) || self.floating_open() || file_shown || self.side_panel.read(cx).focus_handle(cx).contains_focused(window, cx);
         // a field of the sidebar's (its search, a workspace being renamed) typed in keeps the keyboard too: herdr
         // moving its focus, or a switch, must not hand it back to a pane mid word
         let typing = self.sidebar_search.as_ref().is_some_and(|s| s.input.read(cx).focus_handle(cx).is_focused(window))

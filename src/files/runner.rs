@@ -104,8 +104,20 @@ fn git_cmd_in(cwd: &Path, args: &[&str], inherited: impl IntoIterator<Item = Str
 
 /// The child, its stdout piped, killed when dropped.
 fn spawn(cmd: &Cmd, stderr: bool) -> Result<tokio::process::Child, RunError> {
+    spawn_in(cmd, stderr, false)
+}
+
+/// `spawn`; with `group`, the child leads a process group of its own (on unix), which its children (a git hook, a
+/// clean filter) join, so one signal reaches them all.
+fn spawn_in(cmd: &Cmd, stderr: bool, group: bool) -> Result<tokio::process::Child, RunError> {
     let mut command = tokio::process::Command::new(&cmd.program);
     command.args(&cmd.args).current_dir(&cmd.cwd).kill_on_drop(true);
+    #[cfg(unix)]
+    if group {
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = group;
     // git and rg are console programs: on Windows they'd each open a console window (`crate::process::command`)
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
@@ -178,6 +190,84 @@ pub async fn run(host: &Host, cmd: Cmd, limits: Limits) -> Result<Output, RunErr
     // ponytail: stderr is read beside stdout, so a child that keeps stderr open past a truncation is waited on
     // until the deadline; git and rg close both together
     tokio::time::timeout(limits.timeout, job).await.map_err(|_| RunError::Timeout)?
+}
+
+/// Sends `signal` to the process group `pid` leads; nothing once it is gone.
+#[cfg(unix)]
+fn signal_group(pid: u32, signal: i32) {
+    if let Ok(pid) = i32::try_from(pid) {
+        // SAFETY: kill(2) takes plain integers; a group already gone answers ESRCH
+        unsafe { libc::kill(-pid, signal) };
+    }
+}
+
+/// A group `run_stopping` started, killed if the future waiting on it is dropped before it ends.
+#[cfg(unix)]
+struct GroupGuard(Option<u32>);
+
+#[cfg(unix)]
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0.take() {
+            signal_group(pid, libc::SIGKILL);
+        }
+    }
+}
+
+/// `run` for a command that must not be killed outright: the child leads its own process group, and its deadline
+/// asks the whole group to stop (SIGTERM), so git takes its `index.lock` away (its tempfile handler) and its hooks
+/// and filters end with it; whatever is left after `grace` is killed. A future dropped early kills the group. Other
+/// platforms are `run`.
+pub async fn run_stopping(host: &Host, cmd: Cmd, limits: Limits, grace: Duration) -> Result<Output, RunError> {
+    #[cfg(not(unix))]
+    {
+        let _ = grace;
+        return run(host, cmd, limits).await;
+    }
+    #[cfg(unix)]
+    {
+        if let Host::Ssh { .. } = host {
+            return Err(RunError::RemoteUnsupported);
+        }
+        let mut child = spawn_in(&cmd, true, true)?;
+        let pid = child.id();
+        let mut guard = GroupGuard(pid);
+        let (stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+        let job = async {
+            let out = async {
+                let mut kept = Vec::new();
+                if let Some(stdout) = stdout {
+                    let _ = stdout.take(limits.max_bytes as u64 + 1).read_to_end(&mut kept).await;
+                }
+                kept
+            };
+            let (mut stdout, stderr, ()) = tokio::join!(out, read_capped(stderr, STDERR_CAP), feed(stdin, cmd.stdin.clone()));
+            let truncated = stdout.len() > limits.max_bytes;
+            if truncated {
+                stdout.truncate(limits.max_bytes);
+                let _ = child.start_kill();
+            }
+            let status = child.wait().await.map_err(|e| RunError::Io(e.to_string()))?;
+            Ok(Output { code: status.code(), stdout, stderr: String::from_utf8_lossy(&stderr).into_owned(), truncated })
+        };
+        tokio::pin!(job);
+        let result = tokio::select! {
+            done = &mut job => done,
+            _ = tokio::time::sleep(limits.timeout) => {
+                if let Some(pid) = pid {
+                    signal_group(pid, libc::SIGTERM);
+                    if tokio::time::timeout(grace, &mut job).await.is_err() {
+                        signal_group(pid, libc::SIGKILL);
+                        let _ = tokio::time::timeout(Duration::from_secs(2), &mut job).await;
+                    }
+                }
+                Err(RunError::Timeout)
+            }
+        };
+        // ended, or stopped above: the group's id is not ours to signal any more
+        guard.0 = None;
+        result
+    }
 }
 
 /// What a stream sends: its lines in batches, then how the child ended.

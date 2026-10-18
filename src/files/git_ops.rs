@@ -13,11 +13,17 @@ use std::time::Duration;
 const OP: Limits = Limits { timeout: Duration::from_secs(30), max_bytes: 1 << 20 };
 /// Stage All walks the root's whole work tree.
 const ALL: Limits = Limits { timeout: Duration::from_secs(60), max_bytes: 1 << 20 };
-/// A commit runs its hooks (a test suite, a linter), so it is given a long while; it has no cancel, as a kill would
-/// leave `index.lock` behind.
+/// A commit runs its hooks (a test suite, a linter), so it is given a long while. It has no cancel: at its deadline
+/// it is stopped as every command here is (`runner::run_stopping`), since SIGKILL mid-hook would leave no lock but
+/// orphan the hook, and mid-write would leave `index.lock`.
 const COMMIT: Limits = Limits { timeout: Duration::from_secs(5 * 60), max_bytes: 1 << 20 };
 /// `rev-parse` and `log -1`: a line or a message.
 const QUICK: Limits = Limits { timeout: Duration::from_secs(5), max_bytes: 1 << 20 };
+/// How long a command asked to stop at its deadline (SIGTERM to its group, which lets git take `index.lock` away)
+/// has before it is killed.
+const GRACE: Duration = Duration::from_secs(3);
+/// What a busy index's failure adds to git's words.
+pub const STALE_LOCK: &str = "If no other git is running, one that crashed left the lock behind: delete that index.lock file, then Retry.";
 /// What of a failure's output the tab shows.
 const FAILURE_LINES: usize = 20;
 
@@ -257,6 +263,8 @@ pub enum Kind {
     NothingStaged,
     /// A pre-commit or commit-msg hook said no; its own output says why.
     HookFailed,
+    /// Nothing was left of the message once git stripped it (`commit.cleanup=strip` takes `#` lines).
+    EmptyMessage,
     /// Another git (a pane's, an editor's) holds `index.lock`: try again.
     IndexLocked,
     /// No user.name or user.email.
@@ -283,6 +291,7 @@ impl Failure {
         match self.kind {
             Kind::NothingStaged => "Nothing staged to commit".into(),
             Kind::HookFailed => "A git hook stopped the commit".into(),
+            Kind::EmptyMessage => "The message is empty once git strips its comments".into(),
             Kind::IndexLocked => "Git is busy: another git command holds the index".into(),
             Kind::IdentityUnknown => "Set user.name and user.email".into(),
             Kind::SigningFailed => "Signing the commit failed".into(),
@@ -316,6 +325,8 @@ pub fn classify_commit(code: Option<i32>, stdout: &str, stderr: &str) -> Kind {
         Kind::SigningFailed
     } else if all.contains("nothing to commit") || all.contains("no changes added to commit") || all.contains("nothing added to commit") {
         Kind::NothingStaged
+    } else if all.contains("Aborting commit due to empty commit message") {
+        Kind::EmptyMessage
     } else if code == Some(1) && !gits {
         Kind::HookFailed
     } else {
@@ -328,18 +339,24 @@ fn classify_op(stderr: &str) -> Kind {
     if index_locked(stderr) { Kind::IndexLocked } else { Kind::Other }
 }
 
-/// A run's output, `Ok` on exit 0.
+/// A run's output, `Ok` on exit 0; stopped, not killed, at its deadline.
 async fn git(cmd: Cmd, limits: Limits, commit: bool) -> Result<String, Failure> {
-    match runner::run(&Host::Local, cmd, limits).await {
+    match runner::run_stopping(&Host::Local, cmd, limits, GRACE).await {
         Ok(out) if out.code == Some(0) => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let kind = if commit { classify_commit(out.code, &stdout, &out.stderr) } else { classify_op(&out.stderr) };
-            let text = failure_text(&stdout, &out.stderr);
-            Err(Failure { kind, text: if text.is_empty() { format!("git exited with status {:?}", out.code) } else { text } })
+            let mut text = failure_text(&stdout, &out.stderr);
+            if text.is_empty() {
+                text = format!("git exited with status {:?}", out.code);
+            }
+            if kind == Kind::IndexLocked {
+                text = format!("{text}\n{STALE_LOCK}");
+            }
+            Err(Failure { kind, text })
         }
         Err(RunError::NotFound(_)) => Err(Failure::other("Git isn't installed")),
-        Err(RunError::Timeout) => Err(Failure::other(format!("git didn't finish within {} seconds", limits.timeout.as_secs()))),
+        Err(RunError::Timeout) => Err(Failure::other(format!("git didn't finish within {} seconds and was stopped", limits.timeout.as_secs()))),
         Err(e) => Err(Failure::other(e.to_string())),
     }
 }
@@ -360,6 +377,11 @@ async fn initial(root: &Path) -> Result<bool, Failure> {
 
 /// Runs `op` in `root`'s repository. Whether it has a first commit is asked here, as the unstage commands differ.
 pub async fn run(root: PathBuf, op: Op) -> Result<(), Failure> {
+    run_within(root, op, None).await
+}
+
+/// `run`, its deadline `timeout` instead of the op's own when given (a test's slow filter).
+pub(crate) async fn run_within(root: PathBuf, op: Op, timeout: Option<Duration>) -> Result<(), Failure> {
     let top = top(&root).await?;
     let first = match op {
         Op::Unstage(_) | Op::UnstageAll => initial(&root).await?,
@@ -370,7 +392,7 @@ pub async fn run(root: PathBuf, op: Op) -> Result<(), Failure> {
         Ok(None) => return Ok(()),
         Err(refused) => return Err(Failure::other(format!("{refused:?}"))),
     };
-    let limits = Limits { timeout: inv.limits.0, max_bytes: inv.limits.1 };
+    let limits = Limits { timeout: timeout.unwrap_or(inv.limits.0), max_bytes: inv.limits.1 };
     git(command(&inv, &top, &root), limits, matches!(op, Op::Commit { .. })).await.map(|_| ())
 }
 
@@ -524,6 +546,8 @@ mod tests {
         assert_eq!(classify_commit(Some(128), "", "fatal: could not parse HEAD\n"), Kind::Other);
         assert_eq!(classify_commit(Some(1), "", "error: something git said\n"), Kind::Other);
         assert_eq!(classify_commit(None, "", ""), Kind::Other);
+        // git words this one without `fatal:`; it is not a hook's
+        assert_eq!(classify_commit(Some(1), "", "Aborting commit due to empty commit message.\n"), Kind::EmptyMessage);
         assert_eq!(classify_op("fatal: Unable to create '/r/.git/index.lock': File exists."), Kind::IndexLocked);
         assert_eq!(classify_op("fatal: pathspec 'x' did not match any files"), Kind::Other);
     }

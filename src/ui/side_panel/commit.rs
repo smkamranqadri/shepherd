@@ -14,8 +14,7 @@ use gpui::{
     Styled, Subscription, Window, div, prelude::*, px,
 };
 use gpui_base::input::{Enter, InputEvent, Textarea, TextareaState};
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
 const PLACEHOLDER: &str = "Message (⌘Enter to commit)";
@@ -43,8 +42,8 @@ struct Shown {
 pub(super) struct CommitBox {
     input: Option<Entity<TextareaState>>,
     _events: Vec<Subscription>,
-    /// Each root's message while another root shows.
-    drafts: HashMap<PathBuf, String>,
+    /// Each root's message while another root shows; none kept empty.
+    drafts: Kept<String>,
     /// The root whose message the input holds.
     shown_for: Option<PathBuf>,
     /// Amending the last commit: the message that was in the box before, put back by Stop amending.
@@ -52,8 +51,64 @@ pub(super) struct CommitBox {
     busy: Option<Busy>,
     error: Option<Shown>,
     /// The roots whose box was started from their merge's `MERGE_MSG`, so clearing it does not fill it again.
-    merge_filled: HashSet<PathBuf>,
+    merge_filled: Kept<()>,
     menu: Option<crate::ui::Popup<Point<Pixels>>>,
+}
+
+/// How many roots' drafts (and merge fills) are kept: the latest, a workspace's worth of repositories.
+const MEMORY: usize = 32;
+
+/// A value per root, the most recently put last, at most `MEMORY` of them (the oldest goes first).
+struct Kept<T>(Vec<(PathBuf, T)>);
+
+impl<T> Default for Kept<T> {
+    fn default() -> Self {
+        Kept(Vec::new())
+    }
+}
+
+impl<T> Kept<T> {
+    fn get(&self, root: &Path) -> Option<&T> {
+        self.0.iter().find(|(r, _)| r == root).map(|(_, v)| v)
+    }
+
+    fn take(&mut self, root: &Path) -> Option<T> {
+        let i = self.0.iter().position(|(r, _)| r == root)?;
+        Some(self.0.remove(i).1)
+    }
+
+    fn put(&mut self, root: PathBuf, value: T) {
+        self.take(&root);
+        self.0.push((root, value));
+        if self.0.len() > MEMORY {
+            self.0.remove(0);
+        }
+    }
+}
+
+impl CommitBox {
+    /// The shown root's box is left for another: its message is kept unless empty (an amend's is the one from
+    /// before it, as Stop amending would give back).
+    fn leave(&mut self, old: PathBuf, typed: String) {
+        let kept = self.amend.take().unwrap_or(typed);
+        if !kept.trim().is_empty() {
+            self.drafts.put(old, kept);
+        }
+    }
+
+    /// `committed` landed in `root`'s repository, `now` the shown box's text: whether the box empties. Only the root
+    /// it was committed from leaves amending, and its text goes only if it is still what was committed (what was
+    /// typed meanwhile stays); a root no longer shown loses its kept draft on the same terms.
+    fn committed(&mut self, root: &Path, committed: &str, now: &str) -> bool {
+        if self.shown_for.as_deref() == Some(root) {
+            self.amend = None;
+            return now == committed;
+        }
+        if self.drafts.get(root).is_some_and(|d| d == committed) {
+            self.drafts.take(root);
+        }
+        false
+    }
 }
 
 /// Why Commit is disabled, or `None` when it is not: a run under way, a conflict in the list, no message, or
@@ -139,19 +194,18 @@ impl SidePanel {
         if self.commit.shown_for.as_ref() != Some(&root) {
             if let Some(old) = self.commit.shown_for.take() {
                 let typed = self.commit_message(cx);
-                let kept = self.commit.amend.take().unwrap_or(typed);
-                self.commit.drafts.insert(old, kept);
+                self.commit.leave(old, typed);
             }
             self.commit.amend = None;
-            let back = self.commit.drafts.remove(&root).unwrap_or_default();
+            let back = self.commit.drafts.take(&root).unwrap_or_default();
             self.set_commit_message(&back, window, cx);
             self.commit.shown_for = Some(root.clone());
         }
         let Some(repo) = self.changes_answer().map(|a| a.repo.clone()) else { return };
-        if !repo.merging {
-            self.commit.merge_filled.remove(&root);
-        } else if let Some(msg) = repo.merge_msg.filter(|_| self.commit.amend.is_none() && !self.commit.merge_filled.contains(&root)) {
-            self.commit.merge_filled.insert(root);
+        if !repo.merging && repo.picking.is_none() {
+            self.commit.merge_filled.take(&root);
+        } else if let Some(msg) = repo.merge_msg.filter(|_| self.commit.amend.is_none() && self.commit.merge_filled.get(&root).is_none()) {
+            self.commit.merge_filled.put(root, ());
             if self.commit_message(cx).trim().is_empty() {
                 self.set_commit_message(&msg, window, cx);
             }
@@ -178,10 +232,9 @@ impl SidePanel {
     fn land_git_op(&mut self, root: PathBuf, op: Op, result: Result<(), Failure>, window: &mut Window, cx: &mut Context<Self>) {
         self.commit.busy = None;
         match result {
-            Ok(()) if matches!(op, Op::Commit { .. }) => {
-                self.commit.amend = None;
-                self.commit.drafts.remove(&root);
-                if self.commit.shown_for.as_ref() == Some(&root) {
+            Ok(()) if let Op::Commit { message, .. } = &op => {
+                let now = self.commit_message(cx);
+                if self.commit.committed(&root, message, &now) {
                     self.set_commit_message("", window, cx);
                 }
             }
@@ -328,6 +381,7 @@ impl SidePanel {
             .child(Textarea::new(&input));
         let note = |text: String, color| div().mx(px(12.)).text_size(px(11.5)).text_color(color).child(text);
         let rebase = repo.rebasing.then(|| note("A rebase is under way: this commit goes into it. Continue the rebase in a terminal.".into(), theme.warning));
+        let picking = repo.picking.map(|what| note(format!("A {what} stopped on a conflict: this commit concludes it."), theme.warning));
         let amending = amend.then(|| {
             div()
                 .mx(px(12.))
@@ -414,6 +468,7 @@ impl SidePanel {
                 .gap(px(6.))
                 .child(field)
                 .children(rebase)
+                .children(picking)
                 .children(amending)
                 .child(buttons)
                 .children(error)
@@ -501,5 +556,53 @@ mod tests {
         assert_eq!(commit_blocked("Fix it", 2, 0, 1, false, false), Some("Resolve conflicts first"));
         assert_eq!(commit_blocked("Fix it", 2, 0, 1, true, false), Some("Resolve conflicts first"));
         assert_eq!(commit_blocked("Fix it", 1, 0, 0, false, true), Some("Git is running"));
+    }
+
+    fn shown(root: &str) -> CommitBox {
+        CommitBox { shown_for: Some(PathBuf::from(root)), ..Default::default() }
+    }
+
+    /// A commit empties only its own root's box, only of what it committed, and ends only that root's amend.
+    #[test]
+    fn a_commit_clears_what_it_committed_and_only_in_its_own_root() {
+        let mut b = shown("/tmp/fictional-a");
+        b.amend = Some("before".into());
+        assert!(b.committed(Path::new("/tmp/fictional-a"), "Fix it", "Fix it"));
+        assert_eq!(b.amend, None);
+        // typed while the commit ran: kept
+        assert!(!b.committed(Path::new("/tmp/fictional-a"), "Fix it", "Fix it, and more"));
+        // committed in a root no longer shown: the shown root's amend stays, the other's kept draft goes if it was that
+        let mut b = shown("/tmp/fictional-b");
+        b.amend = Some("before".into());
+        b.drafts.put("/tmp/fictional-a".into(), "Fix it".into());
+        b.drafts.put("/tmp/fictional-c".into(), "Other".into());
+        assert!(!b.committed(Path::new("/tmp/fictional-a"), "Fix it", "Amended text"));
+        assert_eq!(b.amend.as_deref(), Some("before"));
+        assert_eq!(b.drafts.get(Path::new("/tmp/fictional-a")), None);
+        assert!(!b.committed(Path::new("/tmp/fictional-c"), "Fix it", ""));
+        assert_eq!(b.drafts.get(Path::new("/tmp/fictional-c")).map(String::as_str), Some("Other"));
+    }
+
+    /// An empty message is not kept as a draft, an amend keeps the message from before it, and only `MEMORY` roots are
+    /// remembered, the oldest dropped first.
+    #[test]
+    fn drafts_skip_empty_messages_and_stay_bounded() {
+        let mut b = CommitBox::default();
+        b.leave("/tmp/fictional-a".into(), "  \n".into());
+        assert_eq!(b.drafts.0.len(), 0);
+        b.amend = Some("before amending".into());
+        b.leave("/tmp/fictional-a".into(), "the last commit's message".into());
+        assert_eq!(b.drafts.get(Path::new("/tmp/fictional-a")).map(String::as_str), Some("before amending"));
+        for n in 0..MEMORY + 5 {
+            b.leave(format!("/tmp/fictional-{n}").into(), format!("draft {n}"));
+        }
+        assert_eq!(b.drafts.0.len(), MEMORY);
+        assert_eq!(b.drafts.get(Path::new("/tmp/fictional-a")), None);
+        assert_eq!(b.drafts.get(Path::new("/tmp/fictional-4")), None);
+        assert_eq!(b.drafts.get(Path::new("/tmp/fictional-5")).map(String::as_str), Some("draft 5"));
+        // put again: moved to the newest, not doubled
+        b.drafts.put("/tmp/fictional-5".into(), "again".into());
+        assert_eq!(b.drafts.0.len(), MEMORY);
+        assert_eq!(b.drafts.0.last().map(|(_, v)| v.as_str()), Some("again"));
     }
 }

@@ -94,9 +94,12 @@ pub(super) struct Answer {
 pub(super) struct RepoState {
     /// No commit yet: Amend has nothing to amend, and unstaging takes files out of the index.
     pub(super) initial: bool,
-    /// A merge is under way: its `MERGE_MSG`, comments left out, is what the message starts from.
+    /// A merge, cherry-pick or revert is under way: the `MERGE_MSG` git wrote for it, comments left out, is what the
+    /// message starts from.
     pub(super) merge_msg: Option<String>,
     pub(super) merging: bool,
+    /// A cherry-pick or revert stopped on a conflict, which a commit here concludes: its name.
+    pub(super) picking: Option<&'static str>,
     /// A rebase is under way: a commit here goes into it.
     pub(super) rebasing: bool,
 }
@@ -137,6 +140,9 @@ pub(super) struct ChangeList {
     /// The change last clicked: its group and path.
     selected: Option<(Group, String)>,
     scroll: UniformListScrollHandle,
+    /// Stages, discards and commits landed: a run started before the last of them answers for the index as it was,
+    /// and is dropped for one asked after.
+    ops: u64,
 }
 
 impl Drop for ChangeList {
@@ -165,6 +171,7 @@ impl ChangeList {
             stale: None,
             selected: None,
             scroll: UniformListScrollHandle::new(),
+            ops: 0,
         }
     }
 
@@ -267,7 +274,7 @@ async fn exists(path: &Path) -> bool {
 
 /// The root's place in its repository and where a merge or rebase would keep its state, then its status.
 async fn read_status(root: PathBuf) -> Result<Answer, GitError> {
-    let paths = ["MERGE_HEAD", "MERGE_MSG", "rebase-merge", "rebase-apply"];
+    let paths = ["MERGE_HEAD", "MERGE_MSG", "rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "REVERT_HEAD"];
     let mut args = vec!["rev-parse", "--show-prefix"];
     for p in paths {
         args.extend(["--git-path", p]);
@@ -280,10 +287,17 @@ async fn read_status(root: PathBuf) -> Result<Answer, GitError> {
     let found: Vec<PathBuf> = lines.take(paths.len()).map(|l| root.join(l)).collect();
     let out = git(&root, &["-c", "status.renames=true", "status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all"], STATUS).await?;
     let mut repo = RepoState { initial: git_ops::initial_in_status(&out.stdout), ..Default::default() };
-    if let [merge_head, merge_msg, rebase_merge, rebase_apply] = &found[..] {
+    if let [merge_head, merge_msg, rebase_merge, rebase_apply, cherry_pick, revert] = &found[..] {
         repo.merging = exists(merge_head).await;
         repo.rebasing = exists(rebase_merge).await || exists(rebase_apply).await;
-        if repo.merging {
+        repo.picking = if exists(cherry_pick).await {
+            Some("cherry-pick")
+        } else if exists(revert).await {
+            Some("revert")
+        } else {
+            None
+        };
+        if repo.merging || repo.picking.is_some() {
             let text = tokio::time::timeout(Duration::from_secs(2), tokio::fs::read_to_string(merge_msg.clone())).await;
             repo.merge_msg = text.ok().and_then(Result::ok).map(|t| git_ops::merge_message(&t)).filter(|m| !m.is_empty());
         }
@@ -376,6 +390,7 @@ impl SidePanel {
     /// run out, when one is). Its answer refreshes the shown diff and the gutters (`ChangesPolled`).
     pub(super) fn refresh_changes_now(&mut self, cx: &mut Context<Self>) {
         if let Some(list) = self.changes.as_mut() {
+            list.ops += 1;
             list.next_at = None;
             list.ran = None;
             list.halted = false;
@@ -415,19 +430,24 @@ impl SidePanel {
             return;
         }
         list.wanted = false;
-        let (id, root) = (list.id, list.root.clone());
+        let (id, ops, root) = (list.id, list.ops, list.root.clone());
         let task = self.rt.spawn(read_status(root));
         list.job = Some(task.abort_handle());
         cx.spawn(async move |this, cx| {
             // an aborted run (its list replaced) answers nothing
             let answer = task.await.ok();
-            let _ = this.update(cx, |this, cx| this.take_status(id, now, answer, cx));
+            let _ = this.update(cx, |this, cx| this.take_status(id, ops, now, answer, cx));
         })
         .detach();
     }
 
-    fn take_status(&mut self, id: u64, started: Instant, answer: Option<Result<Answer, GitError>>, cx: &mut Context<Self>) {
-        if self.changes.as_ref().is_none_or(|l| l.id != id) {
+    fn take_status(&mut self, id: u64, ops: u64, started: Instant, answer: Option<Result<Answer, GitError>>, cx: &mut Context<Self>) {
+        let Some(list) = self.changes.as_mut().filter(|l| l.id == id) else { return };
+        if list.ops != ops {
+            // asked before an op landed: its rows may be the index's before it; the one asked for since goes out now
+            list.job = None;
+            list.wanted = true;
+            self.poll_changes(cx);
             return;
         }
         self.land_status(started, answer, cx);
@@ -1261,6 +1281,8 @@ mod tests {
             return;
         }
         let (_dir, repo) = our_repo(&["a.txt"]);
+        // git's default would keep `#` lines here too; set, so a global `commit.cleanup=strip` cannot change it
+        sh(&repo, &["config", "commit.cleanup", "whitespace"]);
         write(&repo, "a.txt", "edited\n");
         let nothing = run(&repo, Op::Commit { message: "Nothing here".into(), amend: false }).await.unwrap_err();
         assert_eq!(nothing.kind, git_ops::Kind::NothingStaged, "{nothing:?}");
@@ -1324,6 +1346,192 @@ mod tests {
         assert_eq!(row_actions(&c), [RowAction::Unstage]);
         run(&repo, Op::Stage(conflict)).await.unwrap();
         assert_eq!(listing(&repo).await, rows(&[(Group::Staged, "f.txt", 'M')]));
+    }
+
+    /// A status asked before a stage landed is dropped, not shown: the rows would be the index's before it.
+    #[gpui::test]
+    fn a_status_asked_before_an_op_landed_is_dropped(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        cx.update(|cx| cx.set_global(Theme::for_appearance(gpui::WindowAppearance::Dark)));
+        let panel = cx.new(|cx| SidePanel::new(rt.handle().clone(), crate::settings::PanelTab::Changes, cx));
+        let answer = Answer { status: Status { changes: vec![change(Group::Changes, "a.txt")], ..Default::default() }, prefix: String::new(), repo: RepoState::default() };
+        panel.update(cx, |p, cx| {
+            p.changes = Some(ChangeList::new("/tmp/fictional-repo".into()));
+            let id = p.changes.as_ref().unwrap().id;
+            // the panel not live: nothing runs git here
+            p.refresh_changes_now(cx);
+            p.take_status(id, 0, Instant::now(), Some(Ok(answer.clone())), cx);
+            let list = p.changes.as_ref().unwrap();
+            assert_eq!((list.result.is_none(), list.wanted, list.job.is_none()), (true, true, true));
+            p.take_status(id, 1, Instant::now(), Some(Ok(answer.clone())), cx);
+            assert_eq!(p.changes_count(), Some(1));
+        });
+    }
+
+    /// A stage past its deadline is stopped, not killed: git takes its `index.lock` away and its slow clean filter
+    /// ends with it, so a Retry can run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stage_past_its_deadline_leaves_no_index_lock() {
+        if !has_git() {
+            return;
+        }
+        let (_dir, repo) = our_repo(&["a.txt"]);
+        write(&repo, "a.txt", "edited\n");
+        let edited = find(&repo, Group::Changes, "a.txt").await;
+        sh(&repo, &["config", "filter.slow.clean", "sleep 30; cat"]);
+        write(&repo, ".gitattributes", "a.txt filter=slow\n");
+        let started = Instant::now();
+        let failed = git_ops::run_within(repo.clone(), Op::Stage(edited), Some(Duration::from_millis(1500))).await.unwrap_err();
+        assert_eq!(failed.text, "git didn't finish within 1 seconds and was stopped");
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        assert!(!repo.join(".git/index.lock").exists(), "index.lock left behind");
+    }
+
+    /// A busy index says how to clear a lock a crashed git left.
+    #[tokio::test]
+    async fn a_held_index_lock_is_reported_with_how_to_clear_it() {
+        if !has_git() {
+            return;
+        }
+        let (_dir, repo) = our_repo(&["a.txt"]);
+        write(&repo, "a.txt", "edited\n");
+        let edited = find(&repo, Group::Changes, "a.txt").await;
+        std::fs::write(repo.join(".git/index.lock"), "").unwrap();
+        let failed = run(&repo, Op::Stage(edited)).await.unwrap_err();
+        assert_eq!(failed.kind, git_ops::Kind::IndexLocked);
+        assert_eq!(failed.text.lines().last(), Some(git_ops::STALE_LOCK));
+    }
+
+    /// From a subfolder root a discard reaches the file from the top: an edit restored, an untracked file deleted.
+    #[tokio::test]
+    async fn a_discard_from_a_subfolder_root() {
+        if !has_git() {
+            return;
+        }
+        let (_dir, repo) = our_repo(&["app/x.txt", "y.txt"]);
+        let committed = std::fs::read_to_string(repo.join("app/x.txt")).unwrap();
+        write(&repo, "app/x.txt", "edited\n");
+        write(&repo, "app/new.txt", "new\n");
+        write(&repo, "y.txt", "edited\n");
+        let app = repo.join("app");
+        let discard = |c: &Change| git_ops::confirm_discard(c, &c.path, false).unwrap().answered(0).unwrap();
+        run(&app, discard(&find(&app, Group::Changes, "app/x.txt").await)).await.unwrap();
+        run(&app, discard(&find(&app, Group::Untracked, "app/new.txt").await)).await.unwrap();
+        assert_eq!(std::fs::read_to_string(repo.join("app/x.txt")).unwrap(), committed);
+        assert!(!repo.join("app/new.txt").exists());
+        assert_eq!(listing(&repo).await, rows(&[(Group::Changes, "y.txt", 'M')]));
+    }
+
+    /// A real nested repository is listed as its folder and is neither staged by Stage All nor offered a stage or a
+    /// discard.
+    #[tokio::test]
+    async fn a_nested_repository_is_neither_staged_nor_discarded() {
+        if !has_git() {
+            return;
+        }
+        let (_dir, repo) = our_repo(&["a.txt"]);
+        write(&repo, "nested/n.txt", "inner\n");
+        sh(&repo.join("nested"), &["init", "-q"]);
+        write(&repo, "loose.txt", "loose\n");
+        let nested = find(&repo, Group::Untracked, "nested/").await;
+        assert_eq!(git_ops::confirm_discard(&nested, "nested", false), Err(git_ops::Refusal::Folder));
+        assert_eq!(git_ops::stage(&nested), Err(git_ops::Refusal::Folder));
+        assert_eq!(row_actions(&nested), []);
+        run(&repo, Op::StageUntracked(vec!["nested/".into()])).await.unwrap();
+        run(&repo, Op::StageUntracked(vec!["nested/".into(), "loose.txt".into()])).await.unwrap();
+        assert_eq!(listing(&repo).await, rows(&[(Group::Staged, "loose.txt", 'A'), (Group::Untracked, "nested/", 'U')]));
+        assert!(repo.join("nested/n.txt").is_file());
+    }
+
+    /// A conflicted merge: resolved, marked resolved and committed with its `MERGE_MSG`, which concludes it.
+    #[tokio::test]
+    async fn a_commit_concludes_a_merge() {
+        if !has_git() {
+            return;
+        }
+        let (_dir, repo) = our_repo(&["f.txt"]);
+        sh(&repo, &["checkout", "-qb", "other"]);
+        write(&repo, "f.txt", "theirs\n");
+        sh(&repo, &["commit", "-qam", "theirs"]);
+        sh(&repo, &["checkout", "-q", "main"]);
+        write(&repo, "f.txt", "ours\n");
+        sh(&repo, &["commit", "-qam", "ours"]);
+        sh(&repo, &["merge", "-q", "other"]);
+        let message = read_status(repo.clone()).await.unwrap().repo.merge_msg.unwrap();
+        write(&repo, "f.txt", "both\n");
+        run(&repo, Op::Stage(find(&repo, Group::Conflicts, "f.txt").await)).await.unwrap();
+        run(&repo, Op::Commit { message: message.clone(), amend: false }).await.unwrap();
+        assert_eq!(sh(&repo, &["log", "-1", "--format=%B"]), message);
+        assert_eq!(sh(&repo, &["rev-list", "--parents", "-1", "HEAD"]).split(' ').count(), 3);
+        let after = read_status(repo).await.unwrap();
+        assert_eq!((after.repo.merging, after.repo.merge_msg, after.status.changes.len()), (false, None, 0));
+    }
+
+    /// A rebase stopped on a conflict is seen; a commit there adds to it and leaves it under way.
+    #[tokio::test]
+    async fn a_commit_during_a_rebase_goes_into_it() {
+        if !has_git() {
+            return;
+        }
+        let (_dir, repo) = our_repo(&["f.txt"]);
+        sh(&repo, &["checkout", "-qb", "topic"]);
+        write(&repo, "f.txt", "topic\n");
+        sh(&repo, &["commit", "-qam", "topic"]);
+        sh(&repo, &["checkout", "-q", "main"]);
+        write(&repo, "f.txt", "main\n");
+        sh(&repo, &["commit", "-qam", "main"]);
+        sh(&repo, &["checkout", "-q", "topic"]);
+        sh(&repo, &["rebase", "-q", "main"]);
+        assert!(read_status(repo.clone()).await.unwrap().repo.rebasing);
+        write(&repo, "f.txt", "both\n");
+        run(&repo, Op::Stage(find(&repo, Group::Conflicts, "f.txt").await)).await.unwrap();
+        run(&repo, Op::Commit { message: "Topic, over main".into(), amend: false }).await.unwrap();
+        assert_eq!(sh(&repo, &["log", "-2", "--format=%s"]), "Topic, over main\nmain");
+        assert!(read_status(repo).await.unwrap().repo.rebasing);
+    }
+
+    /// A cherry-pick or revert stopped on a conflict is named, and its `MERGE_MSG` is the message's start.
+    #[tokio::test]
+    async fn a_cherry_pick_and_a_revert_under_way_are_seen_with_their_messages() {
+        if !has_git() {
+            return;
+        }
+        let (_dir, repo) = our_repo(&["f.txt"]);
+        sh(&repo, &["checkout", "-qb", "other"]);
+        write(&repo, "f.txt", "theirs\n");
+        sh(&repo, &["commit", "-qam", "Pick this fictional fix"]);
+        sh(&repo, &["checkout", "-q", "main"]);
+        write(&repo, "f.txt", "ours\n");
+        sh(&repo, &["commit", "-qam", "ours"]);
+        sh(&repo, &["cherry-pick", "other"]);
+        let repo_state = read_status(repo.clone()).await.unwrap().repo;
+        assert_eq!((repo_state.picking, repo_state.merging), (Some("cherry-pick"), false));
+        assert_eq!(repo_state.merge_msg.as_deref(), Some("Pick this fictional fix"));
+        sh(&repo, &["cherry-pick", "--abort"]);
+        assert_eq!(read_status(repo.clone()).await.unwrap().repo.picking, None);
+
+        write(&repo, "f.txt", "ours, again\n");
+        sh(&repo, &["commit", "-qam", "again"]);
+        sh(&repo, &["revert", "--no-edit", "HEAD~1"]);
+        let repo_state = read_status(repo.clone()).await.unwrap().repo;
+        assert_eq!(repo_state.picking, Some("revert"));
+        assert!(repo_state.merge_msg.as_deref().is_some_and(|m| m.starts_with("Revert \"ours\"")), "{:?}", repo_state.merge_msg);
+    }
+
+    /// With `commit.cleanup=strip`, a message of comments alone is empty, and said so, not blamed on a hook.
+    #[tokio::test]
+    async fn a_message_empty_after_cleanup_is_said_so() {
+        if !has_git() {
+            return;
+        }
+        let (_dir, repo) = our_repo(&["a.txt"]);
+        sh(&repo, &["config", "commit.cleanup", "strip"]);
+        write(&repo, "a.txt", "edited\n");
+        run(&repo, Op::Stage(find(&repo, Group::Changes, "a.txt").await)).await.unwrap();
+        let failed = run(&repo, Op::Commit { message: "# only a comment\n".into(), amend: false }).await.unwrap_err();
+        assert_eq!(failed.kind, git_ops::Kind::EmptyMessage, "{failed:?}");
+        assert_eq!(sh(&repo, &["rev-list", "--count", "HEAD"]), "1");
     }
 
     /// Run only by `a_git_dir_in_the_environment_does_not_redirect_the_read`, with `GIT_DIR` set.
