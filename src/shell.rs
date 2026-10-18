@@ -1464,7 +1464,12 @@ impl Render for Shell {
         let (viewer, _) = self.sync_file_tabs(window, cx);
         // a file tab shown in the grid's place keeps the keyboard from herdr's focused pane, as an overlay does
         let file_shown = self.shown_file_tab().is_some();
-        let overlaid = self.settings.is_some() || self.command_panel.as_ref().is_some_and(|p| p.is_open()) || self.floating_open() || file_shown;
+        let covered = self.settings.is_some() || self.command_panel.as_ref().is_some_and(|p| p.is_open()) || self.floating_open() || file_shown;
+        // a field of the sidebar's (its search, a workspace being renamed) typed in keeps the keyboard too: herdr
+        // moving its focus, or a switch, must not hand it back to a pane mid word
+        let typing = self.sidebar_search.as_ref().is_some_and(|s| s.input.read(cx).focus_handle(cx).is_focused(window))
+            || self.renaming.as_ref().is_some_and(|r| r.input.read(cx).focus_handle(cx).is_focused(window));
+        let overlaid = sidebar_search::keyboard_elsewhere(covered, typing);
         // a session was left: the keyboard leaves its parked panes (out of `panes`) for the window, and herdr's
         // focused pane here takes it next
         if self.views.take_refocus() && self.settings.is_none() {
@@ -1532,6 +1537,10 @@ impl Render for Shell {
             self.peek_hovered = false;
         }
         let peek = self.peek_now();
+        // the sidebar hidden (or its peek gone): a search there would take keys nobody sees, and number hidden rows
+        if self.sidebar_search.is_some() && !sidebar_search::sidebar_drawn(self.sidebar_open, peek) {
+            self.close_sidebar_search(cx);
+        }
         if sliding || self.sidebar_nudge().is_some() || self.sidebar_peek.is_some_and(|m| m.animating()) {
             window.request_animation_frame();
         }

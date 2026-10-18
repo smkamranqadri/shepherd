@@ -160,7 +160,52 @@ pub(super) fn tree_view(places: &[Place], w: &Watchers, collapsed: &HashSet<Stri
     if let Some(kept) = kept {
         rows = filter_rows(rows, kept);
     }
-    TreeView { rows, drags: !filtering }
+    TreeView { rows, drags: drags_while(filtering) }
+}
+
+/// Whether the tree drags and takes drops: not while it is searched (`searching`).
+pub(super) fn drags_while(searching: bool) -> bool {
+    !searching
+}
+
+/// Whether the keyboard stays off herdr's panes this frame: something covers them (`covered`: Settings, the
+/// command panel, a floating view, a file tab), or one of the sidebar's fields is typed in (`typing`).
+pub(super) fn keyboard_elsewhere(covered: bool, typing: bool) -> bool {
+    covered || typing
+}
+
+/// Whether the sidebar is drawn: docked, or its peek card out (`peek`, how far it has slid).
+pub(super) fn sidebar_drawn(open: bool, peek: f32) -> bool {
+    open || peek > 0.
+}
+
+/// Whether Enter closes the search: it goes to the first match it shows, and with none stays open to be typed on.
+pub(super) fn closes_on_enter(first: &Option<(SessionKey, sidebar_tree::Goal)>) -> bool {
+    first.is_some()
+}
+
+/// The first workspace a search shows, as Workspace1 numbers it.
+pub(super) fn first_workspace(order: &[(SessionKey, String)]) -> Option<(SessionKey, sidebar_tree::Goal)> {
+    order.first().map(|(k, ws)| (k.clone(), sidebar_tree::Goal::Workspace(ws.clone())))
+}
+
+/// The first agent the Agents view shows.
+pub(super) fn first_agent(rows: Vec<sidebar_tree::ViewRow>) -> Option<(SessionKey, sidebar_tree::Goal)> {
+    rows.into_iter().find_map(|r| match r {
+        sidebar_tree::ViewRow::Agents(entries) => entries.into_iter().next().map(|e| (e.key, sidebar_tree::Goal::Pane { tab: e.pane.tab_id, pane: e.pane.pane_id })),
+        _ => None,
+    })
+}
+
+/// The search typed in the sidebar, for the Workspaces tree: none while the Agents view shows, whose search keeps
+/// agents, so Workspace1–9 then number the tree as it is.
+pub(super) fn tree_query(query: Option<String>, view: SidebarView, show_agents: bool) -> Option<String> {
+    query.filter(|_| super::sidebar::sidebar_layout(view, show_agents, false).tree)
+}
+
+/// The search field's placeholder in the view shown.
+pub(super) fn placeholder(agents_view: bool) -> &'static str {
+    if agents_view { "Filter agents" } else { "Filter workspaces" }
 }
 
 /// The tree's rows the Agents view lists its sessions' agents under: every session's, whatever focus mode says (it
@@ -182,6 +227,8 @@ pub(super) fn fold_saved(saved: &mut Vec<String>, key: &str, filtering: bool) ->
 /// The search field in the sidebar's header, while it is up.
 pub(super) struct SidebarSearch {
     pub input: Entity<InputState>,
+    /// Its placeholder is the Agents view's.
+    agents: bool,
     _events: Vec<Subscription>,
 }
 
@@ -204,8 +251,9 @@ impl Shell {
             return;
         }
         let theme = Theme::of(cx).clone();
+        let agents = self.agents_view_shown(cx);
         let input = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder("Filter workspaces");
+            let mut input = InputState::new(window, cx).placeholder(placeholder(agents));
             input.set_editor_style(crate::ui::input_style(&theme));
             input
         });
@@ -220,7 +268,7 @@ impl Shell {
             _ => {}
         })];
         self.tree.drop = None;
-        self.sidebar_search = Some(SidebarSearch { input, _events: events });
+        self.sidebar_search = Some(SidebarSearch { input, agents, _events: events });
         cx.notify();
     }
 
@@ -238,13 +286,15 @@ impl Shell {
         if self.search_query(cx).is_none() {
             return;
         }
-        let agents = SettingsGlobal::of(cx).settings.sidebar_view == SidebarView::Agents && SettingsGlobal::of(cx).settings.show_agents;
-        let goal = if agents {
+        let goal = if self.agents_view_shown(cx) {
             self.first_agent_shown(cx)
         } else {
             let (view, shown, kept) = self.shown_tree(cx);
-            self.numbered_workspaces(&view.rows, &shown, kept.as_ref()).into_iter().next().map(|(k, ws)| (k, sidebar_tree::Goal::Workspace(ws)))
+            first_workspace(&self.numbered_workspaces(&view.rows, &shown, kept.as_ref()))
         };
+        if !closes_on_enter(&goal) {
+            return;
+        }
         self.close_sidebar_search(cx);
         if let Some((key, goal)) = goal {
             self.go_to(key, goal, cx);
@@ -256,10 +306,22 @@ impl Shell {
         let sessions = self.session_agents(cx);
         let (rows, kept) = self.agents_tree(&sessions, cx);
         let attention = SettingsGlobal::of(cx).settings.attention_agents;
-        sidebar_tree::agents_view(rows, &sessions, self.agent_sort, attention, Instant::now(), kept.as_ref()).into_iter().find_map(|r| match r {
-            sidebar_tree::ViewRow::Agents(entries) => entries.into_iter().next().map(|e| (e.key, sidebar_tree::Goal::Pane { tab: e.pane.tab_id, pane: e.pane.pane_id })),
-            _ => None,
-        })
+        first_agent(sidebar_tree::agents_view(rows, &sessions, self.agent_sort, attention, Instant::now(), kept.as_ref()))
+    }
+
+    /// The Agents view takes the tree's place now.
+    fn agents_view_shown(&self, cx: &App) -> bool {
+        let settings = &SettingsGlobal::of(cx).settings;
+        super::sidebar::sidebar_layout(settings.sidebar_view, settings.show_agents, false).agents_view
+    }
+
+    /// The search field says what it filters in the view shown, which may have changed since it opened.
+    pub(super) fn retitle_sidebar_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let agents = self.agents_view_shown(cx);
+        if let Some(search) = self.sidebar_search.as_mut().filter(|s| s.agents != agents) {
+            search.agents = agents;
+            search.input.update(cx, |input, cx| input.set_placeholder(placeholder(agents), window, cx));
+        }
     }
 
     /// The Workspaces tree shown now (focus mode and the search applied), the shown session's key, and what the
@@ -268,8 +330,10 @@ impl Shell {
         let settings = &SettingsGlobal::of(cx).settings;
         let collapsed: HashSet<String> = settings.collapsed_sessions.iter().cloned().collect();
         let focus = settings.sidebar_focus;
+        let (view, show_agents) = (settings.sidebar_view, settings.show_agents);
         let shown = self.shown_key().unwrap_or_default();
-        let kept = self.search_query(cx).map(|query| {
+        // in the Agents view the search keeps agents: the tree (and Workspace1–9) stays as it is
+        let kept = tree_query(self.search_query(cx), view, show_agents).map(|query| {
             let sessions = self.searched(&shown, cx);
             workspace_hits(&query, &sessions, |key, snapshot, w| self.workspace_branch(key, &shown, snapshot, w, cx))
         });
@@ -544,6 +608,85 @@ mod tests {
         assert_eq!(entries(&agents_view(rows, &listed, AgentSort::Grouped, false, now, Some(&kept))), ["S default", "p1"]);
         assert_eq!(agent_hits("docs", &listed), [(key("default"), only(&["p2"]))].into(), "by its workspace");
         assert_eq!(agent_hits("notes", &listed), [(key("notes"), Keep::All)].into(), "by its session");
+    }
+
+    #[test]
+    fn a_field_typed_in_keeps_the_keyboard_from_the_panes() {
+        assert!(!keyboard_elsewhere(false, false), "herdr's focused pane takes it");
+        assert!(keyboard_elsewhere(false, true), "the search or a rename being typed in");
+        assert!(keyboard_elsewhere(true, false), "Settings, the command panel, a floating view, a file tab");
+    }
+
+    #[test]
+    fn the_search_closes_once_the_sidebar_is_not_drawn() {
+        assert!(sidebar_drawn(true, 0.));
+        assert!(sidebar_drawn(false, 0.4), "the peek card out");
+        assert!(!sidebar_drawn(false, 0.), "hidden, its card slid away");
+    }
+
+    #[test]
+    fn enter_goes_to_the_first_match_or_stays_open() {
+        let order = [(key("default"), "w3".to_string()), (key("notes"), "n1".to_string())];
+        let first = first_workspace(&order);
+        assert_eq!(first, Some((key("default"), sidebar_tree::Goal::Workspace("w3".into()))));
+        assert!(closes_on_enter(&first));
+        let none = first_workspace(&[]);
+        assert_eq!(none, None);
+        assert!(!closes_on_enter(&none), "no match: the search stays to be typed on");
+        let (places, w, _) = sessions();
+        let shown = web();
+        let since = Since::default();
+        let listed = [SessionAgents { key: key("default"), name: "default".into(), shown: true, snapshot: &shown, since: &since }];
+        let kept = agent_hits("guide", &listed);
+        let rows = agents_rows(&places, &w, &HashSet::new(), Some(&shown), &key("default"), Some(&kept));
+        let view = agents_view(rows, &listed, AgentSort::Grouped, false, Instant::now(), Some(&kept));
+        assert_eq!(first_agent(view), Some((key("default"), sidebar_tree::Goal::Pane { tab: "t-p2".into(), pane: "p2".into() })));
+    }
+
+    #[test]
+    fn the_agents_view_s_search_leaves_the_tree_and_its_numbers_alone() {
+        let q = || Some("docs".to_string());
+        assert_eq!(tree_query(q(), SidebarView::Workspaces, true), q());
+        assert_eq!(tree_query(q(), SidebarView::Agents, true), None, "it keeps agents there");
+        assert_eq!(tree_query(q(), SidebarView::Agents, false), q(), "the Agents section off: the tree shows");
+        assert_eq!(placeholder(true), "Filter agents");
+        assert_eq!(placeholder(false), "Filter workspaces");
+    }
+
+    #[test]
+    fn rows_neither_drag_nor_take_a_drop_while_searching() {
+        let keep = only(&["w1"]);
+        let searching = sidebar_tree::RowFilter { keep: Some(&keep), drags: drags_while(true) };
+        assert!(!searching.allows(true), "a row that would drag, or take a drop");
+        let plain = sidebar_tree::RowFilter { keep: None, drags: drags_while(false) };
+        assert!(plain.allows(true));
+        assert!(!plain.allows(false), "one that would not anyway");
+    }
+
+    #[test]
+    fn numbering_counts_the_rows_as_they_are_drawn() {
+        let s = web();
+        let folded = |root: &str| root == "w1";
+        // what `workspace_rows` draws: `shown_groups`, a group's worktrees while `kids_shown`
+        let drawn = |keep: Option<&Keep>, searching: bool| {
+            sidebar_tree::shown_groups(&s, keep)
+                .into_iter()
+                .flat_map(|(w, kids)| {
+                    let open = sidebar_tree::kids_shown(folded(&w.workspace_id), searching);
+                    std::iter::once(w.workspace_id.clone()).chain(kids.into_iter().filter(move |_| open).map(|k| k.workspace_id.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        let rows = [TreeRow::Workspaces { key: key("web") }];
+        let folds: HashSet<String> = [root_key(&key("web").0, "w1")].into();
+        let numbered = |kept: Option<&Kept>| workspace_order(&rows, |_| Some(&s), &folds, kept).into_iter().map(|(_, w)| w).collect::<Vec<_>>();
+        assert_eq!(numbered(None), drawn(None, false));
+        assert_eq!(numbered(None), ["w1", "w4"]);
+        let keep = only(&["w1", "w3", "w4"]);
+        let kept: Kept = [(key("web"), keep.clone())].into();
+        assert_eq!(numbered(Some(&kept)), drawn(Some(&keep), true));
+        assert_eq!(numbered(Some(&kept)), ["w1", "w3", "w4"]);
+        assert!(numbered(Some(&Kept::new())).is_empty(), "nothing kept, nothing drawn");
     }
 
     #[test]

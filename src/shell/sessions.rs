@@ -288,6 +288,7 @@ impl Shell {
         if !self.watchers.start_listing() {
             return; // read again when the read under way lands
         }
+        let started = Instant::now();
         let list = self.rt.spawn(crate::herdr::lifecycle::list_places(Duration::from_secs(5)));
         cx.spawn(async move |this, cx| {
             let listed = list.await.map_err(anyhow::Error::from).and_then(|r| r);
@@ -299,6 +300,10 @@ impl Shell {
                 if let Ok((sessions, machines)) = listed {
                     // the one record of whether herdr's machines were read: views kept here, and a drop's saved order
                     s.tree.machines_known = machines.is_some();
+                    if machines.is_some() {
+                        // the adds that finished before this read began are in it, or not, by now
+                        s.tree.adds.listed(started);
+                    }
                     let machines_known = s.tree.machines_known;
                     let settings = &SettingsGlobal::of(cx).settings;
                     let (places, disabled) = sidebar_tree::tree_order(sessions, machines.unwrap_or_default(), &settings.session_order, &settings.machine_order);
@@ -541,15 +546,21 @@ impl Shell {
         self.focused = None; // an input held focus: back to herdr's focused pane
         if create && remote {
             crate::ui::toast::info(cx, format!("Setting up {name} on {host}…"), None);
-            let task = cx.background_spawn(async move { crate::herdr::add_machine(&host, &name) });
+            let task = self.rt.spawn(async move { crate::herdr::add_machine(&host, &name).await });
             cx.spawn(async move |this, cx| {
-                let added = task.await;
-                let _ = this.update(cx, |s, cx| match added {
-                    Ok(machine) => {
+                let added = task.await.unwrap_or_else(|e| Err(crate::herdr::AddError::Failed(e.to_string())));
+                let _ = this.update(cx, |s, cx| match discover::offered(&added) {
+                    Some(machine) => {
                         s.switch_machine(machine.clone(), cx);
-                        s.offer_more_sessions(machine, cx);
+                        s.offer_more_sessions(machine.clone(), cx);
                     }
-                    Err(e) => crate::ui::toast::error(cx, format!("{e:#}")),
+                    None => {
+                        if let Err(e) = &added {
+                            crate::ui::toast::error(cx, e.to_string());
+                        }
+                        // herdr may have saved one it does not list yet
+                        s.refresh_places(cx);
+                    }
                 });
             })
             .detach();

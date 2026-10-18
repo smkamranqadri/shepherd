@@ -78,6 +78,8 @@ impl Shell {
                     || open(shell.agents_menu.as_ref().map(|m| m.is_open()))
                     || open(shell.place_menu.as_ref().map(|m| m.is_open()))
                     || shell.tree.menu_open()
+                    // searching in it: the card stays until the search closes
+                    || shell.sidebar_search.is_some()
                     // a drag out of it would drop it mid-way
                     || cx.has_active_drag();
                 if !shell.peek_hovered && !menu {
@@ -299,21 +301,14 @@ impl Shell {
         let snapshot = pending.as_ref().or(snapshot);
         // a workspace row's height, one line; a worktree's, which always has a branch line unless compact
         let (ws_h, kid_h) = if SettingsGlobal::of(cx).settings.compact_workspaces { (26., 26.) } else { (32., WS_TWO_LINES) };
-        // a search keeps a worktree's checkout whenever it keeps the worktree
-        let shows = |id: &str| filter.keep.is_none_or(|k| k.has(id));
+        // as Workspace1–9 count them: with a search, what it keeps
         let groups: Vec<(crate::model::Workspace, Vec<crate::model::Workspace>)> = snapshot
             .as_ref()
-            .map(|s| {
-                crate::model::groups(s.workspace_tree())
-                    .into_iter()
-                    .filter(|(w, _)| shows(&w.workspace_id))
-                    .map(|(w, kids)| (w.clone(), kids.into_iter().filter(|k| shows(&k.workspace_id)).cloned().collect()))
-                    .collect()
-            })
+            .map(|s| sidebar_tree::shown_groups(s, filter.keep).into_iter().map(|(w, kids)| (w.clone(), kids.into_iter().cloned().collect())).collect())
             .unwrap_or_default();
         // a workspace moves with its worktrees among the others, a worktree among its siblings; not one being removed,
         // nor any while the tree is searched
-        let movable = filter.drags && self.can_drag_workspaces(&key);
+        let movable = filter.allows(self.can_drag_workspaces(&key));
         let draggable: std::collections::HashSet<String> = groups
             .iter()
             .flat_map(|(w, kids)| {
@@ -477,7 +472,7 @@ impl Shell {
                     let dragged = tree_drag::DraggedTreeItem { from: key.clone(), item, label: w.label.clone(), theme: theme.clone() };
                     el.on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone()))
                 })
-                .when(takes_drop, |el| {
+                .when(filter.allows(takes_drop), |el| {
                     let over = tree_drag::Over::Workspace(key.clone(), w.workspace_id.clone());
                     el.on_drag_move(cx.listener(move |this, e: &gpui::DragMoveEvent<tree_drag::DraggedTreeItem>, _, cx| this.tree_drag_over(over.clone(), e, cx)))
                 })
@@ -530,7 +525,7 @@ impl Shell {
             }
             // A folded group opens while one of its worktrees is being created, and while the tree is searched.
             let fold = fold_key(&w.workspace_id);
-            let open = filter.keep.is_some() || !self.folded.contains(&fold) || !pending.is_empty();
+            let open = sidebar_tree::kids_shown(self.folded.contains(&fold), filter.keep.is_some()) || !pending.is_empty();
             let full = (kids.len() + pending.len()) as f32 * (kid_h + 2.);
             let tween = self.fold_motion.get(&fold).copied().filter(|m| m.animating());
             let chevron = fold_chevron(theme, &format!("{idx}-{}", w.workspace_id), open, full, tween).map(|el| {
@@ -589,6 +584,7 @@ impl Shell {
         let strip = update_strip(theme, cx);
         // a drag's line and drops herdr carried out are tidied whichever view shows
         self.tidy_tree_drag(window, cx);
+        self.retitle_sidebar_search(window, cx);
         // every session's agents, read once for the section and the Agents view; the section stays while any agent
         // runs, so its menu can turn the filter off again
         let sessions = self.session_agents(cx);

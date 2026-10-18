@@ -22,6 +22,13 @@ pub(super) struct RowFilter<'a> {
     pub drags: bool,
 }
 
+impl RowFilter<'_> {
+    /// Whether a row may drag or take a drop that it otherwise would (`ok`): never while the tree is searched.
+    pub(super) fn allows(self, ok: bool) -> bool {
+        self.drags && ok
+    }
+}
+
 /// A faint line where the tree or the Agents view has nothing to list.
 fn no_match(theme: &Theme, text: &'static str) -> gpui::AnyElement {
     div().flex_none().px(px(8.)).py(px(6.)).text_size(px(11.)).text_color(theme.text_faint).child(text).into_any_element()
@@ -108,6 +115,8 @@ pub(super) struct TreeState {
     add_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
     /// Sessions on this host…: an SSH host's sessions not saved as machines, to add one.
     pub(super) discover: Option<crate::ui::Popup<super::discover::Discover>>,
+    /// The sessions being added as machines from that popup, kept while it closes and opens again.
+    pub(super) adds: super::discover::Adds,
     /// Bare folded ids (an older Shepherd's) were moved under the shown session's key.
     folds_migrated: bool,
     /// Where a row being dragged would land.
@@ -468,6 +477,22 @@ pub(super) fn tree(places: &[Place], w: &Watchers, collapsed: &HashSet<String>, 
     rows
 }
 
+/// A session's worktree groups as its rows draw them and Workspace1–9 count them: herdr's, and with a search (`keep`)
+/// only what it keeps (a worktree's checkout whenever it keeps the worktree).
+pub(super) fn shown_groups<'s>(snapshot: &'s Snapshot, keep: Option<&Keep>) -> Vec<(&'s crate::model::Workspace, Vec<&'s crate::model::Workspace>)> {
+    let shows = |id: &str| keep.is_none_or(|k| k.has(id));
+    crate::model::groups(snapshot.workspace_tree())
+        .into_iter()
+        .filter(|(w, _)| shows(&w.workspace_id))
+        .map(|(w, kids)| (w, kids.into_iter().filter(|k| shows(&k.workspace_id)).collect()))
+        .collect()
+}
+
+/// Whether a group's worktrees show: unfolded, or the tree searched, which shows every group open.
+pub(super) fn kids_shown(folded: bool, searching: bool) -> bool {
+    searching || !folded
+}
+
 /// The workspaces Workspace1–9 go to: the tree's visible rows from the top, worktrees of a folded group left out.
 /// With a search (`kept`), only those it shows, every group open as it shows them.
 pub(super) fn workspace_order<'a>(rows: &[TreeRow], snaps: impl Fn(&SessionKey) -> Option<&'a Snapshot>, folded: &HashSet<String>, kept: Option<&Kept>) -> Vec<(SessionKey, String)> {
@@ -475,14 +500,15 @@ pub(super) fn workspace_order<'a>(rows: &[TreeRow], snaps: impl Fn(&SessionKey) 
     for row in rows {
         let TreeRow::Workspaces { key } = row else { continue };
         let Some(snapshot) = snaps(key) else { continue };
-        let shows = |id: &str| kept.is_none_or(|k| k.get(key).is_some_and(|k| k.has(id)));
-        for (w, kids) in crate::model::groups(snapshot.workspace_tree()) {
-            if !shows(&w.workspace_id) {
-                continue;
-            }
+        // a search that keeps nothing of the session: its rows are gone
+        let keep = match kept.map(|k| k.get(key)) {
+            Some(None) => continue,
+            keep => keep.flatten(),
+        };
+        for (w, kids) in shown_groups(snapshot, keep) {
             order.push((key.clone(), w.workspace_id.clone()));
-            if kept.is_some() || !folded.contains(&root_key(&key.0, &w.workspace_id)) {
-                order.extend(kids.iter().filter(|k| shows(&k.workspace_id)).map(|k| (key.clone(), k.workspace_id.clone())));
+            if kids_shown(folded.contains(&root_key(&key.0, &w.workspace_id)), kept.is_some()) {
+                order.extend(kids.iter().map(|k| (key.clone(), k.workspace_id.clone())));
             }
         }
     }

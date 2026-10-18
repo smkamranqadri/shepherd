@@ -3,18 +3,60 @@
 //! (`herdr machine add`, which starts a stopped one). The list is read once a popup opens, never in the background;
 //! Add SSH machine reads it once more after a host is added, and a toast offers the rest.
 use super::*;
-use crate::herdr::{ListError, Machine, SessionInfo};
-use std::collections::HashSet;
+use crate::herdr::{AddError, ListError, Machine, SessionInfo};
 
-/// The popup's host, what its list said, and the sessions being added from it.
+/// The popup's host and what its list said.
 pub(super) struct Discover {
     pub target: String,
     found: Found,
-    /// Sessions being added, or added and not yet in herdr's list of machines read since: no second add, and their
-    /// rows say so until the list leaves them out.
-    adding: HashSet<String>,
     /// Bumped on each read of the host's list, so one that lands after a newer one began is dropped.
     run: usize,
+}
+
+/// The sessions being added as machines, by (SSH target, session), kept beside the tree rather than in a popup: a
+/// popup closed and opened again mid add still knows, and no second `herdr machine add` starts for the session.
+#[derive(Default)]
+pub(super) struct Adds(HashMap<(String, String), Add>);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Add {
+    /// `herdr machine add` runs.
+    Running,
+    /// It finished, saved or not listed yet: guarded until a read of herdr's list begun after `at` lands.
+    Waiting { at: Instant },
+}
+
+impl Adds {
+    /// Whether `session` on `target` may be added now: false while it is being added already (a second click, a
+    /// double click, the popup opened again).
+    pub(super) fn begin(&mut self, target: &str, session: &str) -> bool {
+        let key = (target.to_string(), session.to_string());
+        if self.0.contains_key(&key) {
+            return false;
+        }
+        self.0.insert(key, Add::Running);
+        true
+    }
+
+    /// The add finished at `at`: a failure frees the row at once; a success, or herdr's list not having the machine
+    /// yet, keeps it guarded until herdr's list is read again (`listed`).
+    pub(super) fn finished(&mut self, target: &str, session: &str, failed: bool, at: Instant) {
+        let key = (target.to_string(), session.to_string());
+        if failed {
+            self.0.remove(&key);
+        } else {
+            self.0.insert(key, Add::Waiting { at });
+        }
+    }
+
+    /// A read of herdr's list begun at `started` landed: the adds finished before it are in it, or not, by now.
+    pub(super) fn listed(&mut self, started: Instant) {
+        self.0.retain(|_, add| !matches!(add, Add::Waiting { at } if *at <= started));
+    }
+
+    fn busy(&self, target: &str, session: &str) -> bool {
+        self.0.contains_key(&(target.to_string(), session.to_string()))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -46,7 +88,7 @@ pub(super) struct Row {
 
 impl Discover {
     pub(super) fn new(target: String) -> Self {
-        Discover { target, found: Found::Loading, adding: HashSet::new(), run: 0 }
+        Discover { target, found: Found::Loading, run: 0 }
     }
 
     /// A new read of the host's list begins: its number, for [`Self::listed`].
@@ -65,22 +107,12 @@ impl Discover {
             };
         }
     }
-
-    /// Whether `name` may be added now: false while it is being added already (a second click, a double click).
-    pub(super) fn begin_add(&mut self, name: &str) -> bool {
-        self.adding.insert(name.to_string())
-    }
-
-    /// Adding `name` failed: its row can be clicked again.
-    pub(super) fn add_failed(&mut self, name: &str) {
-        self.adding.remove(name);
-    }
 }
 
-/// What the popup for `d` shows, given herdr's saved machines (turned on or off); `None` once none is for its host
-/// any more (all forgotten meanwhile), when the popup closes. A session saved since the list was read leaves it, so
-/// each render reads it again from what is saved.
-pub(super) fn view(d: &Discover, saved: &[Machine]) -> Option<View> {
+/// What the popup for `d` shows, given herdr's saved machines (turned on or off) and the adds under way; `None` once
+/// none is for its host any more (all forgotten meanwhile), when the popup closes. A session saved since the list was
+/// read leaves it, so each render reads it again from what is saved.
+pub(super) fn view(d: &Discover, saved: &[Machine], adds: &Adds) -> Option<View> {
     let first = saved.iter().find(|m| m.target == d.target)?;
     let host = &d.target;
     Some(match &d.found {
@@ -96,8 +128,8 @@ pub(super) fn view(d: &Discover, saved: &[Machine]) -> Option<View> {
             let rows: Vec<Row> = crate::herdr::unsaved(found, saved, host)
                 .into_iter()
                 .map(|s| Row {
-                    adding: d.adding.contains(&s.name),
-                    note: match (d.adding.contains(&s.name), s.running) {
+                    adding: adds.busy(host, &s.name),
+                    note: match (adds.busy(host, &s.name), s.running) {
                         (true, _) => "Adding…",
                         (false, true) => "running",
                         (false, false) => "stopped (adding starts it)",
@@ -108,6 +140,21 @@ pub(super) fn view(d: &Discover, saved: &[Machine]) -> Option<View> {
             if rows.is_empty() { View::Empty(format!("No other sessions on {host}")) } else { View::Rows(rows) }
         }
     })
+}
+
+/// The toast after an add from the popup, when it did not save a listed machine.
+pub(super) fn add_note(added: &Result<Machine, AddError>, host: &str, session: &str) -> Option<String> {
+    match added {
+        Ok(_) => None,
+        Err(AddError::Unsaved) => Some(format!("{session} on {host} was added, but herdr does not list it yet.")),
+        Err(e) => Some(format!("Couldn't add {session} on {host}: {e}")),
+    }
+}
+
+/// The machine Add SSH machine saved, which is switched to and whose host's other sessions the toast offers; none
+/// when the add failed, which an error toast says instead.
+pub(super) fn offered(added: &Result<Machine, AddError>) -> Option<&Machine> {
+    added.as_ref().ok()
 }
 
 /// The toast after Add SSH machine, when the host runs `more` sessions besides those saved.
@@ -149,25 +196,23 @@ impl Shell {
     }
 
     /// Saves the session `name` of the popup's host as a machine, then reads herdr's list again; the session shown
-    /// stays. A row being added already ignores the click.
+    /// stays. One being added already ignores the click.
     fn add_discovered(&mut self, name: String, cx: &mut Context<Self>) {
-        let Some(popup) = self.tree.discover.as_mut().filter(|p| p.is_open()) else { return };
-        if !popup.value.begin_add(&name) {
+        let Some(target) = self.tree.discover.as_ref().filter(|p| p.is_open()).map(|p| p.value.target.clone()) else { return };
+        if !self.tree.adds.begin(&target, &name) {
             return;
         }
-        let target = popup.value.target.clone();
-        let task = cx.background_spawn({
+        let task = self.rt.spawn({
             let (target, name) = (target.clone(), name.clone());
-            async move { crate::herdr::add_machine(&target, &name) }
+            async move { crate::herdr::add_machine(&target, &name).await }
         });
         cx.spawn(async move |this, cx| {
-            let added = task.await;
+            let added = task.await.unwrap_or_else(|e| Err(AddError::Failed(e.to_string())));
             let _ = this.update(cx, |s, cx| {
-                if let Err(e) = added {
-                    if let Some(popup) = s.tree.discover.as_mut().filter(|p| p.value.target == target) {
-                        popup.value.add_failed(&name);
-                    }
-                    crate::ui::toast::error(cx, format!("{e:#}"));
+                let failed = matches!(added, Err(AddError::Failed(_) | AddError::TimedOut));
+                s.tree.adds.finished(&target, &name, failed, Instant::now());
+                if let Some(note) = add_note(&added, &target, &name) {
+                    crate::ui::toast::error(cx, note);
                 }
                 s.refresh_places(cx);
                 cx.notify();
@@ -214,7 +259,7 @@ impl Shell {
 
     /// The popup closes once its host has no machine left to add to; called each frame.
     pub(super) fn reap_discover(&mut self, window: &mut Window) {
-        let gone = self.tree.discover.as_ref().filter(|p| p.is_open()).is_some_and(|p| view(&p.value, &self.machine_records(&p.value.target)).is_none());
+        let gone = self.tree.discover.as_ref().filter(|p| p.is_open()).is_some_and(|p| view(&p.value, &self.machine_records(&p.value.target), &self.tree.adds).is_none());
         if gone && let Some(popup) = self.tree.discover.as_mut() {
             popup.close();
         }
@@ -226,7 +271,7 @@ impl Shell {
         let popup = self.tree.discover.as_ref()?;
         let target = popup.value.target.clone();
         // closing: the last frames show the list as it was
-        let shown = view(&popup.value, &self.machine_records(&target)).unwrap_or(View::Loading);
+        let shown = view(&popup.value, &self.machine_records(&target), &self.tree.adds).unwrap_or(View::Loading);
         let line = |text: String| div().mt(px(8.)).line_height(px(19.)).text_color(theme.text_muted).child(text);
         let mut card = dialog_card(theme, "discover-dialog", "Sessions on this host")
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_discover(cx)))
@@ -297,6 +342,10 @@ mod tests {
         Machine { id: format!("m-{session}"), label: format!("workbox/{session}"), target: target.into(), session: session.into(), enabled: true }
     }
 
+    fn none() -> Adds {
+        Adds::default()
+    }
+
     fn listed(found: Vec<SessionInfo>) -> Discover {
         let mut d = Discover::new("you@workbox".into());
         let run = d.relist();
@@ -316,36 +365,71 @@ mod tests {
         let d = listed(vec![info("docs", false), info("agents", true), info("default", true)]);
         let machines = [saved("you@workbox", "agents"), saved("you@otherbox", "docs")];
         assert_eq!(
-            rows(view(&d, &machines)),
+            rows(view(&d, &machines, &none())),
             [("default".to_string(), "running", false), ("docs".to_string(), "stopped (adding starts it)", false)],
             "agents is saved for this host; docs only for another"
         );
         let all = [saved("you@workbox", "agents"), saved("you@workbox", "docs"), saved("you@workbox", "default")];
-        assert_eq!(view(&d, &all), Some(View::Empty("No other sessions on you@workbox".into())));
+        assert_eq!(view(&d, &all, &none()), Some(View::Empty("No other sessions on you@workbox".into())));
     }
 
     #[test]
     fn a_session_being_added_is_not_added_twice() {
-        let mut d = listed(vec![info("default", true), info("docs", false)]);
+        let d = listed(vec![info("default", true), info("docs", false)]);
         let machines = [saved("you@workbox", "agents")];
-        assert!(d.begin_add("docs"));
-        assert!(!d.begin_add("docs"), "a second click while it is added");
-        assert_eq!(rows(view(&d, &machines))[1], ("docs".to_string(), "Adding…", true));
-        d.add_failed("docs");
-        assert!(d.begin_add("docs"), "clickable again after a failure");
+        let mut adds = none();
+        let t0 = Instant::now();
+        assert!(adds.begin("you@workbox", "docs"));
+        assert!(!adds.begin("you@workbox", "docs"), "a second click while it is added");
+        assert!(adds.begin("you@otherbox", "docs"), "the same name on another host is another session");
+        assert_eq!(rows(view(&d, &machines, &adds))[1], ("docs".to_string(), "Adding…", true));
+        adds.finished("you@workbox", "docs", true, t0);
+        assert!(adds.begin("you@workbox", "docs"), "clickable again after a failure");
+        // added, or herdr not listing it yet: guarded until a list read begun after it lands
+        let done = t0 + Duration::from_secs(1);
+        adds.finished("you@workbox", "docs", false, done);
+        assert!(!adds.begin("you@workbox", "docs"));
+        adds.listed(t0);
+        assert!(!adds.begin("you@workbox", "docs"), "a read begun before the add finished");
+        adds.listed(done + Duration::from_secs(1));
+        assert!(adds.begin("you@workbox", "docs"), "the next read");
         // added: herdr's list has it now, and the row goes
         let machines = [saved("you@workbox", "agents"), saved("you@workbox", "docs")];
-        assert_eq!(rows(view(&d, &machines)), [("default".to_string(), "running", false)]);
+        assert_eq!(rows(view(&d, &machines, &adds)), [("default".to_string(), "running", false)]);
+    }
+
+    #[test]
+    fn an_add_under_way_is_known_when_the_popup_opens_again() {
+        let machines = [saved("you@workbox", "agents")];
+        let mut adds = none();
+        let first = listed(vec![info("docs", false)]);
+        assert!(adds.begin(&first.target, "docs"));
+        drop(first);
+        let again = listed(vec![info("docs", false)]);
+        assert_eq!(rows(view(&again, &machines, &adds)), [("docs".to_string(), "Adding…", true)]);
+        assert!(!adds.begin(&again.target, "docs"));
+    }
+
+    #[test]
+    fn only_a_saved_machine_is_switched_to_and_offered() {
+        let m = saved("you@workbox", "docs");
+        assert_eq!(offered(&Ok(m.clone())), Some(&m));
+        for e in [AddError::Failed("no route".into()), AddError::TimedOut, AddError::Unsaved] {
+            assert_eq!(offered(&Err(e)), None);
+        }
+        assert_eq!(add_note(&Ok(m), "you@workbox", "docs"), None);
+        assert_eq!(add_note(&Err(AddError::Unsaved), "you@workbox", "docs").as_deref(), Some("docs on you@workbox was added, but herdr does not list it yet."));
+        assert_eq!(add_note(&Err(AddError::Failed("no route".into())), "you@workbox", "docs").as_deref(), Some("Couldn't add docs on you@workbox: no route"));
     }
 
     #[test]
     fn the_popup_closes_once_its_host_has_no_machine() {
         let d = listed(vec![info("default", true)]);
-        assert!(view(&d, &[saved("you@workbox", "agents")]).is_some());
+        assert!(view(&d, &[saved("you@workbox", "agents")], &none()).is_some());
         let off = Machine { enabled: false, ..saved("you@workbox", "agents") };
-        assert!(view(&d, &[off]).is_some(), "turned off is still saved");
-        assert_eq!(view(&d, &[saved("you@otherbox", "agents")]), None, "forgotten");
-        assert_eq!(view(&d, &[]), None);
+        assert!(view(&d, &[off], &none()).is_some(), "turned off is still saved");
+        assert_eq!(view(&d, &[saved("you@otherbox", "agents")], &none()), None, "forgotten");
+        assert_eq!(view(&d, &[], &none()), None);
     }
 
     #[test]
@@ -355,7 +439,7 @@ mod tests {
             let mut d = Discover::new("you@workbox".into());
             let run = d.relist();
             d.listed(run, Err(e));
-            view(&d, &machines)
+            view(&d, &machines, &none())
         };
         assert_eq!(
             failed(ListError::SignIn),
@@ -366,7 +450,7 @@ mod tests {
             failed(ListError::Failed("no answer from you@workbox in 15 s".into())),
             Some(View::Failed("Couldn't list the sessions on you@workbox: no answer from you@workbox in 15 s".into()))
         );
-        assert_eq!(view(&Discover::new("you@workbox".into()), &machines), Some(View::Loading));
+        assert_eq!(view(&Discover::new("you@workbox".into()), &machines, &none()), Some(View::Loading));
     }
 
     #[test]
@@ -400,7 +484,7 @@ mod tests {
         let run = d.relist();
         d.listed(run, found);
         assert_eq!(
-            rows(view(&d, &[saved("you@workbox", "agents")])),
+            rows(view(&d, &[saved("you@workbox", "agents")], &none())),
             [("default".to_string(), "running", false), ("docs".to_string(), "stopped (adding starts it)", false)]
         );
         let denied = host(None);
@@ -408,6 +492,6 @@ mod tests {
         let mut d = Discover::new("you@workbox".into());
         let run = d.relist();
         d.listed(run, refused);
-        assert!(matches!(view(&d, &[saved("you@workbox", "agents")]), Some(View::Failed(why)) if why.contains("herdr machine reconnect m-agents")));
+        assert!(matches!(view(&d, &[saved("you@workbox", "agents")], &none()), Some(View::Failed(why)) if why.contains("herdr machine reconnect m-agents")));
     }
 }

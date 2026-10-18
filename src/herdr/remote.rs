@@ -27,16 +27,68 @@ pub fn machines() -> anyhow::Result<Vec<Machine>> {
     Ok(serde_json::from_slice(&herdr(&["machine", "list", "--json"])?)?)
 }
 
+/// How long saving a machine may take: herdr reaches the host, checks its herdr (it may copy one over) and starts
+/// the session's server first.
+pub const ADD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Why a machine was not added.
+#[derive(Debug)]
+pub enum AddError {
+    /// `herdr machine add` failed, as it said.
+    Failed(String),
+    /// It took past its deadline and was ended.
+    TimedOut,
+    /// It succeeded, yet herdr's list of machines has none for the session.
+    Unsaved,
+}
+
+impl std::fmt::Display for AddError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AddError::Failed(why) => f.write_str(why),
+            AddError::TimedOut => write!(f, "herdr machine add took over {} min and was stopped", ADD_TIMEOUT.as_secs() / 60),
+            AddError::Unsaved => f.write_str("herdr added the machine but does not list it yet"),
+        }
+    }
+}
+
+impl std::error::Error for AddError {}
+
 /// Saves `target` as a machine running the session `session`: herdr checks the host's herdr and starts that
-/// session's server first. Setup that needs approval (installing or replacing herdr) only runs in a terminal.
-pub fn add_machine(target: &str, session: &str) -> anyhow::Result<Machine> {
-    herdr(&["machine", "add", target, "--remote-session", session]).map_err(|e| {
-        anyhow::anyhow!("{e:#}\nIf the host needs herdr set up, run `herdr machine add {target} --remote-session {session}` in a terminal.")
+/// session's server first, within [`ADD_TIMEOUT`]. Setup that needs approval (installing or replacing herdr) only
+/// runs in a terminal.
+pub async fn add_machine(target: &str, session: &str) -> Result<Machine, AddError> {
+    add_machine_with(std::ffi::OsStr::new(&super::session::binary()), target, session, ADD_TIMEOUT).await
+}
+
+/// [`add_machine`] with the `herdr` to run and its deadline, for a test's stand-in.
+async fn add_machine_with(herdr: &std::ffi::OsStr, target: &str, session: &str, timeout: Duration) -> Result<Machine, AddError> {
+    let run = |args: Vec<String>| async move {
+        let child = tokio::process::Command::from(crate::process::command(herdr))
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // past the deadline the child is dropped, and herdr ended with it
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(timeout, child).await {
+            Err(_) => Err(AddError::TimedOut),
+            Ok(Err(e)) => Err(AddError::Failed(format!("herdr: {e}"))),
+            Ok(Ok(out)) if !out.status.success() => Err(AddError::Failed(format!("herdr {}: {}", args[..2].join(" "), String::from_utf8_lossy(&out.stderr).trim()))),
+            Ok(Ok(out)) => Ok(out.stdout),
+        }
+    };
+    let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    run(words(&["machine", "add", target, "--remote-session", session])).await.map_err(|e| match e {
+        AddError::Failed(why) => {
+            AddError::Failed(format!("{why}\nIf the host needs herdr set up, run `herdr machine add {target} --remote-session {session}` in a terminal."))
+        }
+        e => e,
     })?;
-    machines()?
-        .into_iter()
-        .find(|m| m.target == target && m.session == session)
-        .ok_or_else(|| anyhow::anyhow!("herdr saved no machine for {target}"))
+    let list = run(words(&["machine", "list", "--json"])).await?;
+    let saved: Vec<Machine> = serde_json::from_slice(&list).map_err(|e| AddError::Failed(format!("herdr's list of machines was not readable: {e}")))?;
+    saved.into_iter().find(|m| m.target == target && m.session == session).ok_or(AddError::Unsaved)
 }
 
 /// Renames the machine's label.
@@ -639,6 +691,32 @@ mod tests {
         assert_eq!(run(&remote_command(&list_script())), (Some(0), "SHEPHERD_OUT\nargs: session list --json session: none\n".into()));
         let bridge = run(&bridge_command("agents", "remote-api-bridge"));
         assert_eq!(bridge, (Some(0), "args: --session agents remote-api-bridge session: agents\n".into()));
+    }
+
+    /// A stand-in herdr: `add` is what its `machine add` does, `list` what its `machine list --json` prints.
+    #[cfg(unix)]
+    fn fake_herdr(add: &str, list: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        super::fake::script(&dir.path().join("herdr"), &format!("case \"$2\" in add) {add} ;; list) echo '{list}' ;; esac"));
+        dir
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adding_a_machine_says_why_it_did_not_and_stops_at_its_deadline() {
+        let add = |dir: tempfile::TempDir, secs| async move {
+            let herdr = dir.path().join("herdr");
+            add_machine_with(herdr.as_os_str(), "you@workbox", "docs", Duration::from_secs(secs)).await
+        };
+        let listed = r#"[{"id":"m-9","label":"workbox/docs","target":"you@workbox","session":"docs","enabled":true}]"#;
+        let added = add(fake_herdr("true", listed), 5).await.unwrap();
+        assert_eq!((added.id.as_str(), added.session.as_str()), ("m-9", "docs"));
+        assert!(matches!(add(fake_herdr("true", "[]"), 5).await, Err(AddError::Unsaved)), "added, yet not listed");
+        let refused = add(fake_herdr("echo 'cannot reach you@workbox' >&2; exit 1", listed), 5).await;
+        assert!(matches!(&refused, Err(AddError::Failed(why)) if why.starts_with("herdr machine add: cannot reach you@workbox\nIf the host")), "{refused:?}");
+        let started = std::time::Instant::now();
+        assert!(matches!(add(fake_herdr("exec /bin/sleep 30", listed), 1).await, Err(AddError::TimedOut)));
+        assert!(started.elapsed() < Duration::from_secs(5), "herdr is ended, not waited for");
     }
 
     #[cfg(unix)]
