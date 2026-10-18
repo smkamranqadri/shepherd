@@ -148,14 +148,56 @@ fn group_name(group: emojis::Group) -> &'static str {
     }
 }
 
+/// New session, and with Remote on Add SSH machine: the host first, then the sessions on it to add.
 pub(super) struct SessionDialog {
+    /// New session's name, and Add SSH machine's new session's once New session… is picked.
     pub(super) name: Entity<InputState>,
-    /// The SSH host of a remote session; shown while `remote` is on.
+    /// Add SSH machine's host; shown while `remote` is on.
     pub(super) host: Entity<InputState>,
     pub(super) remote: bool,
-    /// Bumped on every flip of `remote`: the host field's slide restarts.
+    /// Bumped on every flip of `remote`: the dialog's body fades in again.
     pub(super) flips: u64,
+    /// Add SSH machine's way from the host to the sessions added.
+    pub(super) flow: discover::HostFlow,
     _events: Vec<Subscription>,
+}
+
+/// A dialog's text field, for Tab's way through them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Field {
+    Name,
+    Host,
+    /// Edit session's icon search.
+    Search,
+}
+
+/// The session dialog's fields top to bottom, as Tab goes through them: New session's name; Add SSH machine's host,
+/// and under the host's list the new session's name once New session… is picked.
+pub(super) fn session_fields(remote: bool, flow: &discover::HostFlow) -> Vec<Field> {
+    match remote {
+        false => vec![Field::Name],
+        true if flow.naming && flow.stage == discover::Stage::Choose => vec![Field::Host, Field::Name],
+        true => vec![Field::Host],
+    }
+}
+
+/// Edit session's fields top to bottom: the name, then the icon search under it.
+pub(super) const PLACE_EDIT_FIELDS: [Field; 2] = [Field::Name, Field::Search];
+
+/// The field Tab (Shift+Tab: `back`) goes to from `at` among `fields`, round from the last to the first and back;
+/// from none (the keyboard on no field), the first, or the last going back.
+pub(super) fn tab_to(fields: &[Field], at: Option<Field>, back: bool) -> Option<Field> {
+    let n = fields.len();
+    if n == 0 {
+        return None;
+    }
+    let to = match (at.and_then(|f| fields.iter().position(|x| *x == f)), back) {
+        (None, false) => 0,
+        (None, true) => n - 1,
+        (Some(i), false) => (i + 1) % n,
+        (Some(i), true) => (i + n - 1) % n,
+    };
+    Some(fields[to])
 }
 
 impl Shell {
@@ -512,8 +554,22 @@ impl Shell {
             }
         };
         let events = vec![cx.subscribe_in(&name, window, enter), cx.subscribe_in(&host, window, enter)];
-        self.session_dialog = Some(crate::ui::Popup::new(SessionDialog { name, host, remote: false, flips: 0, _events: events }));
+        let flow = discover::HostFlow::new();
+        self.session_dialog = Some(crate::ui::Popup::new(SessionDialog { name, host, remote: false, flips: 0, flow, _events: events }));
         cx.notify();
+    }
+
+    /// Add SSH machine…: the session dialog with Remote on, the host's field taking the keyboard. Given a `host`, it
+    /// is typed in and read at once; `naming`, New session… is picked for when the list lands.
+    pub(super) fn open_add_machine(&mut self, host: Option<String>, naming: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_session_dialog(window, cx);
+        self.toggle_session_remote(window, cx);
+        let Some(dialog) = self.session_dialog.as_mut() else { return };
+        dialog.value.flow.naming = naming;
+        if let Some(host) = host {
+            dialog.value.host.update(cx, |input, cx| input.set_value(host, window, cx));
+            self.connect_add_machine(cx);
+        }
     }
 
     pub(super) fn toggle_session_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -525,46 +581,69 @@ impl Shell {
         cx.notify();
     }
 
-    /// Create (and move to) the session, here or on an SSH host, or cancel. Input herdr would refuse keeps the dialog
-    /// open.
+    /// Tab (Shift+Tab: `back`) in a dialog with more than one field: the keyboard to the next field down (up), round
+    /// from the last to the first.
+    pub(super) fn tab_dialog_field(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let inputs: Vec<(Field, Entity<InputState>)> = if let Some(d) = self.session_dialog.as_ref().filter(|d| d.is_open()) {
+            session_fields(d.value.remote, &d.value.flow)
+                .into_iter()
+                .map(|f| (f, if f == Field::Host { d.value.host.clone() } else { d.value.name.clone() }))
+                .collect()
+        } else if let Some(e) = self.place_edit.as_ref().filter(|e| e.is_open()) {
+            PLACE_EDIT_FIELDS.into_iter().map(|f| (f, if f == Field::Search { e.value.search.clone() } else { e.value.name.clone() })).collect()
+        } else {
+            return;
+        };
+        let fields: Vec<Field> = inputs.iter().map(|(f, _)| *f).collect();
+        let at = inputs.iter().find(|(_, i)| i.read(cx).focus_handle(cx).is_focused(window)).map(|(f, _)| *f);
+        let Some(to) = tab_to(&fields, at, back) else { return };
+        if let Some((_, input)) = inputs.into_iter().find(|(f, _)| *f == to) {
+            input.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.select_all(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Add SSH machine's rows: a click on a session picks it, or no longer.
+    pub(super) fn pick_session_to_add(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Some(d) = self.session_dialog.as_mut().filter(|d| d.is_open()) {
+            d.value.flow.pick(name);
+            cx.notify();
+        }
+    }
+
+    /// Add SSH machine's New session…: the name field shows, with the keyboard, or goes.
+    pub(super) fn toggle_new_remote_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = self.session_dialog.as_mut().filter(|d| d.is_open()) else { return };
+        d.value.flow.toggle_naming();
+        let to = if d.value.flow.naming { &d.value.name } else { &d.value.host };
+        to.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Create (and move to) the session here, or cancel. Input herdr would refuse keeps the dialog open. With Remote
+    /// on, Enter and the main button read the host typed, or add the sessions picked on it (`discover::Primary`).
     pub(super) fn finish_session_dialog(&mut self, create: bool, cx: &mut Context<Self>) {
         let Some(dialog) = self.session_dialog.as_mut().filter(|d| d.is_open()) else { return };
+        if create && dialog.value.remote {
+            let host = dialog.value.host.read(cx).value().to_string();
+            match dialog.value.flow.primary(&host) {
+                discover::Primary::Connect => self.connect_add_machine(cx),
+                discover::Primary::Add => self.add_picked_sessions(cx),
+                discover::Primary::Wait => {}
+            }
+            return;
+        }
         let name = dialog.value.name.read(cx).value().trim().to_string();
-        let host = dialog.value.host.read(cx).value().trim().to_string();
-        let remote = dialog.value.remote;
-        // a remote session may go unnamed: the host's default one
-        let name = if remote && name.is_empty() { "default".to_string() } else { name };
         if create && !crate::herdr::valid_session_name(&name) {
             crate::ui::toast::error(cx, "A session's name takes ASCII letters, digits, '.', '_' and '-'.");
             return;
         }
-        if create && remote && host.is_empty() {
-            crate::ui::toast::error(cx, "Which host? An SSH target such as user@host or a Host from ~/.ssh/config.");
-            return;
-        }
         dialog.close();
         self.focused = None; // an input held focus: back to herdr's focused pane
-        if create && remote {
-            crate::ui::toast::info(cx, format!("Setting up {name} on {host}…"), None);
-            let task = self.rt.spawn(async move { crate::herdr::add_machine(&host, &name).await });
-            cx.spawn(async move |this, cx| {
-                let added = task.await.unwrap_or_else(|e| Err(crate::herdr::AddError::Failed(e.to_string())));
-                let _ = this.update(cx, |s, cx| match discover::offered(&added) {
-                    Some(machine) => {
-                        s.switch_machine(machine.clone(), cx);
-                        s.offer_more_sessions(machine.clone(), cx);
-                    }
-                    None => {
-                        if let Err(e) = &added {
-                            crate::ui::toast::error(cx, e.to_string());
-                        }
-                        // herdr may have saved one it does not list yet
-                        s.refresh_places(cx);
-                    }
-                });
-            })
-            .detach();
-        } else if create {
+        if create {
             // a name that exists moves there instead
             let known = self.places.iter().find_map(|p| match p {
                 Place::Session(s) if s.name == name => Some(s.clone()),
@@ -681,5 +760,36 @@ mod tests {
         let found: Vec<_> = icon_rows("home").concat();
         assert!(found.iter().any(|t| matches!(t, IconTile::Solar("home-2"))));
         assert!(matches!(icon_rows("")[0][0], IconTile::Letter));
+    }
+
+    #[test]
+    fn tab_goes_down_the_fields_and_round() {
+        use Field::*;
+        let two = [Host, Name];
+        assert_eq!(tab_to(&two, Some(Host), false), Some(Name));
+        assert_eq!(tab_to(&two, Some(Name), false), Some(Host), "round from the last");
+        assert_eq!(tab_to(&two, Some(Name), true), Some(Host));
+        assert_eq!(tab_to(&two, Some(Host), true), Some(Name), "Shift+Tab round from the first");
+        assert_eq!(tab_to(&two, None, false), Some(Host), "the keyboard on no field");
+        assert_eq!(tab_to(&two, None, true), Some(Name));
+        assert_eq!(tab_to(&two, Some(Search), false), Some(Host), "a field not shown");
+        assert_eq!(tab_to(&[Name], Some(Name), false), Some(Name));
+        assert_eq!(tab_to(&[], None, false), None);
+        assert_eq!(tab_to(&PLACE_EDIT_FIELDS, Some(Name), false), Some(Search));
+        assert_eq!(tab_to(&PLACE_EDIT_FIELDS, Some(Search), true), Some(Name));
+    }
+
+    #[test]
+    fn the_dialogs_fields_go_in_the_order_they_show() {
+        use Field::*;
+        let mut flow = discover::HostFlow::new();
+        assert_eq!(session_fields(false, &flow), [Name]);
+        assert_eq!(session_fields(true, &flow), [Host], "the host first");
+        flow.naming = true;
+        assert_eq!(session_fields(true, &flow), [Host], "no name field before the host's list");
+        let run = flow.connect("you@workbox").unwrap();
+        flow.listed(run, Ok(Vec::new()));
+        assert_eq!(session_fields(true, &flow), [Host, Name], "New session…'s name under the list");
+        assert_eq!(session_fields(false, &flow), [Name]);
     }
 }

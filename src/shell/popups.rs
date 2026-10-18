@@ -226,6 +226,9 @@ impl Shell {
                         this.finish_place_edit(false, cx);
                     }
                 }))
+                // Tab from the name to the icon search and back
+                .on_action(cx.listener(|this, _: &gpui_base::input::IndentInline, window, cx| this.tab_dialog_field(false, window, cx)))
+                .on_action(cx.listener(|this, _: &gpui_base::input::OutdentInline, window, cx| this.tab_dialog_field(true, window, cx)))
                 .child(div().mt(px(4.)).text_color(theme.text_muted).child("Name"))
                 .child(field(&edit.value.name))
                 // Arc's and Zen's picker: drawn icons or emoji, after the name's letter; the picked one lit
@@ -560,7 +563,62 @@ impl Shell {
                     .text_size(px(14.))
                     .child(div().flex_1().child(Input::new(input)))
             };
-            let card = dialog_card(theme, "session-dialog", "New session")
+            let label = |text: &'static str| div().mt(px(4.)).text_color(theme.text_muted).child(text);
+            let flow = &dialog.value.flow;
+            let host_typed = dialog.value.host.read(cx).value().to_string();
+            let primary = flow.primary(&host_typed);
+            let mut body = div().flex().flex_col();
+            if remote {
+                // the host first; its sessions are read before any is added
+                body = body.child(label("Host")).child(field(&dialog.value.host));
+                let line = |text: String| div().mt(px(10.)).line_height(px(19.)).text_color(theme.text_muted).child(text);
+                match &flow.stage {
+                    discover::Stage::Host => {}
+                    discover::Stage::Listing => {
+                        body = body.child(div().mt(px(12.)).flex().items_center().gap(px(8.)).text_color(theme.text_muted).child(spinner(theme, "add-machine-loading".into())).child("Asking the host…"))
+                    }
+                    discover::Stage::Failed(e) => body = body.child(line(discover::list_failure(e, &flow.target, &self.machine_records(&flow.target)))),
+                    discover::Stage::Choose | discover::Stage::Adding(_) | discover::Stage::Done => {
+                        let choices = flow.choices(&self.machine_records(&flow.target), &self.tree.adds);
+                        let choosing = flow.stage == discover::Stage::Choose;
+                        if let Some(text) = choices.line {
+                            body = body.child(line(text));
+                        }
+                        let rows = choices.rows.iter().enumerate().map(|(i, r)| {
+                            let name = r.name.clone();
+                            discover::session_choice(theme, ("add-machine-session", i), r)
+                                .when(choosing && !r.adding, |el| el.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.pick_session_to_add(&name, cx))))
+                        });
+                        let new = discover::Row { name: "New session…".into(), note: "named here, started when added", adding: false, picked: flow.naming };
+                        let new = discover::session_choice(theme, ("add-machine-new", 0), &new)
+                            .when(choosing, |el| el.on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_new_remote_session(window, cx))));
+                        body = body.child(div().mt(px(10.)).flex().flex_col().gap(px(2.)).children(rows).child(new));
+                        if flow.naming && choosing {
+                            body = body.child(label("Name of the new session")).child(field(&dialog.value.name));
+                        }
+                    }
+                }
+                if let Some(problem) = flow.problem.clone() {
+                    body = body.child(div().mt(px(10.)).line_height(px(19.)).text_color(theme.danger).child(problem));
+                }
+            } else {
+                body = body.child(label("Name")).child(field(&dialog.value.name));
+            }
+            // a flip of Remote fades the other body in
+            let body = match dialog.value.flips {
+                0 => body.into_any_element(),
+                flips => body
+                    .with_animation(SharedString::from(format!("session-body-{flips}")), gpui::Animation::new(SPRING_DURATION), |el, t| el.opacity(spring(t).clamp(0., 1.)))
+                    .into_any_element(),
+            };
+            let (title, action) = match (remote, primary) {
+                (false, _) => ("New session", "Create"),
+                (true, discover::Primary::Add) => ("Add SSH machine", "Add"),
+                (true, _) => ("Add SSH machine", "Connect"),
+            };
+            let retry = remote && matches!(flow.stage, discover::Stage::Failed(_)) && primary == discover::Primary::Connect;
+            let waiting = remote && primary == discover::Primary::Wait;
+            let card = dialog_card(theme, "session-dialog", title)
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| this.finish_session_dialog(false, cx)))
                 .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, _, cx| {
                     if e.keystroke.key == "escape" {
@@ -568,29 +626,11 @@ impl Shell {
                         this.finish_session_dialog(false, cx);
                     }
                 }))
-                .child(div().mt(px(4.)).text_color(theme.text_muted).child(if remote { "Name, or empty for the host's default session" } else { "Name" }))
-                .child(field(&dialog.value.name))
-                // the host field slides open under the name, and the card grows with it
-                .child({
-                    // its margin and box: the height it springs to
-                    let full = 8. + SESSION_FIELD_H;
-                    let host = div().flex_none().overflow_hidden().child(field(&dialog.value.host));
-                    match dialog.value.flips {
-                        0 => host.h(px(0.)).into_any_element(),
-                        flips => host
-                            .with_animation(
-                                SharedString::from(format!("session-host-{flips}")),
-                                // gpui wants eased time inside 0..=1; the spring overshoots, so it shapes the height here
-                                gpui::Animation::new(SPRING_DURATION),
-                                move |el, t| {
-                                    let open = if remote { spring(t) } else { 1. - spring(t) };
-                                    el.h(px(full * open.max(0.))).opacity(open.clamp(0., 1.))
-                                },
-                            )
-                            .into_any_element(),
-                    }
-                })
-                // on: the session runs on an SSH host, saved as a herdr machine
+                // a one-line input passes Tab on: the next field takes the keyboard
+                .on_action(cx.listener(|this, _: &gpui_base::input::IndentInline, window, cx| this.tab_dialog_field(false, window, cx)))
+                .on_action(cx.listener(|this, _: &gpui_base::input::OutdentInline, window, cx| this.tab_dialog_field(true, window, cx)))
+                .child(body)
+                // on: the dialog adds sessions on an SSH host, each saved as a herdr machine
                 .child(
                     row(theme, false, "session-remote")
                         .mt(px(12.))
@@ -608,13 +648,15 @@ impl Shell {
                         .justify_end()
                         .gap(px(8.))
                         .child(
-                            ghost_button(theme, "session-cancel", "Cancel")
+                            ghost_button(theme, "session-cancel", if waiting { "Close" } else { "Cancel" })
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.finish_session_dialog(false, cx))),
                         )
-                        .child(
-                            solid_button("session-create", "Create", theme.text, theme.surface)
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.finish_session_dialog(true, cx))),
-                        ),
+                        .when(!waiting, |el| {
+                            el.child(
+                                solid_button("session-create", if retry { "Try again" } else { action }, theme.text, theme.surface)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.finish_session_dialog(true, cx))),
+                            )
+                        }),
                 );
             modal("session-dialog", dialog, window, card)
         }))
