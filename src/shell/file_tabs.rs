@@ -10,7 +10,8 @@
 //! A file's view is its editor (`ui::editor`), which shows what it cannot edit in the read-only viewer. A tab with
 //! unsaved changes has a dot, is pinned on its first edit, is never closed to make room nor replaced as a preview,
 //! and asks Save / Don't Save / Cancel before it closes; quitting or closing the window with any asks Save All /
-//! Don't Save / Cancel. The cursor and scroll of a view dropped to save memory are put back when it is made again.
+//! Don't Save / Cancel; Don't Save lets their drafts go too (`files::drafts`). The cursor and scroll of a view
+//! dropped to save memory are put back when it is made again.
 //!
 //! A change in the Changes tab opens its diff (`ui::diff_view`) as a file tab of its own kind (`TabKind::Diff`),
 //! by the same preview rules, never kept for the next run; the shown one reads its diff again on every Changes
@@ -515,7 +516,11 @@ impl Shell {
         cx.spawn_in(window, async move |this, cx| {
             let close = match closing(answer.await.ok()) {
                 Closing::Keep => false,
-                Closing::Discard => true,
+                Closing::Discard => {
+                    // its changes let go: their draft too
+                    let _ = this.update(cx, |_, cx| editor.update(cx, |e, _| e.discard_draft()));
+                    true
+                }
                 Closing::Save => {
                     let save = this.update_in(cx, |_, window, cx| editor.update(cx, |e, cx| e.save(SaveMode::Safe, window, cx)));
                     match save {
@@ -953,6 +958,12 @@ impl Shell {
             let go = match answer {
                 Closing::Keep => false,
                 Closing::Discard => {
+                    // the unsaved changes let go: their drafts too, so the next run does not bring them back
+                    let _ = this.update(cx, |s, cx| {
+                        for e in s.editors(false, cx) {
+                            e.update(cx, |e, _| e.discard_draft());
+                        }
+                    });
                     // what is being written finishes first, whatever was answered
                     let writes = this.update(cx, |s, cx| s.editors(true, cx).iter().filter_map(|e| e.read(cx).saving()).collect::<Vec<_>>()).unwrap_or_default();
                     for write in writes {
