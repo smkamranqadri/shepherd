@@ -1081,6 +1081,11 @@ impl PaneTerminal {
             return; // typing in the search bar
         }
         let ks = &event.keystroke;
+        // a tapped modifier's stand-in keystroke (`tap::VIRTUAL_PREFIX`), replayed when no chord followed it: it is no
+        // key to type
+        if ks.unparse() == crate::tap::VIRTUAL_PREFIX {
+            return;
+        }
         // The dialog takes the keys: Esc and Space (Quick Look's) close it, the rest go nowhere.
         if self.preview.as_ref().is_some_and(Popup::is_open) {
             if ks.key == "escape" || ks.key == "space" {

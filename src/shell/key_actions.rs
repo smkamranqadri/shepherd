@@ -146,7 +146,31 @@ impl Shell {
     /// A key after the prefix that herdr binds to nothing: swallowed, as herdr's prefix mode does.
     pub(super) fn herdr_unbound(&mut self, unbound: &crate::herdr::keys::HerdrUnbound, cx: &mut Context<Self>) {
         if !unbound.chord.is_empty() {
-            crate::ui::toast::info(cx, format!("herdr binds nothing to {}", spaced_chord(&unbound.chord)), None);
+            let tap = SettingsGlobal::of(cx).settings.prefix_tap.as_deref().and_then(crate::tap::Mods::parse);
+            crate::ui::toast::info(cx, format!("herdr binds nothing to {}", spaced_chord(&unbound.chord, tap)), None);
+        }
+    }
+}
+
+impl Shell {
+    /// Feeds the tapped-modifier prefix (`tap`, set in Settings): a tap that completes while a pane has the keyboard
+    /// dispatches its stand-in keystroke to the window, which starts herdr's prefix chords as the prefix key would.
+    /// `window` is none for the events that only cancel a tap.
+    pub(super) fn prefix_tap_event(&mut self, event: crate::tap::Event, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        let Some(wanted) = SettingsGlobal::of(cx).settings.prefix_tap.as_deref().and_then(crate::tap::Mods::parse) else {
+            return;
+        };
+        if !self.prefix_tap.step(wanted, event, Instant::now()) {
+            return;
+        }
+        let Some(window) = window else { return };
+        // only in a pane: the chords are bound there, and a tap anywhere else (Settings, a file) is nothing
+        let in_pane = self.panes.values().any(|p| p.read(cx).focus_handle(cx).is_focused(window));
+        if in_pane && let Ok(stand_in) = gpui::Keystroke::parse(crate::tap::VIRTUAL_PREFIX) {
+            // after this event is done: a dispatch from inside one would nest
+            window.defer(cx, move |window, cx| {
+                window.dispatch_keystroke(stand_in, cx);
+            });
         }
     }
 }
@@ -165,8 +189,18 @@ pub(super) fn herdr_only_message(only: &crate::herdr::keys::HerdrOnly) -> String
 }
 
 /// A chord of keystrokes as the settings page writes it: `ctrl-b a` → `Ctrl+B then A`.
-pub(super) fn spaced_chord(chord: &str) -> String {
-    chord.split_whitespace().map(crate::ui::settings::display_chord).collect::<Vec<_>>().join(" then ")
+/// A tapped modifier's stand-in keystroke reads as the tap (`tap`), not as a key no keyboard has.
+pub(super) fn spaced_chord(chord: &str, tap: Option<crate::tap::Mods>) -> String {
+    let first = chord.split_whitespace().next();
+    let stand_in = crate::bindings::normalize(crate::tap::VIRTUAL_PREFIX);
+    chord
+        .split_whitespace()
+        .map(|k| match (tap, stand_in.as_deref()) {
+            (Some(tap), Some(stand_in)) if k == stand_in && first == Some(k) => tap.display(),
+            _ => crate::ui::settings::display_chord(k),
+        })
+        .collect::<Vec<_>>()
+        .join(" then ")
 }
 
 #[cfg(test)]
@@ -219,6 +253,9 @@ mod tests {
     fn a_caught_chord_says_where_the_action_runs() {
         let only = crate::herdr::keys::HerdrOnly { name: "copy_mode".into(), chord: "prefix+[".into() };
         assert!(herdr_only_message(&only).starts_with("copy_mode is an action of herdr's own screen"));
-        assert_eq!(spaced_chord("ctrl-b a"), "Ctrl+B then A");
+        assert_eq!(spaced_chord("ctrl-b a", None), "Ctrl+B then A");
+        let tap = crate::tap::Mods::parse("ctrl-shift");
+        assert_eq!(spaced_chord("ctrl-alt-shift-f24 a", tap), "Ctrl+Shift tap then A", "the stand-in reads as the tap");
+        assert_eq!(spaced_chord("ctrl-b ctrl-alt-shift-f24", tap), "Ctrl+B then Ctrl+Alt+Shift+F24", "only as the first keystroke");
     }
 }

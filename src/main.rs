@@ -19,8 +19,10 @@ fn main() {
         shepherd::herdr::set_binary(settings.herdr_bin.clone());
         shepherd::herdr::set_socket(settings.herdr_socket.clone());
         cx.set_global(settings.theme(cx.window_appearance()));
-        shepherd::bindings::rebind(cx, &settings.keys);
+        let keys = settings.keys.clone();
         cx.set_global(shepherd::settings::SettingsGlobal { settings, error, path });
+        // after the settings are global: a tap prefix is one of them
+        shepherd::bindings::rebind(cx, &keys);
         shepherd::bindings::bind_editor_keys(cx);
         // herdr's chords follow its config.toml from here on, whoever edits it
         shepherd::bindings::watch_herdr_config(cx);
@@ -56,7 +58,6 @@ fn main() {
         if let Ok(which) = std::env::var("SHEPHERD_PANEL") {
             use shepherd::ui::command_panel::Kind;
             let kind = match which.as_str() {
-                "agents" => Kind::Agents,
                 "workspaces" => Kind::Workspaces,
                 "sessions" => Kind::Places,
                 "shortcuts" => Kind::Shortcuts,

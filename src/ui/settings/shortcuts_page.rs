@@ -23,11 +23,15 @@ impl Recording {
     /// `herdr:<name>`, `command:<n>` or `shepherd:<Action>`, with a trailing `+` to add a chord: the launch hook
     /// (`SHEPHERD_RECORD`) for screenshots and tests.
     pub fn from_spec(spec: &str, config: &HerdrConfig, keys: &std::collections::BTreeMap<String, String>) -> Option<Self> {
+        if spec == "tap" {
+            return Some(Recording { id: RowId::PrefixTap, slot: Slot::Replace(0), kind: Kind::PrefixTap, pending_prefix: false });
+        }
         let (spec, add) = spec.strip_suffix('+').map_or((spec, false), |s| (s, true));
         let rows = shortcuts::rows(keys, keymap::defaults(), config);
         let row = rows.iter().find(|r| match &r.id {
             RowId::Herdr(n) => spec == format!("herdr:{n}"),
             RowId::Command(i) => spec == format!("command:{i}"),
+            RowId::PrefixTap => false,
             RowId::Shepherd(n) => spec == format!("shepherd:{n}"),
         })?;
         Some(Self::of(row, if add { Slot::Add } else { Slot::Replace(0) }))
@@ -36,7 +40,9 @@ impl Recording {
     /// Records chord `slot` of `row`.
     fn of(row: &Row, slot: Slot) -> Self {
         let kind = match (row.source, row.indexed, row.prefix) {
+            (Source::Shepherd, ..) if row.id == RowId::PrefixTap => Kind::PrefixTap,
             (Source::Shepherd, ..) => Kind::Shepherd,
+            _ if row.id == RowId::PrefixTap => Kind::PrefixTap,
             (_, _, true) => Kind::Prefix,
             (_, true, _) => Kind::HerdrIndexed,
             _ => Kind::Herdr,
@@ -66,8 +72,30 @@ impl SettingsView {
                 let chord = chord.unwrap_or_default();
                 update(cx, |s| s.record_chord(action, &chord));
             }
+            // Backspace on the tap row: no tap prefix
+            RowId::PrefixTap => update(cx, |s| s.prefix_tap = None),
             id => self.edit_row(id, |labels| shortcuts::apply_slot(labels, recording.slot, chord), cx),
         }
+    }
+
+    /// The window's modifiers changed: while a prefix row records, a modifier (or pair) pressed and let go with no key
+    /// in between is the tap prefix.
+    pub(super) fn recording_modifiers(&mut self, event: crate::tap::Event, cx: &mut Context<Self>) {
+        if !self.recording.as_ref().is_some_and(|r| matches!(r.kind, Kind::Prefix | Kind::PrefixTap)) {
+            return;
+        }
+        if let Some(mods) = self.tap_recorder.step(event) {
+            self.commit_tap(mods, cx);
+        }
+    }
+
+    /// A modifier tapped alone while the prefix rows record: Shepherd's tap prefix, saved in its settings.
+    pub(super) fn commit_tap(&mut self, mods: crate::tap::Mods, cx: &mut Context<Self>) {
+        self.keys_note = None;
+        let label = mods.label();
+        update(cx, |s| s.prefix_tap = label);
+        self.recording = None;
+        cx.notify();
     }
 
     /// Changes the chords of a herdr row (an action or a command): `change` gets the ones now. Reads the file
@@ -93,6 +121,7 @@ impl SettingsView {
             RowId::Shepherd(action) => update(cx, |s| {
                 s.keys.remove(*action);
             }),
+            RowId::PrefixTap => update(cx, |s| s.prefix_tap = None),
             id => {
                 let default = row.default.clone();
                 self.edit_row(id, move |_| default, cx);
@@ -107,6 +136,7 @@ impl SettingsView {
         match source {
             Source::Shepherd => update(cx, |s| s.keys.clear()),
             Source::Herdr => {
+                update(cx, |s| s.prefix_tap = None);
                 let keys = SettingsGlobal::of(cx).settings.keys.clone();
                 let result = self.write_config(cx, |config| {
                     let rows = shortcuts::rows(&keys, keymap::defaults(), config);
@@ -150,21 +180,21 @@ impl SettingsView {
         // the page is a 760 px column beside the 320 px nav: a window under ~1100 px has no room for chips beside the names
         let wide = window.viewport_size().width > px(1100.);
         let config = self.herdr_config.clone().unwrap_or_default();
-        let rows = shortcuts::rows(&settings.keys, keymap::defaults(), &config);
+        let rows = shortcuts::rows_with_tap(&settings.keys, settings.prefix_tap.as_deref(), keymap::defaults(), &config);
         let prefixes = self.prefix_chords();
         let clashes = shortcuts::conflicts(&rows, &prefixes);
         let query = self.shortcut_search.read(cx).value().trim().to_string();
         let shown: Vec<&Row> = shortcuts::filter(&rows, &query, &shortcuts::show);
         let recording = self.recording.clone();
         let groups = [
-            (Source::Herdr, "herdr", "Written to herdr's config.toml, which herdr reloads. The prefix key starts the chords marked Prefix."),
-            (Source::HerdrCommand, "herdr commands", "The [[keys.command]] entries of the same file: re-key them here, add or remove them in the file."),
             (Source::Shepherd, "Shepherd", "Saved in Shepherd's settings; a Shepherd chord wins over a herdr one in a pane."),
+            (Source::HerdrCommand, "herdr commands", "The [[keys.command]] entries of the same file: re-key them here, add or remove them in the file."),
+            (Source::Herdr, "herdr", "Written to herdr's config.toml, which herdr reloads. The prefix key starts the chords marked Prefix."),
         ];
         let mut page = div()
             .child(
                 div()
-                    .child(page_header(theme, "Shortcuts", "Click a chord, then press the new one. Press the prefix, then a key, for a prefix chord. Esc cancels, \u{232b} unbinds."))
+                    .child(page_header(theme, "Shortcuts", "Click a chord, then press the new one. Press the prefix, then a key, for a prefix chord. Esc cancels, \u{232b} unbinds. A chord is recorded as Shepherd receives it: a desktop that takes or rewrites Super chords (a window manager's own shortcuts) never passes them on."))
                     .child(
                         div()
                             .mt(px(16.))
@@ -222,6 +252,7 @@ impl SettingsView {
     fn shortcut_row(&self, theme: &Theme, wide: bool, row: &Row, first: bool, clashes: &std::collections::BTreeMap<RowId, Vec<String>>, recording: Option<&Recording>, cx: &mut Context<Self>) -> Div {
         let hover = theme.border_strong;
         let tag = match (row.source, row.herdr_only) {
+            _ if row.id == RowId::PrefixTap => "Shepherd",
             (Source::Shepherd, _) => "Shepherd",
             (Source::HerdrCommand, false) => "herdr command",
             (_, false) => "herdr",
@@ -231,6 +262,7 @@ impl SettingsView {
             RowId::Herdr(n) => format!("herdr-{n}"),
             RowId::Command(i) => format!("command-{i}"),
             RowId::Shepherd(n) => format!("shepherd-{n}"),
+            RowId::PrefixTap => "prefix-tap".to_string(),
         };
         let own = recording.filter(|r| r.id == row.id);
         let chip = |slot: Slot, text: Option<String>, faint: bool| {
@@ -265,6 +297,7 @@ impl SettingsView {
                 })
                 .on_click(cx.listener(move |v, _: &ClickEvent, window, cx| {
                     v.recording = Some(Recording::of(&target, slot));
+                    v.tap_recorder.reset();
                     v.keys_note = None;
                     window.focus(&v.focus, cx);
                     cx.notify();
@@ -273,11 +306,11 @@ impl SettingsView {
         let show = |c: &String| shortcuts::show(row, c);
         let mut chips: Vec<gpui::AnyElement> = Vec::new();
         if row.chords.is_empty() {
-            chips.push(chip(if row.source == Source::Shepherd { Slot::Replace(0) } else { Slot::Add }, None, false).into_any_element());
+            chips.push(chip(if row.source == Source::Shepherd || row.id == RowId::PrefixTap { Slot::Replace(0) } else { Slot::Add }, None, false).into_any_element());
         } else {
             let shown = if row.source == Source::Shepherd { &row.chords[..row.chords.len().min(2)] } else { &row.chords[..] };
             chips.extend(shown.iter().enumerate().map(|(i, c)| chip(Slot::Replace(i), Some(show(c)), false).into_any_element()));
-            if row.source != Source::Shepherd && !(row.prefix && row.name == "prefix") {
+            if row.source != Source::Shepherd && row.id != RowId::PrefixTap && !(row.prefix && row.name == "prefix") {
                 chips.push(chip(Slot::Add, Some("+".into()), true).into_any_element());
             }
         }

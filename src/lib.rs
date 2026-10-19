@@ -14,6 +14,7 @@ pub mod process;
 pub mod settings;
 pub mod shell;
 pub mod shortcuts;
+pub mod tap;
 pub mod terminal;
 pub mod theme;
 pub mod ui;

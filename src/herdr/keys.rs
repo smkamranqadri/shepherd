@@ -70,8 +70,12 @@ pub fn chords_for(label: &str, prefixes: &[String]) -> Vec<String> {
 /// Every chord herdr's config binds to something Shepherd runs, in GPUI's spelling: the actions of `[keys]` as
 /// `actions` has them, the `[[keys.command]]`, and, after each prefix, every other key (so herdr's prefix mode is not
 /// left half-typed into a shell by a key it does not bind).
-pub fn bindings(actions: &[Action], config: &HerdrConfig) -> Vec<(Bind, String)> {
-    let prefixes = prefix_chords(actions);
+pub fn bindings(actions: &[Action], config: &HerdrConfig, tap: bool) -> Vec<(Bind, String)> {
+    let mut prefixes = prefix_chords(actions);
+    // a modifier tapped on its own is a prefix too (`tap`): its virtual keystroke starts the same chords
+    if tap {
+        prefixes.extend(crate::bindings::normalize(crate::tap::VIRTUAL_PREFIX));
+    }
     let chords = |label: &str| chords_for(label, &prefixes);
     let mut out = Vec::new();
     for (target, label) in targets(actions) {
@@ -250,7 +254,7 @@ mod tests {
 
     fn binds(toml: &str) -> Vec<(Bind, String)> {
         let config = config(toml);
-        bindings(&actions(&builtin_defaults(), &config), &config)
+        bindings(&actions(&builtin_defaults(), &config), &config, false)
     }
 
     fn chord(binds: &[(Bind, String)], bind: Bind) -> Vec<&str> {

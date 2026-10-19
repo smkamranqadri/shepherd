@@ -73,7 +73,6 @@ fn window_controls_w(cx: &App) -> f32 {
 /// Centre line of the traffic lights (placed at y 14), measured on a 2x screen; the toggle centres on it, not on the titlebar.
 const TRAFFIC_LIGHTS_CENTER: f32 = 21.25;
 /// The Agents list's least height when dragged: one agent row and a bit.
-const AGENTS_MIN: f32 = 60.0;
 const TITLEBAR_CLUSTER: f32 = TOGGLE_LEFT + 24.0 + 8.0;
 
 pub struct Shell {
@@ -210,12 +209,6 @@ pub struct Shell {
     /// The description's whole height at the last paint: whether it has more than its folded lines.
     review_body_h: Rc<Cell<f32>>,
     agent_sort: AgentSort,
-    /// Saved in the settings when a drag ends.
-    agents_height: Option<f32>,
-    /// The Agents section folded to its header; saved in the settings on every toggle.
-    agents_collapsed: bool,
-    /// The Agents section's top edge is being dragged: the pointer's y and the list's height at the press.
-    agents_drag: Option<(f32, f32)>,
     /// The sidebar's `…` menu, open where it was clicked.
     view_menu: Option<crate::ui::Popup<()>>,
     /// The done agent's pane herdr was last told you looked at, so it is told once, not every frame.
@@ -249,7 +242,6 @@ pub struct Shell {
     usage_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
     /// The status bar's right-click menu of its labels, where it was clicked.
     statusbar_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
-    agents_scroll: gpui::ScrollHandle,
     /// The sidebar's Agents view's scroll.
     agents_view_scroll: gpui::ScrollHandle,
     tab_bar: tab_bar::TabBar,
@@ -328,6 +320,8 @@ pub struct Shell {
     /// Every key down in this window puts the hints away, a key bound to an action too (dispatched before any
     /// key-down listener hears it).
     _hint_keys: Subscription,
+    /// A modifier tapped on its own as the prefix (`tap`): watched from the window's modifier changes.
+    prefix_tap: crate::tap::Tap,
 }
 
 /// New worktree: the repo's workspace and the branch name being typed.
@@ -540,7 +534,11 @@ impl Shell {
                 let (this, handle) = (cx.entity().downgrade(), window.window_handle());
                 let hint_keys = cx.intercept_keystrokes(move |_, window, cx| {
                     if window.window_handle() == handle {
-                        let _ = this.update(cx, |s, cx| s.hint_cancel(cx));
+                        let _ = this.update(cx, |s, cx| {
+                            s.hint_cancel(cx);
+                            // a key with the modifier held: a chord, no tap
+                            s.prefix_tap_event(crate::tap::Event::Key, None, cx);
+                        });
                     }
                 });
                 let mut shell = Shell {
@@ -618,9 +616,6 @@ impl Shell {
                     review_expanded: false,
                     review_body_h: Default::default(),
                     agent_sort: SettingsGlobal::of(cx).settings.agent_sort,
-                    agents_height: SettingsGlobal::of(cx).settings.agents_height,
-                    agents_collapsed: SettingsGlobal::of(cx).settings.agents_collapsed,
-                    agents_drag: None,
                     view_menu: None,
                     focus_next: None,
                     marked_seen: None,
@@ -637,7 +632,6 @@ impl Shell {
                     removing: Default::default(),
                     remove_confirm: None,
                     pending_worktrees: Vec::new(),
-                    agents_scroll: gpui::ScrollHandle::new(),
                     agents_view_scroll: gpui::ScrollHandle::new(),
                     tab_bar: Default::default(),
                     focus: cx.focus_handle(),
@@ -677,6 +671,7 @@ impl Shell {
                     hints: Default::default(),
                     hints_wait: None,
                     _hint_keys: hint_keys,
+                    prefix_tap: Default::default(),
                 };
                 shell.resume_machine(cx);
                 shell.connect(cx);
@@ -793,7 +788,6 @@ impl Shell {
                 crate::ui::command_panel::items(self.shown_in_order().as_deref(), &bindings, &self.plugin_actions)
             }
             Kind::Shortcuts => crate::ui::command_panel::shortcut_items(&cx.try_global::<ActiveBindings>().map(|b| b.0.clone()).unwrap_or_default()),
-            Kind::Agents => crate::ui::command_panel::agent_items(self.panel_agents(cx)),
             Kind::Workspaces => {
                 let sessions = self.session_agents(cx);
                 // each session's workspaces in the order of drops herdr hasn't carried out yet, as the tree shows them
@@ -1185,15 +1179,13 @@ impl Shell {
         });
     }
 
-    /// While a divider, the sidebar or the agents list is being dragged, the whole window shows the resize cursor:
+    /// While a divider or the sidebar is being dragged, the whole window shows the resize cursor:
     /// the pointer outruns the narrow hit strip, whose own cursor would otherwise flicker with the terminal's.
     fn resize_cursor(&self) -> Option<impl IntoElement> {
         let vertical = if let Some(d) = &self.divider {
             d.vertical
         } else if self.sidebar_drag || self.panel_drag {
             true
-        } else if self.agents_drag.is_some() {
-            false
         } else {
             return None;
         };
@@ -1771,8 +1763,12 @@ impl Render for Shell {
             .capture_any_mouse_down(cx.listener(|s, _: &MouseDownEvent, _, cx| {
                 s.touch(cx);
                 s.hint_cancel(cx);
+                s.prefix_tap_event(crate::tap::Event::Click, None, cx);
             }))
-            .on_modifiers_changed(cx.listener(|s, e: &gpui::ModifiersChangedEvent, _, cx| s.hint_modifiers(&e.modifiers, cx)))
+            .on_modifiers_changed(cx.listener(|s, e: &gpui::ModifiersChangedEvent, window, cx| {
+                s.hint_modifiers(&e.modifiers, cx);
+                s.prefix_tap_event(crate::tap::Event::Mods(crate::tap::Mods::of(&e.modifiers)), Some(window), cx);
+            }))
             .relative()
             .size_full()
             .flex()
@@ -1854,7 +1850,6 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.toggle_settings_here(window, cx)))
             .on_action(cx.listener(|this, _: &CommandPanel, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Commands, w, cx)))
             .on_action(cx.listener(|this, _: &ChangeTheme, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Themes, w, cx)))
-            .on_action(cx.listener(|this, _: &AgentsPanel, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Agents, w, cx)))
             .on_action(cx.listener(|this, _: &NextNeedsYou, _, cx| this.next_needs_you(cx)))
             .on_action(cx.listener(|this, _: &WorkspacesPanel, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Workspaces, w, cx)))
             .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Shortcuts, w, cx)))
@@ -1899,19 +1894,16 @@ impl Render for Shell {
                 this.drag_divider(e.position, cx);
                 this.drag_sidebar(e.position.x, cx);
                 this.drag_panel(e.position.x, w, cx);
-                this.drag_agents(e.position.y, w, cx);
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.end_divider(cx);
                 this.end_sidebar_drag(cx);
                 this.end_panel_drag(cx);
-                this.end_agents_drag(cx);
             }))
             .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.end_divider(cx);
                 this.end_sidebar_drag(cx);
                 this.end_panel_drag(cx);
-                this.end_agents_drag(cx);
             }))
             // one reset of the selectable markdown's paint list for the frame, before the PR tab's description
             // and logs and the viewer's preview paint theirs

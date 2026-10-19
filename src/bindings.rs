@@ -109,7 +109,6 @@ app_actions! {
     ChangeTheme: "Change theme",
     ToggleSecureInput: "Secure keyboard entry",
     CommandPanel: "Command panel",
-    AgentsPanel: "Agents",
     NextNeedsYou: "Next agent that needs you",
     WorkspacesPanel: "Workspaces",
     SaveFile: "Save file",
@@ -244,7 +243,8 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("OpenSettings", "cmd-,"),
     ("CommandPanel", "cmd-k"),
     ("CommandPanel", "cmd-shift-p"),
-    ("AgentsPanel", "cmd-shift-a"),
+    // the sidebar's Workspaces or Agents view (the Agents panel it took over from had this chord)
+    ("ToggleAgentsView", "cmd-shift-a"),
     // fork-only: the agent that has waited longest for you, in any session, then the next
     ("NextNeedsYou", "cmd-shift-j"),
     ("SaveFile", "cmd-s"),
@@ -326,7 +326,7 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("FontSizeReset", "ctrl-0"),
     ("OpenSettings", "ctrl-,"),
     ("CommandPanel", "ctrl-shift-p"),
-    ("AgentsPanel", "ctrl-shift-a"),
+    ("ToggleAgentsView", "ctrl-shift-a"),
     // fork-only: the agent that has waited longest for you, in any session, then the next. Not Ctrl+Shift+U, IBus's
     // Unicode entry
     ("NextNeedsYou", "ctrl-shift-j"),
@@ -338,8 +338,8 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("ReplaceInFile", "ctrl-h"),
     ("GoToLine", "ctrl-g"),
     ("Quit", "ctrl-shift-q"),
-    // Ctrl+Shift+/ as a US layout reports it: the shifted key, without shift. Ctrl+/ stays the terminal's.
-    ("ShowShortcuts", "ctrl-?"),
+    // Ctrl+/ (plain slash): a pane no longer gets it (0x1f: readline's undo, vim's and others' own chord)
+    ("ShowShortcuts", "ctrl-/"),
 ];
 
 /// The Tab1–9 actions, in order: `TAB_ACTIONS[i]` goes to the strip's `i`th tab.
@@ -352,6 +352,21 @@ pub const WORKSPACE_ACTIONS: [&str; 9] =
 /// The Agent1–9 actions, in order: `AGENT_ACTIONS[i]` goes to the `i`th agent of the shown session, in the sidebar's
 /// order.
 pub const AGENT_ACTIONS: [&str; 9] = ["Agent1", "Agent2", "Agent3", "Agent4", "Agent5", "Agent6", "Agent7", "Agent8", "Agent9"];
+
+/// The key a US layout presses with Shift for `key`, when `key` is a shifted symbol: Linux hears Ctrl+Shift+/ as `ctrl-?`,
+/// which the Shortcuts page shows as the keys pressed. Off macOS punctuation counts too; macOS names its own.
+pub fn unshifted(key: &str) -> Option<char> {
+    if let Some(digit) = shifted_digit(key) {
+        return Some(digit);
+    }
+    if cfg!(target_os = "macos") {
+        return None;
+    }
+    const PAIRS: [(char, char); 11] = [('?', '/'), ('+', '='), ('_', '-'), ('{', '['), ('}', ']'), ('|', '\\'), (':', ';'), ('"', '\''), ('<', ','), ('>', '.'), ('~', '`')];
+    let mut chars = key.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else { return None };
+    PAIRS.iter().find(|(shifted, _)| *shifted == c).map(|(_, base)| *base)
+}
 
 /// The digit a US layout types `key` with Shift: Linux hears Ctrl+Shift+1 as `ctrl-!` (see the defaults), which
 /// reads better as the keys pressed.
@@ -506,7 +521,7 @@ fn menus(secure_input: bool) -> Vec<gpui::Menu> {
             I::action("Go to File", QuickOpen),
             I::separator(),
             I::action("Command Panel", CommandPanel),
-            I::action("Agents", AgentsPanel),
+            I::action("Sidebar: Workspaces or Agents", ToggleAgentsView),
             I::action("Workspaces", WorkspacesPanel),
             I::action("Keyboard Shortcuts", ShowShortcuts),
             I::separator(),
@@ -640,7 +655,8 @@ fn read_herdr_config(path: &std::path::Path, bound: bool) -> Option<crate::herdr
 fn rebind_herdr(cx: &mut App, shepherd: &[(String, String)]) {
     let Some(config) = read_herdr_config(&crate::herdr::config_path(), cx.has_global::<HerdrBindings>()) else { return };
     let actions = crate::herdr::keymap::actions(crate::herdr::keymap::defaults(), &config);
-    let next: Vec<_> = crate::herdr::keys::bindings(&actions, &config).into_iter().filter(|(_, chord)| herdr_keeps(chord, shepherd)).collect();
+    let tap = cx.try_global::<crate::settings::SettingsGlobal>().is_some_and(|s| s.settings.prefix_tap.as_deref().and_then(crate::tap::Mods::parse).is_some());
+    let next: Vec<_> = crate::herdr::keys::bindings(&actions, &config, tap).into_iter().filter(|(_, chord)| herdr_keeps(chord, shepherd)).collect();
     let previous = cx.try_global::<HerdrBindings>().map(|b| b.0.clone()).unwrap_or_default();
     let mut bindings: Vec<KeyBinding> = previous
         .iter()
@@ -732,7 +748,6 @@ mod tests {
         ("OpenSettings", "cmd-,"),
         ("CommandPanel", "cmd-k"),
         ("CommandPanel", "cmd-shift-p"),
-        ("AgentsPanel", "cmd-shift-a"),
         ("Quit", "cmd-q"),
     ];
     #[cfg(not(target_os = "macos"))]
@@ -769,7 +784,6 @@ mod tests {
         ("FontSizeReset", "ctrl-0"),
         ("OpenSettings", "ctrl-,"),
         ("CommandPanel", "ctrl-shift-p"),
-        ("AgentsPanel", "ctrl-shift-a"),
         ("Quit", "ctrl-shift-q"),
     ];
 
@@ -905,10 +919,14 @@ mod tests {
 
     /// herdr's keymap as `rebind_herdr` binds it, in a keymap of its own.
     fn herdr_keymap(toml: &str) -> gpui::Keymap {
+        herdr_keymap_with(toml, false)
+    }
+
+    fn herdr_keymap_with(toml: &str, tap: bool) -> gpui::Keymap {
         let config = crate::herdr::HerdrConfig::parse(toml).unwrap();
         let actions = crate::herdr::keymap::actions(&crate::herdr::keymap::builtin_defaults(), &config);
         let mut keymap = gpui::Keymap::new(Vec::new());
-        keymap.add_bindings(crate::herdr::keys::bindings(&actions, &config).iter().filter_map(|(bind, chord)| herdr_binding(bind, chord)));
+        keymap.add_bindings(crate::herdr::keys::bindings(&actions, &config, tap).iter().filter_map(|(bind, chord)| herdr_binding(bind, chord)));
         keymap
     }
 
@@ -944,6 +962,30 @@ mod tests {
         // and the old prefix is nothing now
         let old = Keystroke::parse("ctrl-b").unwrap();
         assert!(keymap.bindings_for_input(&[old], &pane).0.is_empty());
+    }
+
+    /// A tapped modifier's stand-in keystroke starts herdr's prefix chords like the prefix key: the same pending state,
+    /// the same second-key lookup and the same swallowing of a key herdr binds to nothing; and only in a pane.
+    #[test]
+    fn a_tapped_modifier_starts_the_prefix_chords_through_its_stand_in() {
+        let pane = stack(&["Workspace", "Terminal"]);
+        let keymap = herdr_keymap_with("[keys]\nnew_tab = \"prefix+t\"\nswitch_tab = \"prefix+1..9\"\ndetach = \"prefix+q\"\n", true);
+        let stand_in = Keystroke::parse(crate::tap::VIRTUAL_PREFIX).unwrap();
+        let (bound, pending) = keymap.bindings_for_input(std::slice::from_ref(&stand_in), &pane);
+        assert!(bound.is_empty() && pending, "waits for the next key as a prefix does");
+        let fired = |key: &str| keymap.bindings_for_input(&[stand_in.clone(), Keystroke::parse(key).unwrap()], &pane).0.first().map(|b| b.action().name().to_string());
+        assert_eq!(fired("t").as_deref(), Some("shepherd::NewTab"));
+        assert_eq!(fired("4").as_deref(), Some("shepherd::Tab4"));
+        assert_eq!(fired("q").as_deref(), Some("shepherd::HerdrOnly"));
+        assert_eq!(fired("a").as_deref(), Some("shepherd::HerdrUnbound"));
+        let editor = stack(&["Workspace", "FileEditor", "Input"]);
+        let (bound, pending) = keymap.bindings_for_input(std::slice::from_ref(&stand_in), &editor);
+        assert!(bound.is_empty() && !pending, "nothing waits outside a pane");
+        // herdr's own prefix still works beside it, and with no tap set the stand-in is nothing
+        let plain = herdr_keymap("[keys]\nnew_tab = \"prefix+t\"\n");
+        assert_eq!(plain.bindings_for_input(&[Keystroke::parse("ctrl-b").unwrap(), Keystroke::parse("t").unwrap()], &pane).0.len(), 1);
+        let (bound, pending) = plain.bindings_for_input(std::slice::from_ref(&stand_in), &pane);
+        assert!(bound.is_empty() && !pending);
     }
 
     #[test]
@@ -1579,22 +1621,53 @@ mod tests {
             .collect()
     }
 
+    /// The shifted-symbol defaults fire from the keystrokes Linux's Wayland backend delivered for Ctrl+Shift+1, Ctrl+Shift+=
+    /// and Ctrl+Shift+/ (logged from key presses through the compositor's own keymap, in this app and the installed build):
+    /// the character as the key, no Shift, the character as `key_char`; what is displayed is what fires.
     #[test]
     #[cfg(not(target_os = "macos"))]
-    fn ctrl_shift_slash_opens_the_shortcuts_and_ctrl_slash_stays_the_terminal_s() {
+    fn the_shifted_symbol_defaults_fire_from_the_events_a_real_press_makes() {
+        let event = |key: &str| Keystroke { modifiers: gpui::Modifiers::control(), key: key.into(), key_char: Some(key.into()) };
+        assert_eq!(fired(&event("!")), ["Workspace1"]);
+        assert_eq!(fired(&event("+")), ["FontSizeUp"]);
+        // and the page shows them as the keys pressed
+        assert_eq!(crate::ui::settings::display_chord(&event("?").unparse()), "Ctrl+Shift+/");
+        assert_eq!(crate::ui::settings::display_chord("ctrl-/"), "Ctrl+/", "the shortcuts' own chord: plain slash");
+        assert_eq!(crate::ui::settings::display_chord(&event("+").unparse()), "Ctrl+Shift+=");
+        // every shifted-symbol default is one of those
+        for (action, chord) in DEFAULTS {
+            let k = Keystroke::parse(chord).unwrap();
+            if k.key.chars().count() == 1 && !k.key.chars().next().unwrap().is_alphanumeric() && k.modifiers.control {
+                assert!(fired(&event(&k.key)).contains(&action.to_string()), "{action} {chord}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn ctrl_slash_opens_the_shortcuts_and_ctrl_shift_slash_is_another_chord() {
+        let ctrl_slash = from_xkb("/", false, None);
+        assert_eq!(ctrl_slash.unparse(), "ctrl-/");
+        assert_eq!(fired(&ctrl_slash), ["ShowShortcuts"]);
         let ctrl_shift_slash = from_xkb("?", true, Some("?"));
-        assert_eq!(ctrl_shift_slash.unparse(), "ctrl-?", "as Settings records it too");
-        assert_eq!(fired(&ctrl_shift_slash), ["ShowShortcuts"]);
-        assert!(fired(&from_xkb("/", false, None)).is_empty(), "Ctrl+/ goes to the pane");
+        assert_eq!(ctrl_shift_slash.unparse(), "ctrl-?", "as Settings records it");
+        assert!(fired(&ctrl_shift_slash).is_empty(), "Ctrl+Shift+/ is no longer the shortcuts' chord");
+        // no other action's default or gpui-base text chord is on Ctrl+/
+        let taken = normalize("ctrl-/").unwrap();
+        assert_eq!(DEFAULTS.iter().filter(|(_, c)| normalize(c).as_deref() == Some(taken.as_str())).count(), 1);
+        assert!(!text_chords_here().contains(&taken));
         // Ctrl+Shift+1 arrives the same way, as ctrl-!
         assert_eq!(from_xkb("!", true, Some("!")).unparse(), "ctrl-!");
     }
 
     #[test]
-    fn the_sidebar_s_view_toggle_has_no_default_chord() {
-        assert!(known("ToggleAgentsView"));
-        assert!(!DEFAULTS.iter().any(|(a, _)| *a == "ToggleAgentsView"));
-        assert_eq!(chord(&effective(&user(&[])), "ToggleAgentsView"), None);
+    fn the_sidebar_s_view_toggle_has_the_agents_chord() {
+        assert!(known("ToggleAgentsView") && !known("AgentsPanel"), "the Agents panel is gone");
+        assert_eq!(DEFAULTS.iter().filter(|(a, _)| *a == "ToggleAgentsView").count(), 1);
+        let want = if cfg!(target_os = "macos") { "cmd-shift-a" } else { "ctrl-shift-a" };
+        assert_eq!(chord(&effective(&user(&[])), "ToggleAgentsView"), normalize(want).as_deref());
+        // a settings file from before keeps its AgentsPanel chord as a name no action has: read without error, bound to nothing
+        assert!(effective(&user(&[("AgentsPanel", "cmd-9")])).iter().all(|(a, _)| a != "AgentsPanel"));
     }
 
     #[test]

@@ -278,25 +278,9 @@ pub(super) fn agents_view(rows: Vec<TreeRow>, sessions: &[SessionAgents], sort: 
         .collect()
 }
 
-/// Whether any session has an agent at all: the Agents section stays while one does, so its menu can turn the filter
-/// off again.
-pub(super) fn any_agent(sessions: &[SessionAgents]) -> bool {
-    sessions.iter().any(|s| s.snapshot.panes.iter().any(|p| p.agent.is_some()))
-}
-
 /// Whether the session `key` is out of reach: what it shows is the last snapshot it sent.
 pub(super) fn out_of_reach(w: &Watchers, key: &SessionKey) -> bool {
     w.get(key).is_some_and(|w| w.status == Status::Unreachable)
-}
-
-/// The agents panel's rows: every session's agents in the Agents section's order (never filtered to those that need
-/// you: the panel is searched), those of a session out of reach marked so.
-pub(super) fn panel_agent_rows(sessions: &[SessionAgents], sort: AgentSort, w: &Watchers, now: Instant) -> Vec<crate::ui::command_panel::AgentRow> {
-    let (entries, _) = cross_agents(sessions, sort, false, now);
-    entries
-        .into_iter()
-        .map(|e| crate::ui::command_panel::AgentRow { out_of_reach: out_of_reach(w, &e.key), key: e.key.0, pane: e.pane, workspace: e.workspace, waited: e.waited })
-        .collect()
 }
 
 /// The workspaces panel's sessions: each one's snapshot in `ordered`'s order where a drop herdr hasn't carried out
@@ -782,10 +766,6 @@ impl Shell {
         waiting_everywhere(self.snapshot.as_ref(), &self.watchers)
     }
 
-    /// The agents panel's rows (`panel_agent_rows`).
-    pub(super) fn panel_agents(&self, cx: &App) -> Vec<crate::ui::command_panel::AgentRow> {
-        panel_agent_rows(&self.session_agents(cx), self.agent_sort, &self.watchers, Instant::now())
-    }
 
     /// Every session's agents as the Agents section and Next agent that needs you read them, in the tree's order: a
     /// socket of one's own first, the shown session's live snapshot, the others' from their watchers (a stopped one's
@@ -1852,18 +1832,10 @@ mod tests {
             SessionAgents { key: key("default"), name: "default".into(), shown: true, snapshot: &shown, since: &since },
             SessionAgents { key: m.clone(), name: "a".into(), shown: false, snapshot: w.snapshot(&m).unwrap(), since: &since },
         ];
-        let rows = panel_agent_rows(&sessions, AgentSort::Status, &w, Instant::now());
-        let marks: Vec<(String, bool)> = rows.iter().map(|r| (r.key.clone(), r.out_of_reach)).collect();
-        assert_eq!(marks, [("/tmp/default.sock".to_string(), false), ("machine:a".to_string(), true)]);
         let ordered = vec![None, Some(snapshot(&[("w9", None)]))];
         let ws = panel_workspaces(&sessions, &ordered, &w);
         let marks: Vec<(&str, bool, &str)> = ws.iter().map(|s| (s.key.as_str(), s.out_of_reach, s.snapshot.workspaces[0].workspace_id.as_str())).collect();
         assert_eq!(marks, [("/tmp/default.sock", false, "w1"), ("machine:a", true, "w9")], "a drop's order where one waits");
-        // the Agents section stays while any session has an agent
-        assert!(any_agent(&sessions));
-        let none = agents_snapshot(&[]);
-        assert!(!any_agent(&[SessionAgents { key: key("default"), name: "default".into(), shown: true, snapshot: &none, since: &since }]));
-        assert!(!any_agent(&[]));
     }
 
     #[test]

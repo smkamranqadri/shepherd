@@ -5,6 +5,7 @@ use crate::bindings::{ACTIONS, DEFAULTS, context_of, effective, normalize};
 use crate::herdr::HerdrConfig;
 use crate::herdr::keymap::{self, Action, Defaults, INDEXED, Runs};
 use crate::herdr::keys::{chords_for, keystroke, label_of, prefix_chords};
+use crate::tap::Mods;
 use gpui::Keystroke;
 use std::collections::BTreeMap;
 
@@ -19,8 +20,21 @@ pub enum Source {
     Shepherd,
 }
 
+impl Source {
+    /// Where the page lists the group: Shepherd's first, then herdr's commands, then herdr's own keys.
+    pub fn rank(self) -> u8 {
+        match self {
+            Source::Shepherd => 0,
+            Source::HerdrCommand => 1,
+            Source::Herdr => 2,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RowId {
+    /// The modifier tapped on its own as the prefix: Shepherd's setting, shown beside herdr's prefix.
+    PrefixTap,
     Herdr(String),
     Command(usize),
     Shepherd(&'static str),
@@ -53,10 +67,35 @@ pub struct Row {
     pub runs: Vec<&'static str>,
 }
 
-/// All rows: herdr's actions (the prefix first), its commands, then every Shepherd action.
+/// All rows in the page's order: every Shepherd action, herdr's commands, then herdr's actions (the prefix first).
 pub fn rows(keys: &BTreeMap<String, String>, defaults: &Defaults, config: &HerdrConfig) -> Vec<Row> {
+    rows_with_tap(keys, None, defaults, config)
+}
+
+/// [`rows`], with the tap prefix (`Settings::prefix_tap`) as its own row after herdr's prefix.
+pub fn rows_with_tap(keys: &BTreeMap<String, String>, prefix_tap: Option<&str>, defaults: &Defaults, config: &HerdrConfig) -> Vec<Row> {
     let actions = keymap::actions(defaults, config);
     let mut out: Vec<Row> = actions.iter().map(herdr_row).collect();
+    let tap = prefix_tap.and_then(Mods::parse).and_then(Mods::label);
+    let at = out.iter().position(|r| r.prefix).map_or(0, |i| i + 1);
+    out.insert(
+        at,
+        Row {
+            id: RowId::PrefixTap,
+            source: Source::Herdr,
+            label: "Prefix tap".into(),
+            name: "prefix_tap".into(),
+            detail: Some("Shepherd only, saved in its settings: a modifier tapped alone starts herdr's prefix chords here. herdr's own screen keeps its prefix key".into()),
+            herdr_only: false,
+            chords: tap.clone().into_iter().collect(),
+            default: Vec::new(),
+            changed: tap.is_some(),
+            indexed: false,
+            prefix: false,
+            local: false,
+            runs: Vec::new(),
+        },
+    );
     out.extend(config.commands().into_iter().map(|c| {
         let kind = match c.kind.as_str() {
             "shell" => "Shell command",
@@ -101,6 +140,7 @@ pub fn rows(keys: &BTreeMap<String, String>, defaults: &Defaults, config: &Herdr
             runs: vec![name],
         }
     }));
+    out.sort_by_key(|r| r.source.rank()); // stable: each group keeps its own order
     out
 }
 
@@ -221,6 +261,9 @@ pub fn conflicts(rows: &[Row], prefixes: &[String]) -> BTreeMap<RowId, Vec<Strin
                 }
                 continue;
             }
+            if row.id == RowId::PrefixTap {
+                continue; // a tap is no chord: it clashes with nothing a key can do
+            }
             if row.prefix {
                 entries.extend(keystroke(label).map(|chord| Entry { row, chord, prefix: true, runs: None }));
                 continue;
@@ -273,7 +316,9 @@ pub fn conflicts(rows: &[Row], prefixes: &[String]) -> BTreeMap<RowId, Vec<Strin
 
 /// A row's chord as the page shows it: herdr's label as the config spells it, Shepherd's in GPUI's spelling.
 pub fn show(row: &Row, chord: &str) -> String {
-    if row.source == Source::Shepherd { spaced(chord) } else { display_label(chord) }
+    if row.id == RowId::PrefixTap {
+        Mods::parse(chord).map_or_else(|| chord.to_string(), Mods::display)
+    } else if row.source == Source::Shepherd { spaced(chord) } else { display_label(chord) }
 }
 
 /// A chord of keystrokes for a note: `ctrl-b c` → `Ctrl+B C`.
@@ -314,8 +359,10 @@ pub enum Kind {
     Herdr,
     /// An indexed herdr action: the chord takes a digit key, written `1..9`.
     HerdrIndexed,
-    /// The prefix key: any chord that can be pressed on its own.
+    /// The prefix key: any chord that can be pressed on its own, or a modifier tapped alone (Shepherd's tap prefix).
     Prefix,
+    /// The tap prefix's own row: a modifier tapped alone, nothing else.
+    PrefixTap,
 }
 
 /// What `keystroke`, pressed while a row records, does. `pending_prefix`: the prefix was just pressed. `prefixes`:
@@ -329,6 +376,8 @@ pub fn record_step(kind: Kind, keystroke: &Keystroke, pending_prefix: bool, pref
     }
     let chord = keystroke.unparse();
     match kind {
+        // a tap is recorded from the modifier changes (`tap::TapRecorder`); a key is none
+        Kind::PrefixTap => Step::Ignore,
         Kind::Shepherd => {
             if crate::bindings::recordable(keystroke) {
                 Step::Commit(chord)
@@ -403,7 +452,7 @@ pub fn write_herdr(config: &mut HerdrConfig, row: &Row, labels: &[String]) -> an
 /// The lines Reset all of the herdr group removes: every `[keys]` line the page shows a row for, the prefix
 /// included; custom commands and everything else stay.
 pub fn reset_herdr_group(config: &mut HerdrConfig, rows: &[Row]) {
-    let names: Vec<&str> = rows.iter().filter(|r| r.source == Source::Herdr).map(|r| r.name.as_str()).collect();
+    let names: Vec<&str> = rows.iter().filter(|r| r.source == Source::Herdr && r.id != RowId::PrefixTap).map(|r| r.name.as_str()).collect();
     config.remove_key_lines(&names);
 }
 
@@ -447,11 +496,13 @@ mod tests {
     #[test]
     fn three_sources_in_one_list() {
         let r = model(&[], "[[keys.command]]\nkey = \"prefix+g\"\ntype = \"popup\"\ncommand = \"lazygit\"\n");
-        assert_eq!(r.iter().filter(|r| r.source == Source::Herdr).count(), keymap::KNOWN.len());
+        assert_eq!(r.iter().filter(|r| r.source == Source::Herdr).count(), keymap::KNOWN.len() + 1, "and the tap prefix's row");
         assert_eq!(r.iter().filter(|r| r.source == Source::HerdrCommand).count(), 1);
         assert_eq!(r.iter().filter(|r| r.source == Source::Shepherd).count(), ACTIONS.len());
         let order: Vec<_> = r.iter().map(|r| r.source).collect();
-        assert!(order.windows(2).all(|w| (w[0] as u8) <= (w[1] as u8)), "grouped: herdr, commands, Shepherd");
+        assert!(order.windows(2).all(|w| w[0].rank() <= w[1].rank()), "grouped: Shepherd, commands, herdr");
+        assert_eq!(r[0].source, Source::Shepherd);
+        assert!(r.iter().find(|r| r.source == Source::Herdr).is_some_and(|r| r.prefix), "the prefix tops the herdr group");
         let command = row(&r, RowId::Command(0));
         assert_eq!((command.label.as_str(), command.chords.as_slice()), ("lazygit", ["prefix+g".to_string()].as_slice()));
         assert_eq!(command.detail.as_deref(), Some("Popup command"));
@@ -502,6 +553,34 @@ mod tests {
         assert_eq!(row(&r, RowId::Shepherd("Tab4")).detail.as_deref(), Some("herdr: switch_tab"));
         assert_eq!(row(&r, RowId::Shepherd("QuickOpen")).detail, None, "Shepherd's own");
         assert!(!row(&r, RowId::Shepherd("CloseTab")).changed);
+    }
+
+    #[test]
+    fn the_tap_prefix_is_a_row_after_herdrs_prefix_and_shows_as_a_tap() {
+        let keys = BTreeMap::new();
+        let with = |tap| rows_with_tap(&keys, tap, &builtin_defaults(), &config(""));
+        let r = with(Some("super"));
+        let herdr_rows: Vec<_> = r.iter().filter(|r| r.source == Source::Herdr).collect();
+        assert_eq!((herdr_rows[0].name.as_str(), herdr_rows[1].id.clone()), ("prefix", RowId::PrefixTap), "right after the prefix");
+        let tap = row(&r, RowId::PrefixTap);
+        assert_eq!((tap.chords.clone(), tap.changed), (vec!["super".to_string()], true));
+        assert_eq!(super::show(tap, "super"), if cfg!(target_os = "macos") { "Cmd tap" } else { "Super tap" });
+        assert_eq!(super::show(row(&with(Some("ctrl-shift")), RowId::PrefixTap), "ctrl-shift"), "Ctrl+Shift tap");
+        assert!(tap.detail.as_deref().unwrap().contains("herdr's own screen keeps its prefix key"), "says herdr keeps its own");
+        let none = with(None);
+        assert!(row(&none, RowId::PrefixTap).chords.is_empty() && !row(&none, RowId::PrefixTap).changed);
+        assert!(with(Some("hyper")).iter().find(|r| r.id == RowId::PrefixTap).unwrap().chords.is_empty(), "an unknown label is no tap");
+        // it clashes with nothing, and a Reset all of herdr's group leaves the config's lines to the config
+        assert!(conflicts(&r, &["ctrl-b".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn the_tap_row_takes_a_tap_and_backspace_but_no_key() {
+        let p = ["ctrl-b".to_string()];
+        assert_eq!(record_step(Kind::PrefixTap, &press("super-k"), false, &p), Step::Ignore);
+        assert_eq!(record_step(Kind::PrefixTap, &press("a"), false, &p), Step::Ignore);
+        assert_eq!(record_step(Kind::PrefixTap, &press("backspace"), false, &p), Step::Clear);
+        assert_eq!(record_step(Kind::PrefixTap, &press("escape"), false, &p), Step::Cancel);
     }
 
     #[test]
@@ -638,6 +717,27 @@ mod tests {
         assert_eq!(keystroke("super+space"), normalize(&press("super-space").unparse()));
         // Cmd (the Mac's name for it) is the same key
         assert_eq!(record_step(Kind::Herdr, &press("cmd-k"), false, &prefixes), Step::Commit("super+k".into()));
+    }
+
+    /// Keystrokes as Linux's Wayland backend delivered them for Super+P, Super+Space and Super+Shift+T (logged from a real
+    /// compositor-keymap key press): the platform modifier, the plain key, and the character as `key_char`.
+    #[test]
+    fn super_chords_as_the_platform_reports_them_record_exactly_as_pressed() {
+        let p = ["ctrl-b".to_string()];
+        let event = |key: &str, key_char: &str, shift: bool| Keystroke {
+            modifiers: gpui::Modifiers { platform: true, shift, ..Default::default() },
+            key: key.into(),
+            key_char: Some(key_char.into()),
+        };
+        assert_eq!(record_step(Kind::Herdr, &event("p", "p", false), false, &p), Step::Commit("super+p".into()));
+        assert_eq!(record_step(Kind::Prefix, &event("space", " ", false), false, &p), Step::Commit("super+space".into()));
+        assert_eq!(record_step(Kind::Herdr, &event("t", "T", true), false, &p), Step::Commit("super+shift+t".into()));
+        let chord = event("t", "t", false).unparse();
+        assert_eq!(record_step(Kind::Shepherd, &event("t", "t", false), false, &p), Step::Commit(chord.clone()));
+        assert!(chord.contains(if cfg!(target_os = "macos") { "cmd" } else { "super" }), "{chord}");
+        // what the compositor rewrites Super+T to is another chord, and records as that (Ctrl+Shift+T), which is what arrived
+        let rewritten = Keystroke { modifiers: gpui::Modifiers { control: true, shift: true, ..Default::default() }, key: "t".into(), key_char: None };
+        assert_eq!(record_step(Kind::Herdr, &rewritten, false, &p), Step::Commit("ctrl+shift+t".into()));
     }
 
     #[test]

@@ -55,8 +55,11 @@ pub struct Settings {
     /// the first builds saved them) still reads.
     pub workspace_roots: BTreeMap<String, crate::files::roots::WorkspaceRoot>,
     pub agent_sort: AgentSort,
-    /// The sidebar's Agents section; General settings hide it.
+    /// The sidebar's Workspaces | Agents switch and its Agents view; General settings hide them.
     pub show_agents: bool,
+    /// Each workspace's tabs listed under it in the left sidebar, and the tab bar along the top hidden (while the
+    /// sidebar is out). Off: the bar, as before.
+    pub tabs_in_sidebar: bool,
     /// The bottom status bar; off by default, General settings show it. Off, its own lookups (the shown pane's git
     /// status, the agent's tokens, the plan limits) are not asked.
     pub show_status_bar: bool,
@@ -74,13 +77,11 @@ pub struct Settings {
     pub status_icons: crate::theme::StatusIcons,
     /// The Agents list keeps only agents waiting on you or done and not looked at yet.
     pub attention_agents: bool,
-    /// The Agents list's height cap; dragging the section's top edge sets it, `None` is 40 % of the sidebar.
-    pub agents_height: Option<f32>,
-    /// The Agents section folded to its header at the sidebar's foot; a click on the header opens it again.
-    pub agents_collapsed: bool,
-    /// The left sidebar's view: the workspaces tree, or every session's agents under its header. The Agents section's
-    /// fold and height are kept apart, so going back to Workspaces brings it back as it was.
+    /// The left sidebar's view: the workspaces tree, or every session's agents under its header.
     pub sidebar_view: SidebarView,
+    /// A modifier (or pair) tapped on its own as herdr's prefix in a pane: `super`, `ctrl-shift`. Shepherd's own: herdr's
+    /// config cannot bind one, and herdr's screen keeps its prefix key. `None`: no tap prefix.
+    pub prefix_tap: Option<String>,
     /// What the command panel ran last, newest first: an action's name, `workspace:<id>` or `tab:<id>`.
     pub recent_commands: Vec<String>,
     /// A macOS notification when an agent out of sight starts waiting or finishes.
@@ -338,6 +339,7 @@ impl Default for Settings {
             workspace_roots: BTreeMap::new(),
             agent_sort: AgentSort::default(),
             show_agents: true,
+            tabs_in_sidebar: false,
             show_status_bar: false,
             status_bar_show: StatusBarShow::default(),
             usage_agent: UsageAgent::default(),
@@ -346,9 +348,8 @@ impl Default for Settings {
             compact_agents: false,
             status_icons: crate::theme::StatusIcons::Dots,
             attention_agents: false,
-            agents_height: None,
-            agents_collapsed: false,
             sidebar_view: SidebarView::default(),
+            prefix_tap: None,
             recent_commands: Vec::new(),
             notify_agents: true,
             notify_sound: true,
@@ -533,18 +534,19 @@ mod tests {
     }
 
     #[test]
-    fn the_agents_section_starts_open_and_an_older_file_without_the_fold_loads() {
-        let old: Settings = serde_json::from_str(r#"{"agents_height": 180}"#).unwrap();
-        assert!(!old.agents_collapsed);
-        assert_eq!(old.agents_height, Some(180.));
-        let folded: Settings = serde_json::from_str(r#"{"agents_collapsed": true, "agents_height": 180}"#).unwrap();
-        assert!(folded.agents_collapsed);
-        assert_eq!(folded.agents_height, Some(180.), "the height it opens again at is kept");
+    fn a_file_from_the_bottom_agents_section_s_days_loads() {
+        // the section's height and fold are gone: a file that has them reads without error, the rest as it was
+        let old: Settings = serde_json::from_str(r#"{"agents_height": 180, "agents_collapsed": true, "show_agents": true, "agent_sort": "waiting", "font_size": 15}"#).unwrap();
+        assert!(old.show_agents);
+        assert_eq!((old.agent_sort, old.font_size), (AgentSort::Waiting, 15.0));
+        // and saved again, they are dropped
+        assert!(!serde_json::to_string(&old).unwrap().contains("agents_height"));
+        assert!(!serde_json::to_string(&old).unwrap().contains("agents_collapsed"));
     }
 
     #[test]
     fn the_sidebar_opens_on_its_workspaces_unless_agents_was_left() {
-        let old: Settings = serde_json::from_str(r#"{"agents_collapsed": true}"#).unwrap();
+        let old: Settings = serde_json::from_str(r#"{"font_size": 15}"#).unwrap();
         assert_eq!(old.sidebar_view, SidebarView::Workspaces, "a file from before the toggle");
         assert_eq!(Settings::default().sidebar_view, SidebarView::Workspaces);
         let agents = Settings { sidebar_view: SidebarView::Agents, ..Settings::default() };
@@ -552,7 +554,6 @@ mod tests {
         assert!(text.contains(r#""sidebar_view":"agents""#), "{text}");
         let back: Settings = serde_json::from_str(&text).unwrap();
         assert_eq!(back.sidebar_view, SidebarView::Agents);
-        assert!(back.agents_collapsed == agents.agents_collapsed && back.agents_height == agents.agents_height, "the section's own fold and height apart");
         let future: Settings = serde_json::from_str(r#"{"sidebar_view": "files"}"#).unwrap();
         assert_eq!(future.sidebar_view, SidebarView::Workspaces);
     }
@@ -611,6 +612,24 @@ mod tests {
         s.record_chord("SplitRight", "cmd-n");
         assert_eq!(s.keys.get("SplitRight"), crate::bindings::normalize("cmd-n").as_ref());
         assert_eq!(s.keys.get("NewTab"), None, "NewTab falls back to its default");
+    }
+
+    #[test]
+    fn the_tap_prefix_is_kept_and_an_older_file_has_none() {
+        let old: Settings = serde_json::from_str(r#"{"font_size": 15}"#).unwrap();
+        assert_eq!(old.prefix_tap, None, "a file from before it");
+        let set = Settings { prefix_tap: Some("ctrl-shift".into()), ..Settings::default() };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(back.prefix_tap.as_deref(), Some("ctrl-shift"));
+    }
+
+    #[test]
+    fn tabs_in_the_sidebar_start_off_and_an_older_file_has_them_off() {
+        assert!(!Settings::default().tabs_in_sidebar);
+        let old: Settings = serde_json::from_str(r#"{"font_size": 15}"#).unwrap();
+        assert!(!old.tabs_in_sidebar);
+        let on: Settings = serde_json::from_str(&serde_json::to_string(&Settings { tabs_in_sidebar: true, ..Settings::default() }).unwrap()).unwrap();
+        assert!(on.tabs_in_sidebar);
     }
 
     #[test]

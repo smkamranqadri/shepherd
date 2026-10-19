@@ -201,7 +201,7 @@ pub(super) fn first_agent(rows: Vec<sidebar_tree::ViewRow>) -> Option<(SessionKe
 /// The search typed in the sidebar, for the Workspaces tree: none while the Agents view shows, whose search keeps
 /// agents, so Workspace1–9 then number the tree as it is.
 pub(super) fn tree_query(query: Option<String>, view: SidebarView, show_agents: bool) -> Option<String> {
-    query.filter(|_| super::sidebar::sidebar_layout(view, show_agents, false).tree)
+    query.filter(|_| super::sidebar::sidebar_layout(view, show_agents).tree)
 }
 
 /// The search field's placeholder in the view shown.
@@ -313,7 +313,7 @@ impl Shell {
     /// The Agents view takes the tree's place now.
     fn agents_view_shown(&self, cx: &App) -> bool {
         let settings = &SettingsGlobal::of(cx).settings;
-        super::sidebar::sidebar_layout(settings.sidebar_view, settings.show_agents, false).agents_view
+        super::sidebar::sidebar_layout(settings.sidebar_view, settings.show_agents).agents_view
     }
 
     /// The search field says what it filters in the view shown, which may have changed since it opened.

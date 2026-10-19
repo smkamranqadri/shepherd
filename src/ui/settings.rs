@@ -144,6 +144,8 @@ pub struct SettingsView {
     shortcut_search: Entity<InputState>,
     /// What the last change on the Shortcuts page did, when there is something to say.
     keys_note: Option<String>,
+    /// A modifier tapped alone, while a prefix row records.
+    tap_recorder: crate::tap::TapRecorder,
     /// The page's scroll, so the shortcuts panel can bring an action's row into view.
     body_scroll: gpui::ScrollHandle,
     ping: Option<String>,
@@ -157,7 +159,7 @@ impl EventEmitter<Close> for SettingsView {}
 pub fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) {
     // Nothing changed, nothing saved: leaving a field must not overwrite a file that failed to load.
     let Some(settings) = SettingsGlobal::of(cx).settings.changed_by(change) else { return };
-    let keys_changed = settings.keys != SettingsGlobal::of(cx).settings.keys;
+    let keys_changed = settings.keys != SettingsGlobal::of(cx).settings.keys || settings.prefix_tap != SettingsGlobal::of(cx).settings.prefix_tap;
     let secure_changed = settings.secure_input != SettingsGlobal::of(cx).settings.secure_input;
     let translucent_changed = settings.translucent_window != SettingsGlobal::of(cx).settings.translucent_window;
     let path = {
@@ -194,8 +196,9 @@ impl SettingsView {
         let keys = SettingsGlobal::of(cx).settings.keys.clone();
         let rows = crate::shortcuts::rows(&keys, crate::herdr::keymap::defaults(), &config);
         if let Some(row) = rows.iter().position(|r| r.id == crate::shortcuts::RowId::Shepherd(action)) {
-            // ponytail: a row is about 57 px (three groups' headers and the search above): a few rows of context above
-            let y = (row as f32 * 57. + 3. * 90. - 3. * 57.).max(0.);
+            // ponytail: a row is about 57 px, the search and the Shepherd group's header (first) above: a few rows of
+            // context above
+            let y = (row as f32 * 57. + 90. - 3. * 57.).max(0.);
             self.body_scroll.set_offset(gpui::point(px(0.), px(-y)));
         }
         cx.notify();
@@ -305,6 +308,8 @@ impl SettingsView {
             }
             let Some(view) = view.upgrade() else { return };
             let Some(recording) = view.read(cx).recording.clone() else { return };
+            // a key with a modifier held: a chord, no tap
+            view.update(cx, |v, cx| v.recording_modifiers(crate::tap::Event::Key, cx));
             let prefixes = view.read(cx).prefix_chords();
             use crate::shortcuts::{Step, record_step};
             match record_step(recording.kind, &event.keystroke, recording.pending_prefix, &prefixes) {
@@ -367,6 +372,7 @@ impl SettingsView {
             recording: None,
             shortcut_search,
             keys_note: None,
+            tap_recorder: Default::default(),
             body_scroll: gpui::ScrollHandle::new(),
             ping: None,
             focus: cx.focus_handle(),
@@ -967,7 +973,7 @@ fn field(theme: &Theme, input: &Entity<InputState>) -> Div {
 pub(crate) fn display_chord(chord: &str) -> String {
     let Ok(k) = Keystroke::parse(chord) else { return chord.to_string() };
     let mut m = k.modifiers;
-    let digit = crate::bindings::shifted_digit(&k.key);
+    let digit = crate::bindings::unshifted(&k.key);
     m.shift |= digit.is_some();
     let key = match (digit, k.key.as_str()) {
         (Some(digit), _) => digit.to_string(),
@@ -1052,9 +1058,16 @@ impl Render for SettingsView {
                 card(&theme)
                     .child(
                         card_row(&theme, true)
-                            .child(row_text(&theme, "Agents", "Every agent herdr finds, at the bottom of the sidebar."))
+                            .child(row_text(&theme, "Agents", "A Workspaces | Agents switch at the top of the sidebar; Agents lists every agent herdr finds, under its session."))
                             .child(toggle(&theme, "show-agents", settings.show_agents).on_click(cx.listener(
                                 |_, _: &ClickEvent, _, cx| update(cx, |s| s.show_agents = !s.show_agents),
+                            ))),
+                    )
+                    .child(
+                        card_row(&theme, false)
+                            .child(row_text(&theme, "Tabs in sidebar", "List each workspace's tabs under it in the sidebar, in place of the tab bar along the top."))
+                            .child(toggle(&theme, "tabs-in-sidebar", settings.tabs_in_sidebar).on_click(cx.listener(
+                                |_, _: &ClickEvent, _, cx| update(cx, |s| s.tabs_in_sidebar = !s.tabs_in_sidebar),
                             ))),
                     )
                     .child(card_row(&theme, false).child(row_text(
@@ -1511,6 +1524,9 @@ impl Render for SettingsView {
             .track_focus(&self.focus)
             .size_full()
             .flex()
+            .on_modifiers_changed(cx.listener(|v, e: &gpui::ModifiersChangedEvent, _, cx| {
+                v.recording_modifiers(crate::tap::Event::Mods(crate::tap::Mods::of(&e.modifiers)), cx)
+            }))
             .on_key_down(cx.listener(|v, e: &KeyDownEvent, _, cx| {
                 if e.keystroke.key == "escape" && v.recording.is_none() {
                     cx.stop_propagation();
@@ -1569,5 +1585,9 @@ mod tests {
         // Linux hears Ctrl+Shift+1 as ctrl-! (US layout): it reads as pressed
         assert_eq!(display_chord("ctrl-!"), "Ctrl+Shift+1");
         assert_eq!(display_chord("ctrl-("), "Ctrl+Shift+9");
+        // and Ctrl+Shift+/ the same: the panel's own chord reads as the keys that fire it
+        assert_eq!(display_chord("ctrl-?"), "Ctrl+Shift+/");
+        assert_eq!(display_chord("ctrl-+"), "Ctrl+Shift+=");
+        assert_eq!(display_chord("ctrl-="), "Ctrl+=");
     }
 }
