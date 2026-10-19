@@ -23,6 +23,7 @@ It's written in Rust on [GPUI](https://github.com/zeronsh/zui) and styled after 
 - Hold `⌘` for a moment and each tab shows its number; hold `⌃` and each workspace does (Ctrl and Ctrl+Shift on Linux). Settings can turn the hints off.
 - A status bar along the bottom, off until General settings turn it on, shows the branch, its PR and CI, the current folder, the focused agent's tokens and your Claude and Codex plan limits. Switch branch is in the command panel either way, and Usage settings show the limits.
 - Settings cover fonts, themes, key bindings and usage. They also edit herdr's own `config.toml` for notifications and integrations, keeping your comments.
+- The Shortcuts page is the one place for keys: every herdr action (`[keys]`, its prefix key included), every herdr custom command (`[[keys.command]]`) and every Shepherd action, in one searchable list. A change to a herdr key is written to herdr's `config.toml` (comments kept, a copy of the file made the first time as `config.toml.shepherd-bak`) and herdr reloads it; Shepherd follows the file whoever edits it, no restart. Reset puts the default back by removing just that line. A prefix chord (`prefix+n`) works in a pane as in herdr: the prefix key, then the key. A herdr action Shepherd has no equivalent of is shown as herdr only and said so when pressed.
 
 ## Install
 

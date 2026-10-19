@@ -13,6 +13,7 @@ pub mod power;
 pub mod process;
 pub mod settings;
 pub mod shell;
+pub mod shortcuts;
 pub mod terminal;
 pub mod theme;
 pub mod ui;

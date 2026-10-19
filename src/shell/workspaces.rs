@@ -19,8 +19,20 @@ impl Shell {
                 shell.finish_worktree_dialog(true, cx);
             }
         });
-        self.worktree_dialog = Some(crate::ui::Popup::new(WorktreeDialog { workspace_id, input, _events: events }));
+        self.worktree_dialog = Some(crate::ui::Popup::new(WorktreeDialog { workspace_id, rename_pane: None, input, _events: events }));
         cx.notify();
+    }
+
+    /// herdr's `rename_pane`: the same dialog, over the pane's name. An empty name puts the automatic one back.
+    pub(super) fn open_pane_name_dialog(&mut self, pane_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_worktree_dialog(String::new(), window, cx);
+        if let Some(dialog) = self.worktree_dialog.as_mut() {
+            dialog.value.rename_pane = Some(pane_id);
+            dialog.value.input.update(cx, |input, cx| {
+                input.set_placeholder("Name", window, cx);
+                input.set_value(String::new(), window, cx);
+            });
+        }
     }
 
     /// Create (an empty name lets herdr pick one) or cancel; either way the dialog fades out.
@@ -31,9 +43,13 @@ impl Shell {
         self.focused = None;
         if create {
             let workspace_id = dialog.value.workspace_id.clone();
-            let branch = dialog.value.input.read(cx).value().trim().to_string();
-            let branch = if branch.is_empty() { new_branch_name() } else { branch };
-            self.new_worktree(workspace_id, branch, cx);
+            let text = dialog.value.input.read(cx).value().trim().to_string();
+            if let Some(pane_id) = dialog.value.rename_pane.clone() {
+                self.send(Command::RenamePane { pane_id, label: text }, cx, |_, _, _| {});
+            } else {
+                let branch = if text.is_empty() { new_branch_name() } else { text };
+                self.new_worktree(workspace_id, branch, cx);
+            }
         }
         cx.notify();
     }

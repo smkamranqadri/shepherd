@@ -3,7 +3,7 @@
 //! theme family, notifications, herdr's integrations and server settings, herdr's binary and socket, key
 //! bindings. Every change is saved at once and applied to all windows; herdr's own settings go to its
 //! `config.toml`, which herdr then reloads.
-use crate::bindings::{ACTIONS, effective, rebind, recordable};
+use crate::bindings::rebind;
 use crate::herdr::{Client, HerdrConfig, config_path, set_binary, set_socket};
 use crate::settings::{Settings, SettingsGlobal, step_font_size, step_line_height};
 use crate::theme::{Appearance, AppearanceMode, StatusIcons, Theme, variants_for};
@@ -17,6 +17,9 @@ use gpui::{
 use gpui_base::input::{Input, InputEvent, InputState};
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+mod shortcuts_page;
+use shortcuts_page::Recording;
 
 /// The app's tokio runtime, for calls made from windows (the herdr connection test).
 pub struct Tokio(pub tokio::runtime::Handle);
@@ -135,8 +138,12 @@ pub struct SettingsView {
     integrations: Option<Result<Vec<Integration>, String>>,
     /// The integration being installed or removed.
     integration_busy: Option<String>,
-    /// The action whose chord the next keystroke becomes.
-    recording: Option<&'static str>,
+    /// The chord the next keystroke becomes.
+    recording: Option<Recording>,
+    /// The filter at the top of the Shortcuts page.
+    shortcut_search: Entity<InputState>,
+    /// What the last change on the Shortcuts page did, when there is something to say.
+    keys_note: Option<String>,
     /// The page's scroll, so the shortcuts panel can bring an action's row into view.
     body_scroll: gpui::ScrollHandle,
     ping: Option<String>,
@@ -179,12 +186,16 @@ pub fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) {
 
 impl SettingsView {
     /// Turns to the Shortcuts page with `action`'s chord recording, scrolled near its row.
-    pub fn show_shortcut(&mut self, action: &'static str, cx: &mut Context<Self>) {
+    pub fn show_shortcut(&mut self, action: &'static str, window: &mut Window, cx: &mut Context<Self>) {
         self.section = Section::Shortcuts;
-        self.recording = ACTIONS.iter().find(|(name, _)| *name == action).map(|(name, _)| *name);
-        if let Some(row) = ACTIONS.iter().position(|(name, _)| *name == action) {
-            // ponytail: rows are a fixed 48 px (and a hairline) under the page's header; a few rows of context above
-            let y = (row as f32 * 49. - 3. * 49.).max(0.);
+        self.shortcut_search.update(cx, |input, cx| input.set_value(String::new(), window, cx));
+        self.recording = crate::bindings::ACTIONS.iter().any(|(name, _)| *name == action).then(|| Recording::shepherd(action));
+        let config = self.herdr_config.clone().unwrap_or_default();
+        let keys = SettingsGlobal::of(cx).settings.keys.clone();
+        let rows = crate::shortcuts::rows(&keys, crate::herdr::keymap::defaults(), &config);
+        if let Some(row) = rows.iter().position(|r| r.id == crate::shortcuts::RowId::Shepherd(action)) {
+            // ponytail: a row is about 57 px (three groups' headers and the search above): a few rows of context above
+            let y = (row as f32 * 57. + 3. * 90. - 3. * 57.).max(0.);
             self.body_scroll.set_offset(gpui::point(px(0.), px(-y)));
         }
         cx.notify();
@@ -220,6 +231,7 @@ impl SettingsView {
             .collect();
 
         let select_search = field(None, "Search", window, cx);
+        let shortcut_search = field(None, "Search shortcuts by name, action or keys", window, cx);
         let mut subscriptions = vec![cx.subscribe(&select_search, |v: &mut Self, search, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 // a query highlights its first match; the emptied field of an opening select keeps the current option
@@ -229,6 +241,13 @@ impl SettingsView {
                 cx.notify()
             }
         })];
+        subscriptions.push(cx.subscribe(&shortcut_search, |_: &mut Self, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify()
+            }
+        }));
+        // herdr's config.toml changed (an editor, herdr's own screen, our write): the page shows what herdr has now
+        subscriptions.push(cx.observe_global::<crate::bindings::HerdrKeysEpoch>(|v: &mut Self, cx| v.reload_herdr_keys(cx)));
         for (input, apply) in [
             (&herdr_bin, (|s: &mut Settings, v: String| s.herdr_bin = (!v.is_empty()).then_some(v)) as fn(&mut Settings, String)),
             (&herdr_socket, |s: &mut Settings, v: String| s.herdr_socket = (!v.is_empty()).then_some(v)),
@@ -285,17 +304,35 @@ impl SettingsView {
                 return;
             }
             let Some(view) = view.upgrade() else { return };
-            let Some(action) = view.read(cx).recording else { return };
-            let keystroke = &event.keystroke;
-            let bare = keystroke.modifiers == Default::default();
-            match keystroke.key.as_str() {
-                "escape" if bare => {}
-                "backspace" if bare => update(cx, |s| s.record_chord(action, "")),
-                _ if recordable(keystroke) => {
-                    let chord = keystroke.unparse();
-                    update(cx, |s| s.record_chord(action, &chord));
+            let Some(recording) = view.read(cx).recording.clone() else { return };
+            let prefixes = view.read(cx).prefix_chords();
+            use crate::shortcuts::{Step, record_step};
+            match record_step(recording.kind, &event.keystroke, recording.pending_prefix, &prefixes) {
+                Step::Ignore => return, // a bare key: keep waiting for a chord
+                Step::WaitPrefix => {
+                    view.update(cx, |v, cx| {
+                        if let Some(r) = v.recording.as_mut() {
+                            r.pending_prefix = true;
+                        }
+                        cx.notify();
+                    });
+                    cx.stop_propagation();
+                    return;
                 }
-                _ => return, // a bare key: keep waiting for a chord
+                Step::Reject(why) => {
+                    view.update(cx, |v, cx| {
+                        v.keys_note = Some(why);
+                        if let Some(r) = v.recording.as_mut() {
+                            r.pending_prefix = false;
+                        }
+                        cx.notify();
+                    });
+                    cx.stop_propagation();
+                    return;
+                }
+                Step::Cancel => {}
+                Step::Clear => view.update(cx, |v, cx| v.commit_chord(&recording, None, cx)),
+                Step::Commit(chord) => view.update(cx, |v, cx| v.commit_chord(&recording, Some(chord), cx)),
             }
             cx.stop_propagation();
             view.update(cx, |v, cx| {
@@ -328,6 +365,8 @@ impl SettingsView {
             integrations: None,
             integration_busy: None,
             recording: None,
+            shortcut_search,
+            keys_note: None,
             body_scroll: gpui::ScrollHandle::new(),
             ping: None,
             focus: cx.focus_handle(),
@@ -343,6 +382,15 @@ impl SettingsView {
                     input.focus(window, cx);
                 });
             }
+        }
+        // SHEPHERD_SHORTCUTS_QUERY=<text> filters the Shortcuts page, and SHEPHERD_RECORD=herdr:<name>|command:<n>|
+        // shepherd:<Action> (a trailing + adds a chord) starts recording its chord at launch, for screenshots and tests.
+        if let Ok(query) = std::env::var("SHEPHERD_SHORTCUTS_QUERY") {
+            view.shortcut_search.update(cx, |input, cx| input.set_value(query, window, cx));
+        }
+        if let Ok(spec) = std::env::var("SHEPHERD_RECORD") {
+            view.recording = Recording::from_spec(&spec, &view.herdr_config.clone().unwrap_or_default(), &settings.keys);
+            window.focus(&view.focus, cx);
         }
         view.load_integrations(cx);
         view
@@ -375,6 +423,7 @@ impl SettingsView {
         let path = config_path();
         let saved = HerdrConfig::load(&path).and_then(|mut config| {
             config.set(key, value)?;
+            crate::herdr::backup_once(&path)?;
             config.save(&path)?;
             Ok(config)
         });
@@ -1454,54 +1503,7 @@ impl Render for SettingsView {
                     ),
                 )
             }
-            Section::Shortcuts => {
-                let bindings = effective(&settings.keys);
-                div()
-                    .child(
-                        div()
-                            .flex()
-                            .items_start()
-                            .child(page_header(&theme, "Shortcuts", "Click a shortcut, then press the new chord. Esc cancels, ⌫ unbinds.").flex_1())
-                            .child(action(&theme, "reset-keys", "Reset to defaults").on_click(cx.listener(|v, _: &ClickEvent, _, cx| {
-                                v.recording = None;
-                                update(cx, |s| s.keys.clear())
-                            }))),
-                    )
-                    .child(card(&theme).children(ACTIONS.iter().enumerate().map(|(i, (action, label))| {
-                        let chord = bindings.iter().find(|(a, _)| a == action).map(|(_, k)| display_chord(k));
-                        let recording = self.recording == Some(*action);
-                        let action = *action;
-                        let hover = theme.border_strong;
-                        card_row(&theme, i == 0).min_h(px(48.)).py(px(8.)).child(div().flex_1().child(*label)).child(
-                            div()
-                                .id(SharedString::from(format!("record-{action}")))
-                                .h(px(28.))
-                                .min_w(px(64.))
-                                .px(px(10.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(6.))
-                                .bg(theme.surface)
-                                .border_1()
-                                .font_family(theme.font_terminal.clone())
-                                .text_size(px(12.))
-                                .cursor_pointer()
-                                .map(|el| match (recording, &chord) {
-                                    (true, _) => el.border_color(theme.accent).text_color(theme.accent).child("Press keys…"),
-                                    (false, Some(chord)) => el.border_color(theme.border).hover(move |s| s.border_color(hover)).child(chord.clone()),
-                                    (false, None) => {
-                                        el.border_color(theme.border).text_color(theme.text_faint).hover(move |s| s.border_color(hover)).child("—")
-                                    }
-                                })
-                                .on_click(cx.listener(move |v, _: &ClickEvent, window, cx| {
-                                    v.recording = Some(action);
-                                    window.focus(&v.focus, cx);
-                                    cx.notify();
-                                })),
-                        )
-                    })))
-            }
+            Section::Shortcuts => self.shortcuts_page(&theme, &settings, window, cx),
         };
 
         div()
@@ -1553,6 +1555,7 @@ mod tests {
         assert_eq!(display_chord("cmd-shift-t"), "Shift+Cmd+T");
         assert_eq!(display_chord("ctrl-alt-space"), "Ctrl+Opt+Space");
         assert_eq!(display_chord("cmd-,"), "Cmd+,");
+        assert_eq!(display_chord("cmd-space"), "Cmd+Space");
     }
 
     #[test]
@@ -1561,6 +1564,8 @@ mod tests {
         assert_eq!(display_chord("ctrl-shift-t"), "Ctrl+Shift+T");
         assert_eq!(display_chord("ctrl-alt-space"), "Ctrl+Alt+Space");
         assert_eq!(display_chord("super-,"), "Super+,");
+        assert_eq!(display_chord("super-space"), "Super+Space");
+        assert_eq!(display_chord("ctrl-alt-super-shift-k"), "Ctrl+Alt+Shift+Super+K");
         // Linux hears Ctrl+Shift+1 as ctrl-! (US layout): it reads as pressed
         assert_eq!(display_chord("ctrl-!"), "Ctrl+Shift+1");
         assert_eq!(display_chord("ctrl-("), "Ctrl+Shift+9");

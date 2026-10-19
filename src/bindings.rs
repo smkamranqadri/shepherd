@@ -21,14 +21,35 @@ macro_rules! app_actions {
 app_actions! {
     NewTab: "New tab",
     CloseTab: "Close tab",
+    RenameTab: "Rename tab",
+    MoveTabPrevious: "Move tab toward the front",
+    MoveTabNext: "Move tab toward the back",
     NewWorkspace: "New workspace",
+    RenameWorkspace: "Rename workspace",
+    CloseWorkspace: "Close workspace",
+    NewWorktree: "New worktree",
+    OpenWorktree: "Open worktree",
+    RemoveWorktree: "Remove worktree",
     SplitRight: "Split right",
     SplitDown: "Split down",
     ClosePane: "Close pane",
+    RenamePane: "Rename pane",
+    ClearPane: "Clear pane",
+    EditScrollback: "Edit scrollback",
     FocusLeft: "Focus pane left",
     FocusRight: "Focus pane right",
     FocusUp: "Focus pane up",
     FocusDown: "Focus pane down",
+    CyclePaneNext: "Next pane",
+    CyclePanePrevious: "Previous pane",
+    SwapPaneLeft: "Swap pane left",
+    SwapPaneRight: "Swap pane right",
+    SwapPaneUp: "Swap pane up",
+    SwapPaneDown: "Swap pane down",
+    ResizePaneLeft: "Resize pane left",
+    ResizePaneRight: "Resize pane right",
+    ResizePaneUp: "Resize pane up",
+    ResizePaneDown: "Resize pane down",
     ToggleZoom: "Zoom pane",
     Tab1: "Go to tab 1",
     Tab2: "Go to tab 2",
@@ -56,6 +77,17 @@ app_actions! {
     Workspace7: "Go to workspace 7",
     Workspace8: "Go to workspace 8",
     Workspace9: "Go to workspace 9",
+    PreviousAgent: "Previous agent",
+    NextAgent: "Next agent",
+    Agent1: "Go to agent 1",
+    Agent2: "Go to agent 2",
+    Agent3: "Go to agent 3",
+    Agent4: "Go to agent 4",
+    Agent5: "Go to agent 5",
+    Agent6: "Go to agent 6",
+    Agent7: "Go to agent 7",
+    Agent8: "Go to agent 8",
+    Agent9: "Go to agent 9",
     ToggleSidebar: "Toggle sidebar",
     ToggleAgentsView: "Sidebar: workspaces or agents",
     FilterSidebar: "Sidebar: filter",
@@ -73,6 +105,7 @@ app_actions! {
     FontSizeDown: "Smaller text",
     FontSizeReset: "Default text size",
     OpenSettings: "Settings",
+    ReloadHerdrConfig: "Reload herdr's config",
     ChangeTheme: "Change theme",
     ToggleSecureInput: "Secure keyboard entry",
     CommandPanel: "Command panel",
@@ -316,6 +349,10 @@ pub const TAB_ACTIONS: [&str; 9] = ["Tab1", "Tab2", "Tab3", "Tab4", "Tab5", "Tab
 pub const WORKSPACE_ACTIONS: [&str; 9] =
     ["Workspace1", "Workspace2", "Workspace3", "Workspace4", "Workspace5", "Workspace6", "Workspace7", "Workspace8", "Workspace9"];
 
+/// The Agent1–9 actions, in order: `AGENT_ACTIONS[i]` goes to the `i`th agent of the shown session, in the sidebar's
+/// order.
+pub const AGENT_ACTIONS: [&str; 9] = ["Agent1", "Agent2", "Agent3", "Agent4", "Agent5", "Agent6", "Agent7", "Agent8", "Agent9"];
+
 /// The digit a US layout types `key` with Shift: Linux hears Ctrl+Shift+1 as `ctrl-!` (see the defaults), which
 /// reads better as the keys pressed.
 pub fn shifted_digit(key: &str) -> Option<char> {
@@ -338,8 +375,8 @@ pub fn normalize(chord: &str) -> Option<String> {
     keys.filter(|k| !k.is_empty()).map(|k| k.join(" "))
 }
 
-/// A keystroke worth binding: with cmd, ctrl, alt or fn, or a function key. A bare letter would be taken from
-/// every terminal.
+/// A keystroke worth binding: with cmd (the Super key off macOS), ctrl, alt or fn, or a function key. A bare letter
+/// would be taken from every terminal. A modifier pressed alone is no keystroke at all: the platform reports none.
 pub fn recordable(keystroke: &Keystroke) -> bool {
     let m = &keystroke.modifiers;
     m.platform || m.control || m.alt || m.function || (keystroke.key.starts_with('f') && keystroke.key[1..].parse::<u8>().is_ok())
@@ -556,10 +593,16 @@ pub fn apply(cx: &mut App, previous: &[(String, String)], next: &[(String, Strin
     cx.bind_keys(bindings);
 }
 
-/// The chords of herdr's own keymap bound now, so the next rebind can unbind what it drops.
-struct HerdrBindings(Vec<String>);
+/// What herdr's own keymap has bound now, so the next rebind can unbind what it drops and bind only what is new.
+struct HerdrBindings(Vec<(crate::herdr::keys::Bind, String)>);
 
 impl gpui::Global for HerdrBindings {}
+
+/// Counts the times herdr's keymap was read and bound again (a config.toml change, or Shepherd's own write to it): the
+/// Shortcuts page follows it to show what herdr has now.
+pub struct HerdrKeysEpoch(pub u64);
+
+impl gpui::Global for HerdrKeysEpoch {}
 
 /// The key context herdr's chords are bound in: herdr's keymap is for its panes, and a prefix waiting for its
 /// second key would get in the way of typing elsewhere.
@@ -571,28 +614,72 @@ fn herdr_keeps(chord: &str, shepherd: &[(String, String)]) -> bool {
     !shepherd.iter().any(|(action, k)| k == chord && context_of(action).is_none())
 }
 
-/// Binds herdr's keymap from its config.toml (`[keys]`, `[[keys.command]]`) in the panes, under Shepherd's
-/// own: a chord `shepherd` uses stays Shepherd's.
-fn rebind_herdr(cx: &mut App, shepherd: &[(String, String)]) {
+/// The keybinding of one chord of herdr's keymap in the panes.
+fn herdr_binding(bind: &crate::herdr::keys::Bind, chord: &str) -> Option<KeyBinding> {
     use crate::herdr::keys::Bind;
-    // ponytail: read on rebind (start, Settings), not watched; a config.toml edit takes a restart
-    let config = crate::herdr::HerdrConfig::load(&crate::herdr::config_path()).unwrap_or_default();
-    let next: Vec<_> = crate::herdr::keys::bindings(&config)
-        .into_iter()
-        .filter(|(_, chord)| herdr_keeps(chord, shepherd))
-        .collect();
+    match bind {
+        Bind::App(action) => binding(action, chord, Some(TERMINAL)),
+        Bind::Command(command) => Some(KeyBinding::new(chord, command.clone(), Some(TERMINAL))),
+        Bind::HerdrOnly(only) => Some(KeyBinding::new(chord, only.clone(), Some(TERMINAL))),
+        Bind::Unbound(unbound) => Some(KeyBinding::new(chord, unbound.clone(), Some(TERMINAL))),
+    }
+}
+
+/// herdr's config for binding its chords: a file that does not parse (half-typed in an editor) leaves the chords as
+/// they are once some are bound (`bound`), and is herdr's defaults at the start; a missing file is the defaults.
+fn read_herdr_config(path: &std::path::Path, bound: bool) -> Option<crate::herdr::HerdrConfig> {
+    match crate::herdr::HerdrConfig::load(path) {
+        Ok(config) => Some(config),
+        Err(_) if bound => None,
+        Err(_) => Some(crate::herdr::HerdrConfig::default()),
+    }
+}
+
+/// Binds herdr's keymap from its config.toml (`[keys]`, `[[keys.command]]`) in the panes, under Shepherd's
+/// own: a chord `shepherd` uses stays Shepherd's. Reads the file now.
+fn rebind_herdr(cx: &mut App, shepherd: &[(String, String)]) {
+    let Some(config) = read_herdr_config(&crate::herdr::config_path(), cx.has_global::<HerdrBindings>()) else { return };
+    let actions = crate::herdr::keymap::actions(crate::herdr::keymap::defaults(), &config);
+    let next: Vec<_> = crate::herdr::keys::bindings(&actions, &config).into_iter().filter(|(_, chord)| herdr_keeps(chord, shepherd)).collect();
     let previous = cx.try_global::<HerdrBindings>().map(|b| b.0.clone()).unwrap_or_default();
     let mut bindings: Vec<KeyBinding> = previous
         .iter()
-        .filter(|chord| !next.iter().any(|(_, k)| k == *chord))
-        .map(|chord| KeyBinding::new(chord, NoAction, Some(TERMINAL)))
+        .filter(|(_, chord)| !next.iter().any(|(_, k)| k == chord))
+        .map(|(_, chord)| KeyBinding::new(chord, NoAction, Some(TERMINAL)))
         .collect();
-    bindings.extend(next.iter().filter_map(|(bind, chord)| match bind {
-        Bind::App(action) => binding(action, chord, Some(TERMINAL)),
-        Bind::Command(command) => Some(KeyBinding::new(chord, command.clone(), Some(TERMINAL))),
-    }));
+    // a later binding wins in GPUI: a chord whose meaning changed is bound again, one that did not is left as it is
+    bindings.extend(next.iter().filter(|n| !previous.contains(n)).filter_map(|(bind, chord)| herdr_binding(bind, chord)));
     cx.bind_keys(bindings);
-    cx.set_global(HerdrBindings(next.into_iter().map(|(_, chord)| chord).collect()));
+    cx.set_global(HerdrBindings(next));
+}
+
+/// Reads herdr's config.toml again and binds its chords as it has them now.
+pub fn refresh_herdr(cx: &mut App) {
+    let shepherd = cx.try_global::<ActiveBindings>().map(|a| a.0.clone()).unwrap_or_default();
+    rebind_herdr(cx, &shepherd);
+    let epoch = cx.try_global::<HerdrKeysEpoch>().map_or(0, |e| e.0) + 1;
+    cx.set_global(HerdrKeysEpoch(epoch));
+}
+
+/// Binds herdr's chords again whenever its config.toml changes: Shepherd's own page writes it, and so may an editor.
+// ponytail: a stat of the file every 1.5 s, where a watcher would be told; the file is one, and the stat costs nothing
+pub fn watch_herdr_config(cx: &mut App) {
+    fn stamp() -> Option<(std::time::SystemTime, u64)> {
+        let meta = std::fs::metadata(crate::herdr::config_path()).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    }
+    cx.spawn(async move |cx| {
+        let mut seen = stamp();
+        loop {
+            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+            let now = stamp();
+            if now != seen {
+                seen = now;
+                cx.update(refresh_herdr);
+            }
+        }
+    })
+    .detach();
 }
 
 #[cfg(test)]
@@ -814,6 +901,117 @@ mod tests {
 
     fn stack(names: &[&str]) -> Vec<gpui::KeyContext> {
         names.iter().map(|n| gpui::KeyContext::parse(n).unwrap()).collect()
+    }
+
+    /// herdr's keymap as `rebind_herdr` binds it, in a keymap of its own.
+    fn herdr_keymap(toml: &str) -> gpui::Keymap {
+        let config = crate::herdr::HerdrConfig::parse(toml).unwrap();
+        let actions = crate::herdr::keymap::actions(&crate::herdr::keymap::builtin_defaults(), &config);
+        let mut keymap = gpui::Keymap::new(Vec::new());
+        keymap.add_bindings(crate::herdr::keys::bindings(&actions, &config).iter().filter_map(|(bind, chord)| herdr_binding(bind, chord)));
+        keymap
+    }
+
+    /// What typing `keys` (GPUI's spelling, as the platform reports them) does in a pane: the action fired, or `None`
+    /// and whether the keys are a prefix of a longer chord, still waiting.
+    fn typed(keymap: &gpui::Keymap, keys: &[&str], at: &[gpui::KeyContext]) -> (Option<String>, bool) {
+        let typed: Vec<Keystroke> = keys.iter().map(|k| Keystroke::parse(k).unwrap()).collect();
+        let (bindings, pending) = keymap.bindings_for_input(&typed, at);
+        (bindings.first().map(|b| b.action().name().to_string()), pending)
+    }
+
+    #[test]
+    fn a_super_prefix_runs_herdrs_actions_in_a_pane() {
+        let pane = stack(&["Workspace", "Terminal"]);
+        let keymap = herdr_keymap("[keys]\nprefix = \"super+space\"\nnew_tab = \"prefix+t\"\nswitch_tab = \"prefix+1..9\"\ndetach = \"prefix+q\"\n");
+        // the platform key as Linux and macOS report it: `modifiers.platform`
+        let prefix = gpui::Keystroke { modifiers: gpui::Modifiers { platform: true, ..Default::default() }, key: "space".into(), key_char: None };
+        let t = gpui::Keystroke::parse("t").unwrap();
+        let (bound, pending) = keymap.bindings_for_input(std::slice::from_ref(&prefix), &pane);
+        assert!(bound.is_empty() && pending, "the prefix alone waits for the next key");
+        let fired = |keys: &[Keystroke]| keymap.bindings_for_input(keys, &pane).0.first().map(|b| b.action().name().to_string());
+        assert_eq!(fired(&[prefix.clone(), t]).as_deref(), Some("shepherd::NewTab"));
+        assert_eq!(fired(&[prefix.clone(), Keystroke::parse("3").unwrap()]).as_deref(), Some("shepherd::Tab3"));
+        assert_eq!(fired(&[prefix.clone(), Keystroke::parse("q").unwrap()]).as_deref(), Some("shepherd::HerdrOnly"), "caught, not typed");
+        assert_eq!(fired(&[prefix.clone(), Keystroke::parse("a").unwrap()]).as_deref(), Some("shepherd::HerdrUnbound"), "a key herdr binds to nothing");
+        assert_eq!(fired(&[prefix.clone(), Keystroke::parse("ctrl-alt-x").unwrap()]).as_deref(), Some("shepherd::HerdrUnbound"));
+        assert_eq!(fired(&[prefix.clone(), Keystroke::parse("escape").unwrap()]).as_deref(), Some("shepherd::HerdrUnbound"));
+        // the prefix is the pane's alone: in the editor's text or a file's view nothing waits
+        for other in [stack(&["Workspace", "FileEditor", "Input"]), stack(&["Workspace", "FileEditor", "FileViewer"])] {
+            let (bound, pending) = keymap.bindings_for_input(std::slice::from_ref(&prefix), &other);
+            assert!(bound.is_empty() && !pending, "{other:?}");
+        }
+        // and the old prefix is nothing now
+        let old = Keystroke::parse("ctrl-b").unwrap();
+        assert!(keymap.bindings_for_input(&[old], &pane).0.is_empty());
+    }
+
+    #[test]
+    fn herdrs_direct_chords_run_in_a_pane_and_a_bare_key_stays_typing() {
+        let pane = stack(&["Workspace", "Terminal"]);
+        let keymap = herdr_keymap("[keys]\nnext_tab = \"ctrl+alt+j\"\nzoom = \"z\"\ndetach = \"super+p\"\n");
+        assert_eq!(typed(&keymap, &["ctrl-alt-j"], &pane).0.as_deref(), Some("shepherd::NextTab"));
+        assert_eq!(typed(&keymap, &["super-p"], &pane).0.as_deref(), Some("shepherd::HerdrOnly"));
+        assert_eq!(typed(&keymap, &["z"], &pane), (None, false), "a letter herdr binds bare is typed");
+        assert_eq!(typed(&keymap, &["ctrl-b"], &pane), (None, true), "the default prefix is waiting for its key");
+    }
+
+    #[test]
+    fn a_config_that_does_not_parse_leaves_the_bound_chords_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[keys]\nnew_tab = \"prefix+t\"\n").unwrap();
+        assert_eq!(read_herdr_config(&path, true).unwrap().strs("keys.new_tab"), Some(vec!["prefix+t".to_string()]));
+        std::fs::write(&path, "[keys\nnew_tab = ").unwrap();
+        assert!(read_herdr_config(&path, true).is_none(), "half-typed: keep what is bound");
+        assert!(read_herdr_config(&path, false).is_some_and(|c| c.strs("keys.new_tab").is_none()), "at the start: herdr's defaults");
+        assert!(read_herdr_config(&dir.path().join("none.toml"), true).is_some(), "no file: the defaults");
+    }
+
+    /// The platform key (Super on Linux, Cmd on a Mac) records, binds and fires like any modifier.
+    #[test]
+    fn a_recorded_super_chord_is_bound_and_fires() {
+        let super_k = gpui::Keystroke { modifiers: gpui::Modifiers { platform: true, ..Default::default() }, key: "k".into(), key_char: None };
+        assert!(recordable(&super_k), "the recorder takes it");
+        let recorded = super_k.unparse();
+        assert_eq!(recorded, if cfg!(target_os = "macos") { "cmd-k" } else { "super-k" });
+        let mut settings = crate::settings::Settings::default();
+        settings.record_chord("NewTab", &recorded);
+        let eff = effective(&settings.keys);
+        assert_eq!(chord(&eff, "NewTab"), Some(recorded.as_str()));
+        // however the config or the settings file spell it
+        assert_eq!(normalize("super-k"), normalize("cmd-k"));
+        assert_eq!(normalize("win-k"), normalize("super-k"));
+        let mut keymap = gpui::Keymap::new(Vec::new());
+        keymap.add_bindings(placed(&eff, &[]).into_iter().filter_map(|(chord, context, action)| binding(action, chord, context)));
+        let fired = keymap.bindings_for_input(&[super_k], &stack(&["Workspace", "Terminal"])).0.first().map(|b| b.action().name().to_string());
+        assert_eq!(fired.as_deref(), Some("shepherd::NewTab"));
+        // Super on its own is no chord: the platform reports a modifier alone as no keystroke at all
+        assert!(!recordable(&Keystroke::parse("a").unwrap()), "a bare letter is not one either");
+    }
+
+    /// An action without a listener does nothing when its chord is pressed or its entry in the command panel run:
+    /// every one of `ACTIONS` is handled somewhere in the app.
+    #[test]
+    fn every_action_has_a_listener() {
+        fn sources(dir: &std::path::Path, out: &mut String) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") && !path.ends_with("bindings.rs") {
+                    out.push_str(&std::fs::read_to_string(&path).unwrap());
+                }
+            }
+        }
+        let mut all = String::new();
+        sources(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut all);
+        for (name, _) in ACTIONS {
+            let handled = [format!("_: &{name},"), format!("_: &crate::bindings::{name},"), format!("_: &bindings::{name},"), format!("_: &shepherd::bindings::{name},"), format!("&{name}, ")]
+                .iter()
+                .any(|p| all.contains(p.as_str()));
+            assert!(handled, "{name} has no on_action listener");
+        }
     }
 
     #[test]

@@ -22,6 +22,8 @@ fn main() {
         shepherd::bindings::rebind(cx, &settings.keys);
         cx.set_global(shepherd::settings::SettingsGlobal { settings, error, path });
         shepherd::bindings::bind_editor_keys(cx);
+        // herdr's chords follow its config.toml from here on, whoever edits it
+        shepherd::bindings::watch_herdr_config(cx);
         // unsaved file tabs ask first
         cx.on_action(|_: &shepherd::bindings::Quit, cx| shepherd::shell::Shell::quit(cx));
         // off macOS an app with no windows left has nothing to show: closing the last one quits, as GNOME expects

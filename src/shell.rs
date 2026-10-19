@@ -43,6 +43,7 @@ mod watchers;
 mod sync;
 mod file_tabs;
 mod hints;
+mod key_actions;
 mod tab_bar;
 mod tree_drag;
 pub(crate) mod widgets;
@@ -332,6 +333,8 @@ pub struct Shell {
 /// New worktree: the repo's workspace and the branch name being typed.
 struct WorktreeDialog {
     workspace_id: String,
+    /// Set when the dialog names this pane instead of a new worktree's branch.
+    rename_pane: Option<String>,
     input: Entity<InputState>,
     _events: Subscription,
 }
@@ -769,7 +772,7 @@ impl Shell {
         }
         if let Some((view, _)) = &self.settings {
             window.focus(&view.focus_handle(cx), cx);
-            view.update(cx, |v, cx| v.show_shortcut(action, cx));
+            view.update(cx, |v, cx| v.show_shortcut(action, window, cx));
         }
     }
 
@@ -1856,6 +1859,42 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &WorkspacesPanel, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Workspaces, w, cx)))
             .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Shortcuts, w, cx)))
             .on_action(cx.listener(|this, c: &crate::herdr::keys::HerdrCommand, w, cx| this.run_herdr_command(c, w, cx)))
+            .on_action(cx.listener(|this, c: &crate::herdr::keys::HerdrOnly, _, cx| this.herdr_only(c, cx)))
+            .on_action(cx.listener(|this, c: &crate::herdr::keys::HerdrUnbound, _, cx| this.herdr_unbound(c, cx)))
+            // the rest of herdr's keymap, through its API (`key_actions`)
+            .on_action(cx.listener(|this, _: &ReloadHerdrConfig, _, cx| this.reload_herdr_config(cx)))
+            .on_action(cx.listener(|this, _: &RenameTab, w, cx| this.rename_shown_tab(w, cx)))
+            .on_action(cx.listener(|this, _: &RenameWorkspace, w, cx| this.rename_shown_workspace(w, cx)))
+            .on_action(cx.listener(|this, _: &RenamePane, w, cx| this.rename_active_pane(w, cx)))
+            .on_action(cx.listener(|this, _: &CloseWorkspace, _, cx| this.close_shown_workspace(cx)))
+            .on_action(cx.listener(|this, _: &NewWorktree, w, cx| this.worktree_key(key_actions::WorktreeKey::New, w, cx)))
+            .on_action(cx.listener(|this, _: &OpenWorktree, w, cx| this.worktree_key(key_actions::WorktreeKey::Open, w, cx)))
+            .on_action(cx.listener(|this, _: &RemoveWorktree, w, cx| this.worktree_key(key_actions::WorktreeKey::Remove, w, cx)))
+            .on_action(cx.listener(|this, _: &MoveTabPrevious, _, cx| this.move_shown_tab(false, cx)))
+            .on_action(cx.listener(|this, _: &MoveTabNext, _, cx| this.move_shown_tab(true, cx)))
+            .on_action(cx.listener(|this, _: &CyclePaneNext, w, cx| this.cycle_pane(true, w, cx)))
+            .on_action(cx.listener(|this, _: &CyclePanePrevious, w, cx| this.cycle_pane(false, w, cx)))
+            .on_action(cx.listener(|this, _: &ClearPane, w, cx| this.pane_command(w, cx, |pane_id| Command::ClearPane { pane_id })))
+            .on_action(cx.listener(|this, _: &EditScrollback, w, cx| this.pane_command(w, cx, |pane_id| Command::EditScrollback { pane_id })))
+            .on_action(cx.listener(|this, _: &SwapPaneLeft, w, cx| this.pane_command(w, cx, |pane_id| Command::SwapPaneToward { pane_id, direction: Direction::Left })))
+            .on_action(cx.listener(|this, _: &SwapPaneRight, w, cx| this.pane_command(w, cx, |pane_id| Command::SwapPaneToward { pane_id, direction: Direction::Right })))
+            .on_action(cx.listener(|this, _: &SwapPaneUp, w, cx| this.pane_command(w, cx, |pane_id| Command::SwapPaneToward { pane_id, direction: Direction::Up })))
+            .on_action(cx.listener(|this, _: &SwapPaneDown, w, cx| this.pane_command(w, cx, |pane_id| Command::SwapPaneToward { pane_id, direction: Direction::Down })))
+            .on_action(cx.listener(|this, _: &ResizePaneLeft, w, cx| this.pane_command(w, cx, |pane_id| Command::ResizePane { pane_id, direction: Direction::Left })))
+            .on_action(cx.listener(|this, _: &ResizePaneRight, w, cx| this.pane_command(w, cx, |pane_id| Command::ResizePane { pane_id, direction: Direction::Right })))
+            .on_action(cx.listener(|this, _: &ResizePaneUp, w, cx| this.pane_command(w, cx, |pane_id| Command::ResizePane { pane_id, direction: Direction::Up })))
+            .on_action(cx.listener(|this, _: &ResizePaneDown, w, cx| this.pane_command(w, cx, |pane_id| Command::ResizePane { pane_id, direction: Direction::Down })))
+            .on_action(cx.listener(|this, _: &PreviousAgent, w, cx| this.step_agent(false, w, cx)))
+            .on_action(cx.listener(|this, _: &NextAgent, w, cx| this.step_agent(true, w, cx)))
+            .on_action(cx.listener(|this, _: &Agent1, _, cx| this.go_to_agent(0, cx)))
+            .on_action(cx.listener(|this, _: &Agent2, _, cx| this.go_to_agent(1, cx)))
+            .on_action(cx.listener(|this, _: &Agent3, _, cx| this.go_to_agent(2, cx)))
+            .on_action(cx.listener(|this, _: &Agent4, _, cx| this.go_to_agent(3, cx)))
+            .on_action(cx.listener(|this, _: &Agent5, _, cx| this.go_to_agent(4, cx)))
+            .on_action(cx.listener(|this, _: &Agent6, _, cx| this.go_to_agent(5, cx)))
+            .on_action(cx.listener(|this, _: &Agent7, _, cx| this.go_to_agent(6, cx)))
+            .on_action(cx.listener(|this, _: &Agent8, _, cx| this.go_to_agent(7, cx)))
+            .on_action(cx.listener(|this, _: &Agent9, _, cx| this.go_to_agent(8, cx)))
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, w, cx| {
                 this.drag_divider(e.position, cx);
                 this.drag_sidebar(e.position.x, cx);

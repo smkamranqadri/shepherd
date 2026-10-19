@@ -509,7 +509,8 @@ impl Shell {
             .with_priority(1)
         }))
         .children(self.worktree_dialog.as_ref().map(|dialog| {
-            let card = dialog_card(theme, "worktree-dialog", "New worktree")
+            let renaming = dialog.value.rename_pane.is_some();
+            let card = dialog_card(theme, "worktree-dialog", if renaming { "Rename pane" } else { "New worktree" })
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| this.finish_worktree_dialog(false, cx)))
                 .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, _, cx| {
                     if e.keystroke.key == "escape" {
@@ -517,7 +518,7 @@ impl Shell {
                         this.finish_worktree_dialog(false, cx);
                     }
                 }))
-                .child(div().mt(px(4.)).text_color(theme.text_muted).child("Branch name"))
+                .child(div().mt(px(4.)).text_color(theme.text_muted).child(if renaming { "Name (empty: automatic)" } else { "Branch name" }))
                 .child(
                     div()
                         .mt(px(8.))
@@ -541,7 +542,7 @@ impl Shell {
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.finish_worktree_dialog(false, cx))),
                         )
                         .child(
-                            solid_button("worktree-create", "Create", theme.text, theme.surface)
+                            solid_button("worktree-create", if renaming { "Rename" } else { "Create" }, theme.text, theme.surface)
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.finish_worktree_dialog(true, cx))),
                         ),
                 );

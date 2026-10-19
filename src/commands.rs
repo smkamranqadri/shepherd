@@ -50,6 +50,20 @@ pub enum Command {
     /// with herdr's TUI clients, so it is sent only for a done agent you just looked at.
     MarkSeen { pane_id: String },
     Zoom { pane_id: String },
+    /// Gives the pane herdr's focus, whichever it is: the next or previous pane of the tab.
+    FocusPaneId { pane_id: String },
+    /// Names the pane (its label in herdr's own screen); an empty label puts the automatic name back.
+    RenamePane { pane_id: String, label: String },
+    /// Clears the pane's screen and scrollback as herdr's `clear_pane` does.
+    ClearPane { pane_id: String },
+    /// Opens the pane's scrollback in the editor, as herdr's `edit_scrollback` does.
+    EditScrollback { pane_id: String },
+    /// Swaps the pane with its neighbor that way; the processes keep running.
+    SwapPaneToward { pane_id: String, direction: Direction },
+    /// Moves the pane's edge one step that way, as herdr's `resize_pane_*` do.
+    ResizePane { pane_id: String, direction: Direction },
+    /// herdr reads its config.toml again.
+    ReloadConfig,
     /// Swaps two panes of one tab (herdr refuses `cross_tab`); the processes keep running.
     SwapPanes { source: String, target: String },
     /// Moves a pane, process and all, into a tab: split right (or down) of `target`, or of the whole tab when
@@ -117,6 +131,15 @@ impl Command {
             }
             Command::MarkSeen { pane_id } => ("pane.focus", json!({"pane_id": pane_id})),
             Command::Zoom { pane_id } => ("pane.zoom", json!({"pane_id": pane_id, "mode": "toggle"})),
+            Command::FocusPaneId { pane_id } => ("pane.focus", json!({"pane_id": pane_id})),
+            Command::RenamePane { pane_id, label } => {
+                ("pane.rename", json!({"pane_id": pane_id, "label": if label.is_empty() { Value::Null } else { json!(label) }}))
+            }
+            Command::ClearPane { pane_id } => ("pane.clear", json!({"pane_id": pane_id})),
+            Command::EditScrollback { pane_id } => ("pane.edit_scrollback", json!({"pane_id": pane_id})),
+            Command::SwapPaneToward { pane_id, direction } => ("pane.swap", json!({"pane_id": pane_id, "direction": direction.name()})),
+            Command::ResizePane { pane_id, direction } => ("pane.resize", json!({"pane_id": pane_id, "direction": direction.name()})),
+            Command::ReloadConfig => ("server.reload_config", json!({})),
             Command::SwapPanes { source, target } => {
                 ("pane.swap", json!({"source_pane_id": source, "target_pane_id": target}))
             }
@@ -279,6 +302,32 @@ mod tests {
         );
         assert_eq!(req(Command::MarkSeen { pane_id: "w1:p1".into() }), ("pane.focus", json!({"pane_id": "w1:p1"})));
         assert_eq!(req(Command::Zoom { pane_id: "w1:p1".into() }), ("pane.zoom", json!({"pane_id": "w1:p1", "mode": "toggle"})));
+    }
+
+    #[test]
+    fn herdrs_pane_actions() {
+        let pane = || "w1:p1".to_string();
+        assert_eq!(req(Command::FocusPaneId { pane_id: pane() }), ("pane.focus", json!({"pane_id": "w1:p1"})));
+        assert_eq!(req(Command::ClearPane { pane_id: pane() }), ("pane.clear", json!({"pane_id": "w1:p1"})));
+        assert_eq!(req(Command::EditScrollback { pane_id: pane() }), ("pane.edit_scrollback", json!({"pane_id": "w1:p1"})));
+        assert_eq!(
+            req(Command::RenamePane { pane_id: pane(), label: "logs".into() }),
+            ("pane.rename", json!({"pane_id": "w1:p1", "label": "logs"}))
+        );
+        assert_eq!(
+            req(Command::RenamePane { pane_id: pane(), label: String::new() }),
+            ("pane.rename", json!({"pane_id": "w1:p1", "label": null})),
+            "an empty name puts the automatic one back"
+        );
+        assert_eq!(
+            req(Command::SwapPaneToward { pane_id: pane(), direction: Direction::Down }),
+            ("pane.swap", json!({"pane_id": "w1:p1", "direction": "down"}))
+        );
+        assert_eq!(
+            req(Command::ResizePane { pane_id: pane(), direction: Direction::Left }),
+            ("pane.resize", json!({"pane_id": "w1:p1", "direction": "left"}))
+        );
+        assert_eq!(req(Command::ReloadConfig), ("server.reload_config", json!({})));
     }
 
     #[test]
