@@ -1,9 +1,8 @@
 //! Updating Shepherd.app from its GitHub releases (Collie's updater): the latest release from GitHub's API, its
 //! `Shepherd-<V>-universal.zip` downloaded and unpacked next to the running app, checked to be signed by the
 //! running app's team, swapped in, then a relaunch. Checked at launch and every few hours; the sidebar offers
-//! what it finds (Zeron's update strip), Settings → About checks by hand. Off macOS, where there is no signature to
-//! check a download against, a release build made with `SHEPHERD_UPDATE_CHECK` set only tells: the offer opens the
-//! release's page, and installing is up to the user; other builds never check.
+//! what it finds (Zeron's update strip), Settings → About checks by hand. Off macOS there is no signature to check a
+//! download against, so a release build from CI only tells of a newer release and a click opens its page.
 use anyhow::{Context as _, bail};
 use futures::StreamExt;
 use gpui::{App, AppContext as _, Global};
@@ -13,11 +12,13 @@ use std::process::Command;
 use std::time::Duration;
 
 const LATEST: &str = "https://api.github.com/repos/freethinkel/shepherd/releases/latest";
+/// What a release's page must start with before a click opens it.
+const PAGES: &str = "https://github.com/freethinkel/shepherd/releases/";
 const EVERY: Duration = Duration::from_secs(6 * 3600);
 /// The release zips' arch, as `uname -m` names it in the Makefile.
 const ARCH: &str = if cfg!(target_arch = "aarch64") { "arm64" } else { "x86_64" };
 
-/// A release's version and its zip for this Mac.
+/// A release's version and its zip for this Mac; off macOS, its page and no size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
     pub version: String,
@@ -69,8 +70,8 @@ impl Updates {
     /// The sidebar strip: its label and the release a click installs. `None` while there is nothing to offer.
     pub fn strip(&self) -> Option<(String, Option<Release>)> {
         match self {
-            Updates::Available(r) if INSTALLS => Some((format!("Update to v{}", r.version), Some(r.clone()))),
-            Updates::Available(r) => Some((format!("Shepherd v{} is out", r.version), Some(r.clone()))),
+            Updates::Available(r) if notifies() => Some((format!("Shepherd v{} is out", r.version), Some(r.clone()))),
+            Updates::Available(r) => Some((format!("Update to v{}", r.version), Some(r.clone()))),
             Updates::Downloading { version, percent } => Some((format!("Downloading v{version}… {percent}%"), None)),
             Updates::Installing => Some(("Installing, Shepherd restarts…".into(), None)),
             Updates::Installed => Some(("Installed, restarts on quit".into(), None)),
@@ -96,23 +97,18 @@ fn bundle_of(exe: &Path) -> Option<PathBuf> {
     (app.extension()? == "app").then(|| app.to_path_buf())
 }
 
-/// Whether this build installs updates itself: a macOS app bundle. Elsewhere an offer opens the release's page.
-pub const INSTALLS: bool = cfg!(target_os = "macos");
-
-/// Off macOS, whether this build tells of new releases: only a release build made with `SHEPHERD_UPDATE_CHECK` set
-/// (as release CI would), so a build from source or a distribution's package never asks GitHub.
-const NOTICE: bool = option_env!("SHEPHERD_UPDATE_CHECK").is_some() && !cfg!(debug_assertions);
-
-/// Whether this build looks for updates: a release build in an app bundle on macOS; elsewhere one built to
-/// ([`NOTICE`]).
-pub fn checks() -> bool {
-    if INSTALLS { app_bundle().is_some() } else { NOTICE }
+/// Off macOS, this build tells of new releases: a release build from CI, which sets `SHEPHERD_UPDATE_CHECK`. Builds
+/// from source and distribution packages never ask GitHub; theirs come from the package manager.
+pub fn notifies() -> bool {
+    !cfg!(target_os = "macos") && !cfg!(debug_assertions) && option_env!("SHEPHERD_UPDATE_CHECK").is_some()
 }
 
-/// Where a release's page must be, to be opened: this repository's releases on GitHub.
-const RELEASES: &str = "https://github.com/freethinkel/shepherd/releases/";
+/// This build checks for updates: an app bundle that installs them, or a build that [`notifies`].
+pub fn checks() -> bool {
+    app_bundle().is_some() || notifies()
+}
 
-/// Sets up the state and, where [`checks`], checks now and every few hours.
+/// Sets up the state and, when it [`checks`], checks now and every few hours.
 pub fn start(cx: &mut App) {
     cx.set_global(Updates::default());
     if !checks() {
@@ -152,14 +148,10 @@ pub fn check(cx: &mut App, quiet: bool) {
     .detach();
 }
 
-/// Downloads `release`, swaps the app for it and relaunches; where Shepherd does not install, opens its page.
+/// Downloads `release`, swaps the app for it and relaunches; off macOS, opens its page.
 pub fn install(release: Release, cx: &mut App) {
-    if !INSTALLS {
-        // `release_page` only offers this repository's pages
-        if release.url.starts_with(RELEASES) {
-            cx.open_url(&release.url);
-        }
-        return;
+    if notifies() {
+        return cx.open_url(&release.url);
     }
     let Some(app) = app_bundle() else { return };
     if Updates::of(cx).busy() {
@@ -227,18 +219,10 @@ fn latest() -> anyhow::Result<Release> {
         .body_mut()
         .read_to_string()?;
     let json: serde_json::Value = serde_json::from_str(&body)?;
-    if !INSTALLS {
-        return release_page(&json).context("the latest release has no version tag or no page in this repository");
+    if notifies() {
+        return page_of(&json).context("the latest release has no page on GitHub");
     }
     release_of(&json).with_context(|| format!("the latest release has no universal or {ARCH} Shepherd zip"))
-}
-
-/// A release from GitHub's JSON as an offer to read about: `v0.2.0` and its page.
-/// None when the page is not under [`RELEASES`].
-fn release_page(json: &serde_json::Value) -> Option<Release> {
-    let version = json["tag_name"].as_str()?.strip_prefix('v')?.to_string();
-    let url = json["html_url"].as_str().filter(|u| u.starts_with(RELEASES))?;
-    Some(Release { url: url.into(), size: 0, version })
 }
 
 /// A release from GitHub's JSON: `v0.2.0` with `Shepherd-0.2.0-universal.zip` (or, from before universal builds,
@@ -251,6 +235,13 @@ fn release_of(json: &serde_json::Value) -> Option<Release> {
         assets.iter().find(|a| a["name"] == name.as_str())
     })?;
     Some(Release { url: asset["browser_download_url"].as_str()?.into(), size: asset["size"].as_u64()?, version })
+}
+
+/// A release from GitHub's JSON as a page to open: `v0.2.0` and its `html_url`, which must be one of [`PAGES`].
+fn page_of(json: &serde_json::Value) -> Option<Release> {
+    let version = json["tag_name"].as_str()?.strip_prefix('v')?.to_string();
+    let url = json["html_url"].as_str().filter(|u| u.starts_with(PAGES))?.to_string();
+    Some(Release { version, url, size: 0 })
 }
 
 /// `latest` is a later `x.y.z` than `current`; anything unreadable is not newer.
@@ -367,13 +358,6 @@ mod tests {
             ],
         });
         assert_eq!(release_of(&json), Some(Release { version: "0.2.0".into(), url: "https://x/zip".into(), size: 7 }));
-        let url = "https://github.com/freethinkel/shepherd/releases/tag/v1.3.0";
-        let page = serde_json::json!({ "tag_name": "v1.3.0", "html_url": url, "assets": [] });
-        assert_eq!(release_page(&page), Some(Release { version: "1.3.0".into(), url: url.into(), size: 0 }));
-        assert_eq!(release_page(&serde_json::json!({ "tag_name": "nightly", "html_url": url })), None);
-        for elsewhere in ["https://github.com/o/r/releases/tag/v1.3.0", "http://github.com/freethinkel/shepherd/releases/", "https://evil.example/https://github.com/freethinkel/shepherd/releases/"] {
-            assert_eq!(release_page(&serde_json::json!({ "tag_name": "v1.3.0", "html_url": elsewhere })), None, "{elsewhere}");
-        }
         assert_eq!(release_of(&serde_json::json!({ "tag_name": "v0.2.0", "assets": [] })), None);
         // A universal zip runs on every Mac and wins over an arch's.
         let json = serde_json::json!({
@@ -385,6 +369,16 @@ mod tests {
             ],
         });
         assert_eq!(release_of(&json), Some(Release { version: "0.3.0".into(), url: "https://x/universal".into(), size: 9 }));
+    }
+
+    #[test]
+    fn the_release_page() {
+        let page = |url: &str| page_of(&serde_json::json!({ "tag_name": "v0.2.0", "html_url": url, "assets": [] }));
+        let url = "https://github.com/freethinkel/shepherd/releases/tag/v0.2.0";
+        assert_eq!(page(url), Some(Release { version: "0.2.0".into(), url: url.into(), size: 0 }));
+        assert_eq!(page("https://github.com/freethinkel/shepherd-evil/releases/tag/v0.2.0"), None);
+        assert_eq!(page("http://github.com/freethinkel/shepherd/releases/tag/v0.2.0"), None);
+        assert_eq!(page_of(&serde_json::json!({ "tag_name": "v0.2.0" })), None);
     }
 
     #[test]

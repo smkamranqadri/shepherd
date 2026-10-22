@@ -5,6 +5,7 @@ mod config;
 pub mod lifecycle;
 pub mod session_watch;
 pub mod keymap;
+mod install;
 pub mod keys;
 pub mod popup;
 mod remote;
@@ -15,8 +16,9 @@ pub use wire::Rgb;
 pub use client::{ApiError, Client, EVENT_TYPES, WATCH_TYPES, api_error, burst, event_is, unsupported};
 pub use config::{CommandEntry, HerdrConfig, backup_once, config_path};
 pub use session::{Mode, Session, SessionEvent, SessionInfo, Sockets, client_socket, current_session, delete_session, new_session, no_server, sessions, valid_session_name, set_binary, set_socket, start_server, start_session_server, api_socket};
+pub use install::{install, missing};
 pub use wire::PaneInput;
-pub use remote::{AddError, ListError, Machine, add_machine, git, locate, locate_on, machines, quote, relay, remote_sessions, remove_machine, rename_machine, show_machine, split, ssh, unsaved};
+pub use remote::{AddError, ListError, Machine, Tunnel, add_machine, find_file, forward, git, locate, locate_on, machines, quote, read_file, relay, remote_sessions, remove_machine, rename_machine, show_machine, shown_machine, split, ssh, unsaved};
 /// The stand-in host and `ssh` of remote's tests, for the sidebar's discovery tests.
 #[cfg(all(test, unix))]
 pub(crate) use remote::{fake, sessions_over};

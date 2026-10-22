@@ -20,7 +20,7 @@
 
 use std::cell::RefCell;
 
-use ghostty_vt::render::{CellIterator, RowIterator};
+use ghostty_vt::render::{CellIterator, Dirty, RowIterator};
 use ghostty_vt::screen::{CellContentTag, CellWide, GridRef, Screen};
 use ghostty_vt::selection::{FormatOptions, SelectLineOptions, SelectWordBetweenOptions, Selection};
 use ghostty_vt::style::{Style, StyleColor, Underline};
@@ -74,9 +74,12 @@ fn map_color(color: StyleColor, default: CellColor) -> CellColor {
 }
 
 /// One rendered cell: char + colors + the flags paint cares about.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CellSnapshot {
     pub ch: char,
+    /// The whole grapheme cluster, `ch` first, when the cell holds more than `ch`: a flag, a skin tone, a ZWJ
+    /// sequence, a letter and its combining marks.
+    pub cluster: Option<std::sync::Arc<str>>,
     pub fg: CellColor,
     pub bg: CellColor,
     pub bold: bool,
@@ -118,6 +121,8 @@ struct Render {
     state: RenderState,
     rows: RowIterator,
     cells: CellIterator,
+    /// The rows as last read: a row Ghostty did not mark dirty since is taken from here, not read cell by cell again.
+    lines: Vec<Vec<CellSnapshot>>,
 }
 
 /// The selection being made: its granularity and where it started.
@@ -166,6 +171,7 @@ impl Emulator {
             state: RenderState::new().expect("libghostty-vt render state"),
             rows: RowIterator::new().expect("libghostty-vt row iterator"),
             cells: CellIterator::new().expect("libghostty-vt cell iterator"),
+            lines: Vec::new(),
         };
         Self {
             term,
@@ -192,7 +198,12 @@ impl Emulator {
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
         // ponytail: no pixel size; only CSI 14/16 t size reports would want it.
+        // No reflow: herdr repaints the whole grid at the new size, and until then a reflow shows its frame at the
+        // old width rewrapped (Ghostty reflows only under wraparound).
+        let wrap = self.term.mode(Mode::WRAPAROUND).unwrap_or(true);
+        let _ = self.term.set_mode(Mode::WRAPAROUND, false);
         let _ = self.term.resize(cols.max(2), rows.max(1), 0, 0);
+        let _ = self.term.set_mode(Mode::WRAPAROUND, wrap);
     }
 
     pub fn cols(&self) -> usize {
@@ -340,21 +351,31 @@ impl Emulator {
 
     fn read_lines(&self) -> Result<Vec<Vec<CellSnapshot>>, Error> {
         let mut render = self.render.borrow_mut();
-        let Render { state, rows, cells } = &mut *render;
+        let Render { state, rows, cells, lines: cache } = &mut *render;
         let plain = Style::default();
         let snapshot = state.update(&self.term)?;
+        let full = snapshot.dirty()? == Dirty::Full;
         let mut lines = Vec::with_capacity(self.rows());
         {
             let mut row_iter = rows.update(&snapshot)?;
             while let Some(row) = row_iter.next() {
                 let selected = row.selection()?.map(|s| s.start_x..=s.end_x);
+                // the selection is taken afresh for a clean row too: a changed one may leave the row clean
+                if let Some(mut line) = cache.get(lines.len()).filter(|l| !full && l.len() == self.cols() && !row.dirty().unwrap_or(true)).cloned() {
+                    for (col, cell) in line.iter_mut().enumerate() {
+                        cell.selected = selected.as_ref().is_some_and(|r| r.contains(&(col as u16)));
+                    }
+                    lines.push(line);
+                    continue;
+                }
                 let mut line = Vec::with_capacity(self.cols());
                 let mut cell_iter = cells.update(row)?;
                 while let Some(cell) = cell_iter.next() {
                     let raw = cell.raw_cell()?;
                     let style = if cell.has_styling()? { cell.style()? } else { plain };
                     // An erase with a background set stores the color in the cell, not a style.
-                    let bg = match raw.content_tag()? {
+                    let tag = raw.content_tag()?;
+                    let bg = match tag {
                         CellContentTag::BgColorPalette => CellColor::Indexed(raw.bg_color_palette()?.0),
                         CellContentTag::BgColorRgb => {
                             let c = raw.bg_color_rgb()?;
@@ -364,9 +385,17 @@ impl Emulator {
                     };
                     let wide = raw.wide()?;
                     let col = line.len() as u16;
+                    let cluster = match tag {
+                        CellContentTag::CodepointGrapheme => {
+                            let mut text = String::new();
+                            cell.graphemes_utf8(&mut text)?;
+                            Some(text.into())
+                        }
+                        _ => None,
+                    };
                     line.push(CellSnapshot {
-                        // ponytail: the base codepoint only; combining marks are dropped, as alacritty's view did.
                         ch: char::from_u32(raw.codepoint()?).filter(|&c| c != '\0').unwrap_or(' '),
+                        cluster,
                         fg: map_color(style.fg_color, CellColor::Foreground),
                         bg,
                         bold: style.bold,
@@ -384,6 +413,7 @@ impl Emulator {
             }
         }
         snapshot.clean()?;
+        cache.clone_from(&lines);
         Ok(lines)
     }
 
@@ -486,6 +516,33 @@ mod tests {
     }
 
     #[test]
+    fn a_reread_takes_changed_rows_and_the_selection_afresh() {
+        let mut e = emu(10, 3);
+        e.feed(b"one\r\ntwo\r\nthree");
+        assert_eq!(e.row_text(1), "two");
+        e.feed(b"\x1b[2;1HTWO");
+        assert_eq!((e.row_text(0), e.row_text(1)), ("one".into(), "TWO".into()));
+        e.start_selection(SelectionType::Simple, e.grid_point(0, 0), Side::Left);
+        e.update_selection(e.grid_point(0, 2), Side::Right);
+        assert!(e.line(0)[1].selected);
+        e.clear_selection();
+        assert!(!e.line(0)[1].selected);
+        e.resize(6, 3);
+        assert_eq!(e.line(0).len(), 6);
+    }
+
+    #[test]
+    fn a_cell_keeps_its_whole_grapheme_cluster() {
+        let mut e = emu(20, 2);
+        e.feed("e\u{301}x🇺🇦👍🏽".as_bytes());
+        let line = e.line(0);
+        assert_eq!((line[0].ch, line[0].cluster.as_deref()), ('e', Some("e\u{301}")));
+        assert_eq!(line[1].cluster, None);
+        assert_eq!(line[2].cluster.as_deref(), Some("🇺🇦"));
+        assert_eq!(line[4].cluster.as_deref(), Some("👍🏽"));
+    }
+
+    #[test]
     fn plain_text_lands_on_row_zero() {
         let mut e = emu(20, 5);
         e.feed(b"hello");
@@ -522,7 +579,7 @@ mod tests {
         // After reset: defaults.
         assert_eq!(line[4].fg, CellColor::Foreground);
         // Bold + blue background segment starts at col 10 ("red plain " = 10).
-        let bold_cell = line[10];
+        let bold_cell = &line[10];
         assert!(bold_cell.bold);
         assert_eq!(bold_cell.bg, CellColor::Indexed(4));
     }
@@ -541,13 +598,13 @@ mod tests {
     fn inverse_and_hidden_resolve_in_display_colors() {
         let mut e = emu(10, 2);
         e.feed(b"\x1b[7mI\x1b[0m\x1b[8mH");
-        let inv = e.line(0)[0];
+        let inv = e.line(0)[0].clone();
         assert!(inv.inverse);
         assert_eq!(
             inv.display_colors(),
             (CellColor::Background, CellColor::Foreground)
         );
-        let hid = e.line(0)[1];
+        let hid = e.line(0)[1].clone();
         assert!(hid.hidden);
         let (fg, bg) = hid.display_colors();
         assert_eq!(fg, bg, "hidden text paints foreground as background");
@@ -674,6 +731,16 @@ mod tests {
         assert_eq!(e.rows(), 3);
         assert_eq!(e.row_text(0), "keepme");
         assert_eq!(e.row_text(1), "second");
+    }
+
+    #[test]
+    fn resize_clips_rows_instead_of_rewrapping_them() {
+        // herdr's frames place every row with CUP; its repaint at the new size follows the resize
+        let mut e = emu(6, 3);
+        e.feed(b"\x1b[1;1Habcdef\x1b[2;1Hgh");
+        e.resize(4, 3);
+        assert_eq!((e.row_text(0).as_str(), e.row_text(1).as_str()), ("abcd", "gh"));
+        assert!(e.term.mode(Mode::WRAPAROUND).unwrap());
     }
 
     #[test]

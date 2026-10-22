@@ -22,7 +22,6 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 mod attention;
-mod client_shell;
 mod discover;
 mod divider;
 mod floating;
@@ -46,6 +45,7 @@ mod hints;
 mod key_actions;
 mod tab_bar;
 mod tree_drag;
+mod web;
 pub(crate) mod widgets;
 mod workspaces;
 use motion::*;
@@ -264,10 +264,14 @@ pub struct Shell {
     /// The window's frame not saved yet, and the save it waits for: half a second after the last move, closing or quitting.
     frame: Option<WindowFrame>,
     frame_save: gpui::Task<()>,
+    /// Lets the panes' grids go 120 ms after the window last changed size (`GridHold` while it does).
+    resize_hold: gpui::Task<()>,
     /// Since when each agent has had its status: how long the waiting ones have waited.
     since: crate::model::Since,
     /// The loop that keeps the window in step with herdr; replacing it (a switch of session) stops the last one.
     sync: gpui::Task<()>,
+    /// Wakes the sync loop for a fresh snapshot without an event: a command named a tab or pane herdr no longer has.
+    resync: std::sync::Arc<tokio::sync::Notify>,
     /// herdr's popup over the panes, and the client shell that hears of it.
     floating: Option<floating::Floating>,
     popup_watch: gpui::Task<()>,
@@ -281,8 +285,6 @@ pub struct Shell {
     pane_images: crate::herdr::graphics::PaneImages,
     /// Images no pane shows any more: freed from the window's atlas at the next render (a hidden pane never renders).
     retired_images: Vec<std::sync::Arc<gpui::RenderImage>>,
-    /// PoC: the window's herdr client shell for theme, popup and commands (`SHEPHERD_CLIENT_SHELL=1`).
-    client_shell: Option<client_shell::ShellView>,
     /// herdr's `[[keys.command]]` ids for `command.invoke`, with their keys, from the client shell.
     herdr_commands: Vec<(String, Vec<String>)>,
     /// Panes `[[keys.command]]` of `type = "pane"` opened, by the command's keys: pressed again in their tab, the
@@ -290,6 +292,22 @@ pub struct Shell {
     command_panes: Vec<(Vec<String>, String)>,
     /// herdr's sessions and machines, in the sidebar's tree order.
     places: Vec<sessions::Place>,
+    /// A two-finger swipe over the sidebar in progress (the sessions bar).
+    swipe: Option<sessions::Swipe>,
+    /// The workspace list springing home from this offset since then, after a swipe, beside the place it left.
+    slide: Option<(f32, Instant, Option<sessions::Place>)>,
+    /// The bar's row of places, when it overflows.
+    places_scroll: gpui::ScrollHandle,
+    /// Where the bar's lit square was last kept in view: it is scrolled to again only when it moves.
+    lit_seen: Cell<f32>,
+    /// The bar's row gliding from one scroll offset to another since then, to keep the lit square in its middle.
+    bar_glide: Cell<Option<(f32, f32, Instant)>>,
+    /// Where the bar was painted: a swipe there scrolls the bar, not to the next place.
+    bar_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The bar's buttons sliding to their slots, and the one being dragged.
+    place_motion: Rc<std::cell::RefCell<sessions::PlaceMotion>>,
+    /// Web integrations' pages, and the one shown in place of the tabs and panes.
+    pages: web::Pages,
     /// A place's menu in the sidebar's tree, and where it was clicked.
     place_menu: Option<crate::ui::Popup<(sessions::Place, gpui::Point<Pixels>)>>,
     /// The Edit dialog of a place's name and icon.
@@ -475,6 +493,18 @@ impl Shell {
                         cx.background_executor().timer(Duration::from_millis(500)).await;
                         let _ = this.update(cx, |s, cx| s.save_frame(cx));
                     });
+                    // a live resize reflows the panes as a divider drag does, not one SIGWINCH per frame
+                    cx.set_global(GridHold(true));
+                    s.resize_hold = cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(Duration::from_millis(120)).await;
+                        let _ = this.update(cx, |s, cx| {
+                            // a drag or the sidebar's fold owns the hold now
+                            if s.divider.is_none() && !s.sidebar_drag && !s.panel_drag && s.sidebar_motion.is_none() {
+                                cx.set_global(GridHold(false));
+                                cx.refresh_windows();
+                            }
+                        });
+                    });
                 })
                 .detach();
                 cx.on_app_quit(|s: &mut Shell, cx| {
@@ -612,6 +642,14 @@ impl Shell {
                     review_log: None,
                     review_page: None,
                     review_swipe: None,
+                    swipe: None,
+                    slide: None,
+                    places_scroll: gpui::ScrollHandle::new(),
+                    bar_bounds: Default::default(),
+                    place_motion: Default::default(),
+                    lit_seen: Cell::new(-1.),
+                    bar_glide: Cell::new(None),
+                    pages: Default::default(),
                     review_spring: None,
                     review_expanded: false,
                     review_body_h: Default::default(),
@@ -644,8 +682,10 @@ impl Shell {
                     badge: 0,
                     frame: None,
                     frame_save: gpui::Task::ready(()),
+                    resize_hold: gpui::Task::ready(()),
                     since: Default::default(),
                     sync: gpui::Task::ready(()),
+                    resync: Default::default(),
                     floating: None,
                     popup_watch: gpui::Task::ready(()),
                     popup_surface: None,
@@ -653,7 +693,6 @@ impl Shell {
                     own_focus: Vec::new(),
                     pane_images: Default::default(),
                     retired_images: Vec::new(),
-                    client_shell: None,
                     herdr_commands: Vec::new(),
                     command_panes: Vec::new(),
                     places: Vec::new(),
@@ -722,9 +761,16 @@ impl Shell {
 
     /// Follows herdr over `self.client` from scratch: its snapshot and the subscription that refreshes it.
     fn connect(&mut self, cx: &mut Context<Self>) {
-        let (client, rt) = (self.client.clone(), self.rt.clone());
+        let (client, rt, resync) = (self.client.clone(), self.rt.clone(), self.resync.clone());
+        if crate::mock::dir().is_some() {
+            // the fixture: its one snapshot (sync_loop), no popups, no pane queries
+            self.sync = cx.spawn(async move |this, cx| sync_loop(this, rt, client, resync, cx).await);
+            self.floating = None;
+            self.popup_watch = gpui::Task::ready(());
+            return;
+        }
         cx.set_global(PaneQueries(client.clone(), rt.clone()));
-        self.sync = cx.spawn(async move |this, cx| sync_loop(this, rt, client, cx).await);
+        self.sync = cx.spawn(async move |this, cx| sync_loop(this, rt, client, resync, cx).await);
         self.floating = None;
         // the last session's popup watch stops with its loop, which never gets to clear its surface: done here,
         // before keys could go through it to the same pane id in the last session
@@ -732,11 +778,7 @@ impl Shell {
         if cx.has_global::<crate::terminal::pane::TypingShell>() {
             cx.remove_global::<crate::terminal::pane::TypingShell>();
         }
-        self.popup_watch = if crate::herdr::client_shell::enabled() {
-            cx.spawn(async move |this, cx| client_shell::shell_loop(this, cx).await)
-        } else {
-            cx.spawn(async move |this, cx| floating::popup_loop(this, cx).await)
-        };
+        self.popup_watch = cx.spawn(async move |this, cx| floating::popup_loop(this, cx).await);
     }
 
     fn toggle_settings_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -937,8 +979,13 @@ impl Shell {
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut Shell, &serde_json::Value, &mut Context<Shell>) + 'static,
     ) {
+        if crate::mock::dir().is_some() {
+            return; // a fixture takes no commands
+        }
         self.send_then(command, cx, |shell, result, cx| match result {
             Ok(value) => then(shell, &value, cx),
+            // the window was behind herdr (a tab closed elsewhere, a double click): catch up instead of complaining
+            Err(err) if stale(&err) => shell.resync.notify_one(),
             Err(err) => crate::ui::toast::error(cx, format!("{err:#}")),
         });
     }
@@ -1029,6 +1076,10 @@ impl Shell {
     }
 
     fn pane_command(&mut self, window: &Window, cx: &mut Context<Self>, make: impl FnOnce(String) -> Command) {
+        // a page shown hides the panes: nothing unseen is split or closed
+        if self.pages.shown.is_some() {
+            return;
+        }
         self.show_terminals(cx);
         if let Some(pane_id) = self.active_pane(window, cx) {
             self.send(make(pane_id), cx, |_, _, _| {});
@@ -1036,11 +1087,10 @@ impl Shell {
     }
 
     /// herdr paints the terminals' default colors itself: it is told the theme's over the popup watch, which then
-    /// is the client in front again (back from herdr's TUI on another machine, say). The client shell (PoC) does
-    /// this in `sync_client_shell`.
+    /// is the client in front again (back from herdr's TUI on another machine, say).
     fn push_host_theme(&self, cx: &App) {
         if let Some((surface, _)) = &self.popup_surface {
-            surface.theme(client_shell::host_theme(Theme::of(cx)));
+            surface.theme(floating::host_theme(Theme::of(cx)));
         }
     }
 
@@ -1061,10 +1111,13 @@ impl Shell {
     /// A `[[keys.command]]` of herdr's config, for the pane you are in.
     fn run_herdr_command(&mut self, command: &crate::herdr::keys::HerdrCommand, window: &Window, cx: &mut Context<Self>) {
         let pane_id = self.active_pane(window, cx);
-        let Some(focused) = self.focus_shown_tab(cx) else { return self.run_herdr_command_in(command, pane_id, cx) };
-        let command = command.clone();
+        // herdr gives a popup to the tab in its focus as the popup opens, and only a client shell on that tab gets it:
+        // herdr's focus moves to the tab shown first, so a popup the command opens comes to this window
+        let Some(tab) = self.shown_tab() else { return self.run_herdr_command_in(command, pane_id, cx) };
+        let (client, command) = (self.client.clone(), command.clone());
+        let focused = self.rt.spawn(async move { client.call("tab.focus", json!({"tab_id": tab.tab_id})).await });
         cx.spawn(async move |this, cx| {
-            focused.await;
+            let _ = focused.await;
             let _ = this.update(cx, |s, cx| s.run_herdr_command_in(&command, pane_id, cx));
         })
         .detach();
@@ -1228,6 +1281,11 @@ impl Shell {
     }
 }
 
+/// herdr's answer to a command on something it no longer has (`tab_not_found: …`, `pane_not_found: …`).
+fn stale(err: &anyhow::Error) -> bool {
+    err.to_string().split(':').next().is_some_and(|code| code.ends_with("_not_found"))
+}
+
 /// Keep views of the `kept` panes; focus is forgotten with its view so a recreated one gets keyboard focus again.
 fn prune<S>(surfaces: &mut HashMap<String, S>, focused: &mut Option<String>, kept: &[String], exited: impl Fn(&S) -> bool) {
     surfaces.retain(|id, s| kept.contains(id) && !exited(s));
@@ -1236,8 +1294,9 @@ fn prune<S>(surfaces: &mut HashMap<String, S>, focused: &mut Option<String>, kep
     }
 }
 
-/// How many panes keep their views once their tab is hidden: each holds a herdr session that keeps streaming.
-const KEPT_PANES: usize = 24;
+/// How many panes keep their views once their tab is hidden: each holds a herdr session that keeps streaming, and
+/// herdr renders every one of them (24 kept two fifths of herdr's CPU busy on panes out of sight).
+const KEPT_PANES: usize = 6;
 
 /// Puts the `shown` panes first in `recent`, drops panes herdr no longer has, and keeps the newest `KEPT_PANES`:
 /// switching back to a recent tab shows its panes at once instead of attaching to herdr again.
@@ -1430,7 +1489,6 @@ impl Render for Shell {
         let toasts = crate::ui::toast::stack(&theme, TITLEBAR_HEIGHT + 8., window, cx);
         let tab = self.shown_tab();
         self.shown_workspace = tab.as_ref().map(|t| t.workspace_id.clone());
-        self.sync_client_shell(window, cx);
         self.follow_shown_tab();
         let (mut frames, mut splits) = match (&snapshot, &tab) {
             (Some(s), Some(t)) => (s.pane_frames(&t.tab_id), s.split_frames(&t.tab_id)),
@@ -1481,11 +1539,17 @@ impl Render for Shell {
             if !self.panes.contains_key(&f.pane_id) {
                 let id = f.pane_id.clone();
                 let images = self.pane_images.get(&id).cloned().unwrap_or_default();
-                self.panes.insert(id.clone(), cx.new(|cx| {
-                    let mut pane = PaneTerminal::new(id, cx);
+                let pane = cx.new(|cx| {
+                    let mut pane = PaneTerminal::new(id.clone(), cx);
                     pane.set_images(images, cx);
                     pane
-                }));
+                });
+                // the reader's "Open in editor": a tab of Shepherd's own editor
+                cx.subscribe_in(&pane, window, |s: &mut Shell, _, e: &crate::terminal::pane::OpenFile, window, cx| {
+                    s.open_file(e.path.clone(), e.line, false, window, cx)
+                })
+                .detach();
+                self.panes.insert(id, pane);
             }
             // a parked pane shown again attaches, to the session the window's socket names by now
             if let Some(pane) = self.panes.get(&f.pane_id).filter(|p| p.read(cx).is_parked()) {
@@ -1543,10 +1607,19 @@ impl Render for Shell {
             window.request_animation_frame();
         }
 
-        let sidebar = self.render_sidebar(&theme, &snapshot, &shown_ws, &shown_tab, window, cx);
+        let covered = self.overlay_open(cx);
+        self.sync_pages(covered, window, cx);
+        let web = self.shown_page(cx);
+        // a page in place of the tabs: no workspace looks selected
+        let sidebar_ws = if web.is_some() { None } else { shown_ws.clone() };
+        let sidebar = self.render_sidebar(&theme, &snapshot, &sidebar_ws, &shown_tab, window, cx);
         let (docked, peeking) = if sidebar_w > 0. { (Some(sidebar), None) } else { (None, Some(sidebar)) };
 
         let tabbar = self.render_tab_bar(&theme, shown_ws.clone(), shown_tab.clone(), sidebar_w, window, cx);
+        let (tabbar, web_area) = match &web {
+            Some((key, entry)) => (self.render_web_bar(key, entry, &theme, sidebar_w, cx), Some(self.render_web_area(key, &theme, window, cx))),
+            None => (tabbar, None),
+        };
 
         // A file tab shown: its view in the grid's place. The panes are not drawn, so they are not laid out either
         // and keep their size (herdr's PTYs are not resized); their views stay, as a hidden tab's do.
@@ -1608,7 +1681,8 @@ impl Render for Shell {
                             }),
                         )
                         .child(
-                            div().size_full().relative().child(pane.clone()).when(focused, |el| {
+                            // cached: a frame the pane did not cause (a spinner, a hover elsewhere) reuses its grid
+                            div().size_full().relative().child(pane.clone().cached(gpui::StyleRefinement::default().size_full())).when(focused, |el| {
                                 // ponytail: overlay, not a border on the container, which shrank the grid by 1px
                                 el.child(div().absolute().inset_0().border_1().border_color(ring))
                             }),
@@ -1787,7 +1861,7 @@ impl Render for Shell {
                 if this.close_shown_file_tab(window, cx) {
                     return;
                 }
-                if let Some(tab) = this.shown_tab() {
+                if let Some(tab) = this.shown_tab().filter(|_| this.pages.shown.is_none()) {
                     this.send(Command::CloseTab { tab_id: tab.tab_id }, cx, |_, _, _| {});
                 }
             }))
@@ -1926,7 +2000,10 @@ impl Render for Shell {
             })
             .map(|el| match settings_page {
                 Some(page) => el.child(page),
-                None => el.child(div().flex_1().min_w_0().h_full().flex().flex_col().child(tabbar).child(grid).children(statusbar)),
+                None => el.child(div().flex_1().min_w_0().h_full().flex().flex_col().child(tabbar).map(|el| match web_area {
+                    Some(area) => el.child(area),
+                    None => el.child(grid),
+                }).children(statusbar)),
             })
             .children(panel.into_iter().flatten())
             // The sidebar closed: the window's left edge brings it out floating over the panes, as Arc's does.
@@ -1941,8 +2018,9 @@ impl Render for Shell {
                         .w(px(6.))
                         .on_hover(cx.listener(|this, on: &bool, _, cx| this.hover_peek(*on, cx))),
                 )
+                // deferred: drawn above a web page, which sits above the rest
                 .when(peek > 0., |el| {
-                    el.child(
+                    el.child(gpui::deferred(
                         div()
                             .id("sidebar-peek")
                             .occlude()
@@ -1960,7 +2038,7 @@ impl Render for Shell {
                             .shadow_lg()
                             .on_hover(cx.listener(|this, on: &bool, _, cx| this.hover_peek(*on, cx)))
                             .children(peeking),
-                    )
+                    ))
                 })
             })
             // The sidebar's edge: drag to resize, double-click for the default width.
@@ -2061,9 +2139,17 @@ impl Render for Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::{KEPT_PANES, prune, remember_shown};
+    use super::{KEPT_PANES, prune, remember_shown, stale};
     use crate::model::{Frac, PaneFrame};
     use std::collections::HashMap;
+
+    #[test]
+    fn a_vanished_target_is_stale_other_errors_are_not() {
+        assert!(stale(&anyhow::anyhow!("tab_not_found: tab wAB:t1P not found")));
+        assert!(stale(&anyhow::anyhow!("pane_not_found: pane  not found")));
+        assert!(!stale(&anyhow::anyhow!("herdr is not reachable at /tmp/herdr.sock")));
+        assert!(!stale(&anyhow::anyhow!("invalid_params: not_found in a message")));
+    }
 
     fn shown(ids: &[&str]) -> Vec<PaneFrame> {
         let frame = Frac { x: 0.0, y: 0.0, w: 1.0, h: 1.0 };

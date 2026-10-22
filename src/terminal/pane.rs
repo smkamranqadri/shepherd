@@ -68,13 +68,7 @@ pub fn claim(cx: &mut App) {
     }
 }
 
-/// Shepherd's client shell (PoC, `SHEPHERD_CLIENT_SHELL=1`): herdr's popup is shown from it instead of an attach.
-pub struct ShellConnection(pub std::sync::Arc<crate::herdr::client_shell::ClientShell>);
-
-impl gpui::Global for ShellConnection {}
-
-/// The window's popup watch, which also carries typing to the panes it shows (see [`Surface::type_into`]), and the
-/// client socket it was made on: pane ids repeat across sessions, so it types only into the session it watches.
+/// The window's popup watch, which also carries typing to the panes it shows (see [`Surface::type_into`]).
 ///
 /// [`Surface::type_into`]: crate::herdr::popup::Surface::type_into
 pub struct TypingShell(pub std::sync::Arc<crate::herdr::popup::Surface>, pub PathBuf);
@@ -262,6 +256,8 @@ pub struct PaneTerminal {
     hover_cell: Option<(u16, u16)>,
     /// The image a Cmd+click opened, in a dialog over the window until Esc, Space or a click outside it.
     preview: Option<Popup<Preview>>,
+    /// The Markdown file a Cmd+click opened, rendered in a dialog over the window until Esc or a click outside it.
+    reader: Option<Popup<Reader>>,
     /// Always attaches by taking the terminal over (herdr's popup: whichever window shows it types into it).
     pub takes_over: bool,
     /// Kitty images herdr shows on the pane (from the window's client shell), drawn over the grid.
@@ -325,6 +321,7 @@ impl PaneTerminal {
             hover: None,
             hover_cell: None,
             preview: None,
+            reader: None,
             takes_over: false,
             images: Vec::new(),
             parked: false,
@@ -419,13 +416,8 @@ impl PaneTerminal {
         {
             self.attaches += 1;
         }
-        // herdr's popup comes with the client shell's surface, when there is one
-        if let Some(ShellConnection(shell)) = cx.try_global::<ShellConnection>().filter(|_| self.takes_over) {
-            let (session, rx) = Session::over_popup(shell.clone(), &self.pane_id);
-            self.session = Some(session);
-            self.ended = None;
-            self._pump = Some(cx.spawn(async move |this, cx| pump(this, rx, cx).await));
-            return;
+        if crate::mock::pane_text(&self.pane_id).is_some() {
+            return; // the fixture's text is laid out by `on_grid_metrics`; there is no herdr to attach to
         }
         let (cols, rows) = (self.emulator.cols() as u16, self.emulator.rows() as u16);
         let px = self.geometry.map_or((0, 0), |g| g.cell_px);
@@ -494,16 +486,32 @@ impl PaneTerminal {
             self.refresh_scroll(cx);
         }
         let first = self.geometry.is_none();
+        // `SHEPHERD_READER=<file>`: the first pane laid out opens it as a Cmd+click does (screenshots)
+        static READER_HOOK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if first && let Some(path) = std::env::var("SHEPHERD_READER").ok().filter(|_| !READER_HOOK.swap(true, std::sync::atomic::Ordering::Relaxed)) {
+            self.open_link(Link::File { path, line: None, col: None }, cx);
+        }
         let rescaled = self.geometry.is_some_and(|g| g.cell_px != geometry.cell_px);
         let (cols, rows) = (geometry.cols, geometry.rows);
-        // a client shell's popup is sized by herdr (`SessionEvent::Size`), not by its view
-        let sized_by_herdr = self.session.as_ref().is_some_and(Session::is_shell);
-        let resized = !sized_by_herdr && (self.emulator.cols() != cols as usize || self.emulator.rows() != rows as usize);
+        let resized = self.emulator.cols() != cols as usize || self.emulator.rows() != rows as usize;
         let held = cx.try_global::<GridHold>().is_some_and(|hold| hold.0);
+        // the scrollbar follows the pane every frame, not the grid it held back
+        self.scrollbar.0.bounds.set(geometry.bounds);
         if !first && resized && held && self.resized_at.is_some_and(|at| at.elapsed() < HELD_RESIZE) {
             return; // a drag is under way and the grid just reflowed: the next frame (or the drop) catches up
         }
         self.geometry = Some(geometry);
+        // the fixture's text (`SHEPHERD_MOCK`), laid out afresh at every size: there is no herdr to redraw it
+        if let Some(text) = crate::mock::pane_text(&self.pane_id) {
+            if first || resized {
+                self.emulator = Emulator::new(cols, rows);
+                self.emulator.feed(&text);
+                // ponytail: an Instant a day ahead never comes due, so no loader covers the fixture
+                self.attaching = std::time::Instant::now() + std::time::Duration::from_secs(86_400);
+                cx.notify();
+            }
+            return;
+        }
         if resized {
             self.leave_history(); // the copy is wrapped at the old width
             self.emulator.resize(cols, rows);
@@ -586,8 +594,7 @@ impl PaneTerminal {
             cx.notify();
             return None;
         }
-        let shell = self.session.as_ref().is_some_and(Session::is_shell);
-        let local = delta > 0 && self.scroll.offset_from_bottom == 0 && !self.mouse_capture && !self.emulator.alt_screen() && !shell;
+        let local = delta > 0 && self.scroll.offset_from_bottom == 0 && !self.mouse_capture && !self.emulator.alt_screen();
         let Some(PaneQueries(client, rt)) = cx.try_global::<PaneQueries>().filter(|_| local) else { return Some(delta) };
         self.history_pending = Some(delta);
         let (client, pane_id) = (client.clone(), self.pane_id.clone());
@@ -822,41 +829,154 @@ impl PaneTerminal {
 
     fn update_hover(&mut self, cmd: bool, cx: &mut Context<Self>) {
         // No links under the image dialog: Cmd, still held from the click that opened it, would point at them.
-        let hover = self.pointer.filter(|_| cmd && self.preview.is_none()).and_then(|p| self.link_under(p)).map(|(row, cells, _)| (row, cells));
+        let hover = self.pointer.filter(|_| cmd && self.preview.is_none() && self.reader.is_none()).and_then(|p| self.link_under(p)).map(|(row, cells, _)| (row, cells));
         if hover != self.hover {
             self.hover = hover;
             cx.notify();
         }
     }
 
-    /// URLs go to the browser (`file://` ones to their default app); paths that exist (relative to the pane's shell) to the editor;
-    /// images, either way, to the viewer over the pane.
+    /// URLs go to the browser (`file://` ones to their default app); paths that exist where the pane's shell runs
+    /// (here, or on the machine shown) to the editor; images, either way, to the viewer over the pane, and Markdown
+    /// files to the reader (its header opens them in the editor).
     fn open_link(&mut self, link: Link, cx: &mut Context<Self>) {
         let (path, line, col) = match link {
             // `ls --hyperlink` percent-encodes the path (a space is `%20`).
-            Link::Url(url) => match url.strip_prefix("file://").map(|p| PathBuf::from(percent_encoding::percent_decode_str(p).decode_utf8_lossy().as_ref())).filter(|p| is_image(p)) {
-                Some(path) => return self.show_preview(path, cx),
+            Link::Url(url) => match url
+                .strip_prefix("file://")
+                .map(|p| percent_encoding::percent_decode_str(p).decode_utf8_lossy().into_owned())
+                .filter(|p| is_image(Path::new(p)) || is_markdown(Path::new(p)))
+            {
+                Some(path) => (path, None, None),
                 None => return cx.open_url(&url),
             },
             Link::File { path, line, col } => (path, line, col),
         };
         let Some(PaneQueries(client, rt)) = cx.try_global::<PaneQueries>() else { return };
         let editor = cx.try_global::<crate::settings::SettingsGlobal>().and_then(|s| s.settings.editor.clone());
+        let machine = crate::herdr::shown_machine();
         let (client, pane_id) = (client.clone(), self.pane_id.clone());
         let opened = rt.spawn(async move {
             let cwd = pane_cwd(&client, &pane_id).await;
-            let path = resolve(&path, Path::new(&cwd))?;
-            if is_image(&path) {
-                return Some(Ok(path));
+            let file = File::find(machine, &path, &cwd).await?;
+            if is_image(&file.path) {
+                return file.local_copy().await.map(Opened::Image);
             }
-            open_at(&client, editor, &path, line, col, Some((&pane_id, &cwd))).await.err().map(Err)
+            if !file.dir && is_markdown(&file.path) {
+                let text = String::from_utf8_lossy(&file.bytes().await?).into_owned();
+                let blocks = crate::ui::review::markdown(&text);
+                return Some(Opened::Markdown { file, cwd, text, blocks });
+            }
+            open_at(&client, editor, &file, line, col, Some((&pane_id, &cwd))).await.err().map(Opened::Failed)
         });
         cx.spawn(async move |this, cx| match opened.await {
-            Ok(Some(Ok(path))) => drop(this.update(cx, |pane, cx| pane.show_preview(path, cx))),
-            Ok(Some(Err(why))) => cx.update(|cx| crate::ui::toast::error(cx, why)),
+            Ok(Some(Opened::Image(path))) => drop(this.update(cx, |pane, cx| pane.show_preview(path, cx))),
+            Ok(Some(Opened::Markdown { file, cwd, text, blocks })) => drop(this.update(cx, |pane, cx| pane.show_reader(file, cwd, text, blocks, cx))),
+            Ok(Some(Opened::Failed(why))) => cx.update(|cx| crate::ui::toast::error(cx, why)),
             _ => {}
         })
         .detach();
+    }
+
+    fn show_reader(&mut self, file: File, cwd: String, text: String, blocks: Vec<crate::ui::review::Block>, cx: &mut Context<Self>) {
+        let opened = std::time::Instant::now();
+        let reader = Reader { file, cwd, text, blocks, images: Default::default(), scroll: gpui::ScrollHandle::new(), opened, copied: false };
+        self.reader = Some(Popup::new(reader));
+        self.hover = None;
+        self.load_images(cx);
+        cx.notify();
+    }
+
+    /// Fetches the reader's images into files here, a machine's over SSH and a web one over HTTPS, and shows each
+    /// set as it arrives; until then their alt text stands in.
+    fn load_images(&mut self, cx: &mut Context<Self>) {
+        let Some(r) = self.reader.as_ref().map(|r| &r.value) else { return };
+        let mut sources = Vec::new();
+        image_sources(&r.blocks, &mut sources);
+        let Some(PaneQueries(_, rt)) = cx.try_global::<PaneQueries>().filter(|_| !sources.is_empty()) else { return };
+        let (dir, machine, opened) = (r.file.path.parent().map(Path::to_path_buf).unwrap_or_default(), r.file.machine.clone(), r.opened);
+        // ponytail: one image after another; in parallel if a page with many over SSH ever loads slowly
+        let loaded = rt.spawn(async move {
+            let mut images = std::collections::HashMap::new();
+            for source in sources {
+                let path = if source.starts_with("https://") || source.starts_with("http://") {
+                    download(&source).await
+                } else {
+                    let path = dir.join(percent_encoding::percent_decode_str(&source).decode_utf8_lossy().as_ref());
+                    File { path, dir: false, machine: machine.clone() }.local_copy().await
+                };
+                if let Some(path) = path {
+                    images.insert(source, path);
+                }
+            }
+            images
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(images) = loaded.await else { return };
+            let _ = this.update(cx, |pane, cx| {
+                if let Some(reader) = pane.reader.as_mut().filter(|r| r.value.opened == opened) {
+                    reader.value.images = std::sync::Arc::new(images);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// A link clicked in the reader (the web's open in the browser, in `ui::markdown`): a file, from the document's
+    /// folder and inside the root `ui::markdown` allows, opened as a Cmd+click opens it (another Markdown file in
+    /// the reader, `#L12` at its line). A `#heading` goes nowhere.
+    fn follow_link(&mut self, link: crate::ui::markdown::Link, cx: &mut Context<Self>) {
+        if let crate::ui::markdown::Link::File { path, fragment } = link {
+            let line = fragment.as_deref().and_then(crate::ui::markdown::fragment_line);
+            self.open_link(Link::File { path: path.to_string_lossy().into_owned(), line, col: None }, cx);
+        }
+    }
+
+    fn close_reader(&mut self, cx: &mut Context<Self>) {
+        if let Some(reader) = &mut self.reader {
+            reader.close();
+            crate::ui::markdown::forget_reader();
+            cx.notify();
+        }
+    }
+
+    /// The reader's Markdown to the clipboard, the button checked for a moment.
+    fn copy_reader(&mut self, cx: &mut Context<Self>) {
+        let Some(reader) = self.reader.as_mut() else { return };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(reader.value.text.clone()));
+        reader.value.copied = true;
+        let opened = reader.value.opened;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+            let _ = this.update(cx, |pane, cx| {
+                if let Some(reader) = pane.reader.as_mut().filter(|r| r.value.opened == opened) {
+                    reader.value.copied = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The reader's file in the editor: a file here in a tab of Shepherd's own editor; a machine's in the user's editor
+    /// over its SSH remoting.
+    fn edit_reader(&mut self, cx: &mut Context<Self>) {
+        let Some((file, cwd)) = self.reader.as_ref().map(|r| (r.value.file.clone(), r.value.cwd.clone())) else { return };
+        self.close_reader(cx);
+        if file.machine.is_none() {
+            cx.emit(OpenFile { path: file.path, line: None });
+            return;
+        }
+        let Some(PaneQueries(client, rt)) = cx.try_global::<PaneQueries>() else { return };
+        let editor = cx.try_global::<crate::settings::SettingsGlobal>().and_then(|s| s.settings.editor.clone());
+        let (client, pane_id) = (client.clone(), self.pane_id.clone());
+        rt.spawn(async move {
+            if let Err(why) = open_at(&client, editor, &file, None, None, Some((&pane_id, &cwd))).await {
+                eprintln!("shepherd: couldn't open {} in the editor: {why}", file.path.display());
+            }
+        });
     }
 
     fn show_preview(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -906,70 +1026,29 @@ impl PaneTerminal {
     /// or the header's buttons, and moved by scrolling or dragging. Zed's image viewer: no bounds, no glides.
     fn preview(&self, preview: &Popup<Preview>, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = &preview.value;
-        // Quick Look's entrance and exit: the card grows into place as it fades in, and shrinks a little leaving.
-        let opening = (preview.value.opened.elapsed().as_secs_f32() / PREVIEW_IN.as_secs_f32()).min(1.);
-        let closing = preview.closed_for().map_or(0., |d| (d.as_secs_f32() / 0.1).min(1.));
-        let grown = 0.9 + 0.1 * (1. - (1. - opening).powi(3)) - 0.04 * closing;
-        if opening < 1. {
-            window.request_animation_frame();
-        }
-        let frame = PreviewFrame::of(window, grown);
+        let frame = PreviewFrame::of(window, grown(preview, p.opened, window));
         let name = p.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let (w, h) = p.shown(&frame);
         let percent = format!("{:.0}%", p.scale(&frame) * 100.);
-        let button = |id: &'static str, icon: &'static str| {
-            div()
-                .id(id)
-                .flex_none()
-                .size(px(28.))
-                .rounded(px(8.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.hover))
-                .child(gpui::svg().path(icon).size(px(16.)).text_color(theme.text_muted))
-        };
-        let card = div()
-            .id("image-preview")
-            .w(px(frame.card.0))
-            .h(px(frame.card.1))
-            .p(px(PREVIEW_PAD))
-            .rounded(px(16.))
-            .bg(theme.card)
-            .border_1()
-            .border_color(theme.border)
-            .shadow_lg()
-            .flex()
-            .flex_col()
-            .gap(px(PREVIEW_GAP))
-            .text_color(theme.text)
+        let card = dialog_card("image-preview", &frame, theme)
             .on_mouse_down_out(cx.listener(|pane, _, _, cx| pane.close_preview(cx)))
             .child(
-                div()
-                    .h(px(PREVIEW_HEADER))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(2.))
-                    .pl(px(6.))
-                    .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).text_color(theme.text_muted).child(name))
-                    .child(button("image-zoom-out", "icons/minus.svg").on_click(cx.listener(|pane, _, window, cx| pane.zoom_preview(1. / ZOOM_STEP, None, window, cx))))
+                dialog_header(name, theme)
+                    .child(dialog_button("image-zoom-out", "icons/minus.svg", theme).on_click(cx.listener(|pane, _, window, cx| pane.zoom_preview(1. / ZOOM_STEP, None, window, cx))))
                     .child(
                         div()
                             .id("image-zoom-fit")
                             .flex_none()
-                            .w(px(48.))
+                            .w(px(40.))
                             .text_center()
-                            .text_size(px(12.))
+                            .text_size(px(11.))
                             .text_color(theme.text_muted)
                             .cursor_pointer()
                             .child(percent)
                             .on_click(cx.listener(|pane, _, window, cx| pane.zoom_preview(0., None, window, cx))),
                     )
-                    .child(button("image-zoom-in", "icons/plus.svg").on_click(cx.listener(|pane, _, window, cx| pane.zoom_preview(ZOOM_STEP, None, window, cx))))
-                    .child(div().w(px(1.)).h(px(16.)).mx(px(6.)).bg(theme.border))
-                    .child(button("image-preview-close", "icons/close.svg").on_click(cx.listener(|pane, _, _, cx| pane.close_preview(cx)))),
+                    .child(dialog_button("image-zoom-in", "icons/plus.svg", theme).on_click(cx.listener(|pane, _, window, cx| pane.zoom_preview(ZOOM_STEP, None, window, cx))))
+                    .child(dialog_button("image-preview-close", "icons/close.svg", theme).ml(px(6.)).on_click(cx.listener(|pane, _, _, cx| pane.close_preview(cx)))),
             )
             .child(
                 div()
@@ -977,7 +1056,7 @@ impl PaneTerminal {
                     .relative()
                     .flex_1()
                     .overflow_hidden()
-                    .rounded(px(8.))
+                    .rounded(px(6.))
                     .when(p.drag.is_some(), |el| el.cursor(gpui::CursorStyle::ClosedHand))
                     .on_pinch(cx.listener(|pane, e: &gpui::PinchEvent, window, cx| pane.zoom_preview(1. + e.delta, Some(e.position), window, cx)))
                     .on_scroll_wheel(cx.listener(|pane, e: &ScrollWheelEvent, window, cx| {
@@ -1033,6 +1112,77 @@ impl PaneTerminal {
         crate::shell::modal("image-preview", preview, window, card)
     }
 
+    /// The Markdown dialog: the image dialog's card with the file rendered in a column, scrolled.
+    fn reader(&self, reader: &Popup<Reader>, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let r = &reader.value;
+        let frame = PreviewFrame::of(window, grown(reader, r.opened, window));
+        let name = r.file.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let (images, pane) = (r.images.clone(), cx.entity().downgrade());
+        let look = crate::ui::markdown::Look { document: true, image: Some(std::rc::Rc::new(move |source: &str| images.get(source).cloned())) };
+        // links resolve from the file's folder, inside the pane's folder when the file is in it
+        let dir = r.file.path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let root = if r.file.path.starts_with(&r.cwd) { PathBuf::from(&r.cwd) } else { dir };
+        let links = crate::ui::markdown::Links::local(r.file.path.clone(), root, move |link, _: &mut Window, cx: &mut App| {
+            let _ = pane.update(cx, |pane, cx| pane.follow_link(link, cx));
+        });
+        let card = dialog_card("markdown-reader", &frame, theme)
+            .on_mouse_down_out(cx.listener(|pane, _, _, cx| pane.close_reader(cx)))
+            .child(
+                dialog_header(name, theme)
+                    .child(
+                        dialog_button("markdown-reader-copy", if r.copied { "icons/check.svg" } else { "icons/solar/copy.svg" }, theme)
+                            .on_click(cx.listener(|pane, _, _, cx| pane.copy_reader(cx))),
+                    )
+                    .child(
+                        div()
+                            .id("markdown-reader-edit")
+                            .flex_none()
+                            .h(px(22.))
+                            .px(px(8.))
+                            .rounded(px(6.))
+                            .flex()
+                            .items_center()
+                            .text_size(px(11.5))
+                            .text_color(theme.text_muted)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.hover).text_color(theme.text))
+                            .child("Open in editor")
+                            .on_click(cx.listener(|pane, _, _, cx| pane.edit_reader(cx))),
+                    )
+                    .child(dialog_button("markdown-reader-close", "icons/close.svg", theme).ml(px(4.)).on_click(cx.listener(|pane, _, _, cx| pane.close_reader(cx)))),
+            )
+            .child(
+                // the text fades where it scrolls under the edges, the app's overlay bar on the right
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(crate::ui::edge_fade::edge_faded(
+                        12.,
+                        &r.scroll,
+                        div().id("markdown-reader-body").flex_1().min_h_0().overflow_y_scroll().track_scroll(&r.scroll).child(
+                            div()
+                                .max_w(px(800.))
+                                .mx_auto()
+                                .px(px(24.))
+                                .pt(px(4.))
+                                .pb(px(24.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(12.))
+                                .text_size(px(14.))
+                                .line_height(px(22.))
+                                .child(crate::ui::markdown::frame_reset())
+                                .children(crate::ui::markdown::render_with(&r.blocks, crate::ui::markdown::READER_KEY, &links, theme, &look)),
+                        ),
+                    ))
+                    .child(crate::ui::scrollbar("markdown-reader-scrollbar", &r.scroll, theme)),
+            );
+        crate::shell::modal("markdown-reader", reader, window, card)
+    }
+
     /// A key as herdr's semantic event over the window's client shell (see [`TypingShell`]), which encodes it for
     /// the app's keyboard protocol; false: the pane is not one to type into that way (see [`Self::input`]).
     fn type_key(&mut self, event: PaneInput, cx: &mut Context<Self>) -> bool {
@@ -1086,6 +1236,17 @@ impl PaneTerminal {
         if ks.unparse() == crate::tap::VIRTUAL_PREFIX {
             return;
         }
+        // The reader takes the keys too: Esc closes it, Cmd+A (Ctrl+A off macOS) selects its text.
+        if self.reader.as_ref().is_some_and(Popup::is_open) {
+            let m = &ks.modifiers;
+            if ks.key == "escape" {
+                self.close_reader(cx);
+            } else if ks.key == "a" && if cfg!(target_os = "macos") { m.platform } else { m.control } {
+                crate::ui::markdown::select_all(crate::ui::markdown::READER_KEY);
+                cx.notify();
+            }
+            return;
+        }
         // The dialog takes the keys: Esc and Space (Quick Look's) close it, the rest go nowhere.
         if self.preview.as_ref().is_some_and(Popup::is_open) {
             if ks.key == "escape" || ks.key == "space" {
@@ -1112,8 +1273,6 @@ impl PaneTerminal {
             // ponytail: always bracketed; herdr's frames do not tell us whether the app asked for it.
             if let Some(item) = cx.read_from_clipboard() {
                 match item.text() {
-                    // the client shell brackets the paste as the app asked
-                    Some(text) if self.session.as_ref().is_some_and(|s| s.shell_input(vec![PaneInput::Paste(text.to_string())])) => {}
                     Some(text) => self.input(&paste_bytes(&text, true), cx),
                     // an image: ctrl-v, the key agent TUIs (Claude Code, Codex) read the clipboard's image on
                     None => self.input(b"\x16", cx),
@@ -1130,13 +1289,6 @@ impl PaneTerminal {
                     self.emulator.clear_selection();
                     cx.notify();
                 }
-                cx.stop_propagation();
-            }
-            return;
-        }
-        if let Some(session) = self.session.as_ref().filter(|s| s.is_shell()) {
-            if let Some(event) = crate::herdr::client_shell::key_event(&ks.key, ks.key_char.as_deref(), mods) {
-                session.shell_input(vec![event]);
                 cx.stop_propagation();
             }
             return;
@@ -1310,13 +1462,190 @@ pub struct Preview {
     opened: std::time::Instant,
 }
 
+/// Quick Look's entrance and exit for a dialog opened at `opened`: the card grows into place as it fades in, and
+/// shrinks a little leaving. 1 is in place.
+fn grown<T>(popup: &Popup<T>, opened: std::time::Instant, window: &Window) -> f32 {
+    let opening = (opened.elapsed().as_secs_f32() / PREVIEW_IN.as_secs_f32()).min(1.);
+    let closing = popup.closed_for().map_or(0., |d| (d.as_secs_f32() / 0.1).min(1.));
+    if opening < 1. {
+        window.request_animation_frame();
+    }
+    0.9 + 0.1 * (1. - (1. - opening).powi(3)) - 0.04 * closing
+}
+
+/// A Markdown file in the reader.
+pub struct Reader {
+    file: File,
+    /// The pane's shell's folder, where Neovim opens beside it.
+    cwd: String,
+    /// The file's Markdown, for the copy button.
+    text: String,
+    blocks: Vec<crate::ui::review::Block>,
+    /// The images fetched so far, by their source in the file.
+    images: std::sync::Arc<std::collections::HashMap<String, PathBuf>>,
+    scroll: gpui::ScrollHandle,
+    opened: std::time::Instant,
+    /// The copy button shows a check for a moment after a copy.
+    copied: bool,
+}
+
+/// The images' sources in `blocks`, each once, in document order.
+fn image_sources(blocks: &[crate::ui::review::Block], out: &mut Vec<String>) {
+    use crate::ui::review::Block;
+    let runs = |runs: &[crate::ui::review::InlineRun], out: &mut Vec<String>| {
+        for image in runs.iter().filter_map(|r| r.style.image.as_ref()) {
+            if !out.contains(&image.source) {
+                out.push(image.source.clone());
+            }
+        }
+    };
+    for block in blocks {
+        match block {
+            Block::Paragraph { runs: r } | Block::Heading { runs: r, .. } => runs(r, out),
+            Block::BlockQuote { children } => image_sources(children, out),
+            Block::List { items, .. } => items.iter().for_each(|item| image_sources(item, out)),
+            Block::Table { header, rows, .. } => header.iter().chain(rows.iter().flatten()).for_each(|cell| runs(cell, out)),
+            _ => {}
+        }
+    }
+}
+
+/// A web image, downloaded into the cache under the extension its type has (a badge's URL often has none).
+async fn download(url: &str) -> Option<PathBuf> {
+    let url = url.to_string();
+    let fetched = tokio::task::spawn_blocking(move || {
+        let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(15))).build().into();
+        let mut response = agent.get(&url).call().ok()?;
+        let kind = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+        let bytes = response.body_mut().with_config().limit(32 << 20).read_to_vec().ok()?;
+        let ext = ["svg", "png", "gif", "webp", "jpeg"].into_iter().find(|e| kind.contains(e)).unwrap_or("png");
+        Some((bytes, format!("image.{ext}")))
+    });
+    let (bytes, name) = fetched.await.ok()??;
+    cache_copy(&name, bytes).await
+}
+
+/// `bytes` as a file named `name` in the cache, under their hash: gpui keeps an image by its path, so a changed file
+/// needs a new one.
+// ponytail: copies pile up in the cache until it is cleared; prune by age if they ever matter.
+async fn cache_copy(name: &str, bytes: Vec<u8>) -> Option<PathBuf> {
+    let hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        h.finish()
+    };
+    let dir = crate::settings::cache_dir().join("files").join(format!("{hash:016x}"));
+    tokio::fs::create_dir_all(&dir).await.ok()?;
+    let copy = dir.join(name);
+    tokio::fs::write(&copy, bytes).await.ok()?;
+    Some(copy)
+}
+
+/// What a Cmd+click opens over the pane.
+enum Opened {
+    Image(PathBuf),
+    Markdown { file: File, cwd: String, text: String, blocks: Vec<crate::ui::review::Block> },
+    /// The editor could not be run: this for a toast.
+    Failed(String),
+}
+
+/// A clicked file where the pane's shell runs: here, or on the machine at `machine` (its SSH target).
+#[derive(Clone)]
+struct File {
+    path: PathBuf,
+    dir: bool,
+    machine: Option<String>,
+}
+
+impl File {
+    async fn find(machine: Option<String>, path: &str, cwd: &str) -> Option<File> {
+        let Some(target) = machine else {
+            let path = resolve(path, Path::new(cwd))?;
+            return Some(File { dir: path.is_dir(), path, machine: None });
+        };
+        let (t, path, cwd) = (target.clone(), path.to_string(), cwd.to_string());
+        let (found, dir) = tokio::task::spawn_blocking(move || crate::herdr::find_file(&t, &cwd, &path)).await.ok()??;
+        Some(File { path: PathBuf::from(found), dir, machine: Some(target) })
+    }
+
+    /// Its bytes, a machine's over SSH.
+    async fn bytes(&self) -> Option<Vec<u8>> {
+        let Some(target) = self.machine.clone() else { return tokio::fs::read(&self.path).await.ok() };
+        let path = self.path.to_string_lossy().into_owned();
+        tokio::task::spawn_blocking(move || crate::herdr::read_file(&target, &path)).await.ok()?.ok()
+    }
+
+    /// The file as one here for the image viewer: itself, or a machine's copied into the cache.
+    async fn local_copy(&self) -> Option<PathBuf> {
+        if self.machine.is_none() {
+            return Some(self.path.clone());
+        }
+        let name = self.path.file_name()?.to_string_lossy().into_owned();
+        cache_copy(&name, self.bytes().await?).await
+    }
+}
+
+/// A request for Shepherd to open `path` in a tab of its own editor, from a pane (the reader's header).
+pub struct OpenFile {
+    pub path: PathBuf,
+    pub line: Option<u32>,
+}
+
+impl gpui::EventEmitter<OpenFile> for PaneTerminal {}
+
 const MIN_ZOOM: f32 = 0.1;
 const MAX_ZOOM: f32 = 20.;
 const ZOOM_STEP: f32 = 1.25;
 const PREVIEW_IN: std::time::Duration = std::time::Duration::from_millis(220);
-const PREVIEW_PAD: f32 = 12.;
-const PREVIEW_HEADER: f32 = 28.;
-const PREVIEW_GAP: f32 = 10.;
+const PREVIEW_PAD: f32 = 8.;
+const PREVIEW_HEADER: f32 = 22.;
+const PREVIEW_GAP: f32 = 6.;
+
+/// The image dialog's card, `frame`'s size.
+fn dialog_card(id: &'static str, frame: &PreviewFrame, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .w(px(frame.card.0))
+        .h(px(frame.card.1))
+        .p(px(PREVIEW_PAD))
+        .rounded(px(12.))
+        .bg(theme.card)
+        .border_1()
+        .border_color(theme.border)
+        .shadow_lg()
+        .flex()
+        .flex_col()
+        .gap(px(PREVIEW_GAP))
+        .text_color(theme.text)
+}
+
+/// A dialog's header row: the file's name, then the controls added to it.
+fn dialog_header(name: String, theme: &Theme) -> gpui::Div {
+    div()
+        .h(px(PREVIEW_HEADER))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(2.))
+        .pl(px(6.))
+        .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(theme.text_muted).child(name))
+}
+
+/// A header's icon button, ghost until hovered.
+fn dialog_button(id: &'static str, icon: &'static str, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .size(px(22.))
+        .rounded(px(6.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.hover))
+        .child(gpui::svg().path(icon).size(px(14.)).text_color(theme.text_muted))
+}
 
 /// The dialog's geometry in a window: the card's size, its image frame's, and the frame's middle on the window.
 struct PreviewFrame {
@@ -1395,7 +1724,8 @@ pub fn open_in_editor(path: PathBuf, line: Option<u32>, col: Option<u32>, pane_i
             Some(id) => Some((pane_cwd(&client, &id).await, id)),
             None => None,
         };
-        open_at(&client, editor, &path, line, col, pane.as_ref().map(|(cwd, id)| (id.as_str(), cwd.as_str()))).await
+        let file = File { dir: path.is_dir(), path, machine: None };
+        open_at(&client, editor, &file, line, col, pane.as_ref().map(|(cwd, id)| (id.as_str(), cwd.as_str()))).await
     });
     cx.spawn(async move |cx| {
         if let Ok(Err(why)) = opened.await {
@@ -1476,12 +1806,21 @@ pub fn choose_opener(
 
 /// `open_in_editor`'s work, on the runtime: `pane` is the pane a terminal editor splits and the folder its new pane
 /// starts in. The error is for a toast.
-async fn open_at(client: &Client, editor: Option<String>, path: &Path, line: Option<u32>, col: Option<u32>, pane: Option<(&str, &str)>) -> Result<(), String> {
+async fn open_at(client: &Client, editor: Option<String>, file: &File, line: Option<u32>, col: Option<u32>, pane: Option<(&str, &str)>) -> Result<(), String> {
+    let path = file.path.as_path();
     let env_editor = std::env::var("VISUAL").ok().filter(|e| !e.trim().is_empty()).or_else(|| std::env::var("EDITOR").ok());
     let mac = cfg!(target_os = "macos");
-    match choose_opener(path, path.is_dir(), line, col, editor.as_deref(), env_editor.as_deref(), pane.is_some(), mac, &installed) {
+    match choose_opener(path, file.dir, line, col, editor.as_deref(), env_editor.as_deref(), pane.is_some(), mac, &installed) {
+        Opener::FileManager if file.machine.is_some() => Err("A folder on a machine has no file manager here".into()),
         Opener::FileManager => crate::platform::launch(&[crate::platform::OPEN.into(), path.into()]).await,
-        Opener::Gui(argv) => crate::platform::launch(&argv.into_iter().map(Into::into).collect::<Vec<_>>()).await,
+        Opener::Gui(argv) => {
+            // a machine's file opens over the editor's SSH remoting
+            let argv = match file.machine.as_deref() {
+                Some(host) => remote_argv(argv, host, line).ok_or("That editor can't open a machine's files: set Zed, VS Code or Cursor in Settings, or a terminal editor")?,
+                None => argv,
+            };
+            crate::platform::launch(&argv.into_iter().map(Into::into).collect::<Vec<_>>()).await
+        }
         Opener::Nothing => Err("No editor to open it in: set one in Settings, or install nvim or VS Code".into()),
         Opener::NeedsPane(editor) => {
             Err(format!("{editor} runs in a terminal: focus a pane to open it beside, or set a GUI editor in Settings"))
@@ -1503,9 +1842,32 @@ async fn open_at(client: &Client, editor: Option<String>, path: &Path, line: Opt
     }
 }
 
+/// `argv` (an editor's words, the target last) for a file on the machine at `host` (its SSH target): Zed takes an
+/// `ssh://` URL, VS Code, Cursor and their forks `--remote`; `None` for an editor without remoting.
+fn remote_argv(argv: Vec<String>, host: &str, line: Option<u32>) -> Option<Vec<String>> {
+    let host = host.trim_start_matches("ssh://");
+    let (target, words) = argv.split_last()?;
+    match Path::new(words.first()?).file_name().and_then(|n| n.to_str()) {
+        Some("zed") => Some([words.to_vec(), vec![format!("ssh://{host}{target}")]].concat()),
+        Some("code" | "cursor" | "codium" | "windsurf") => {
+            // `-g` wants a line; a whole file opens without it
+            let flags = words[1..].iter().filter(|w| line.is_some() || *w != "-g").cloned();
+            let remote = ["--remote".to_string(), format!("ssh-remote+{host}")];
+            Some(words[..1].iter().cloned().chain(remote).chain(flags).chain([target.clone()]).collect())
+        }
+        _ => None,
+    }
+}
+
 /// Whether the viewer can show the file: the formats gpui decodes.
 pub fn is_image(path: &Path) -> bool {
     crate::files::content::is_image(path)
+}
+
+/// Whether the reader shows the file.
+fn is_markdown(path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    matches!(ext.as_deref(), Some("md" | "markdown" | "mdx"))
 }
 
 /// A clicked path as a file that exists: `~` is home, a relative path is the pane's shell's.
@@ -1703,6 +2065,9 @@ impl Render for PaneTerminal {
         if let Some(why) = self.ended.clone() {
             let takeover = needs_takeover(&why);
             return div()
+                // keeps the pane focused, so the app's shortcuts still reach their handlers
+                .track_focus(&self.focus)
+                .on_mouse_down(MouseButton::Left, cx.listener(|pane, _, window, cx| window.focus(&pane.focus, cx)))
                 .size_full()
                 .flex()
                 .flex_col()
@@ -1732,6 +2097,7 @@ impl Render for PaneTerminal {
                 .into_any_element();
         }
         crate::ui::reap_popup(&mut self.preview, window);
+        crate::ui::reap_popup(&mut self.reader, window);
         let focused = self.focus.is_focused(window);
         let search_bar = self.search.as_ref().map(|search| self.search_bar(search, &theme, cx));
         let loader = (self.session.is_none() && crate::ui::loader::due(self.attaching, window)).then(|| {
@@ -1776,6 +2142,7 @@ impl Render for PaneTerminal {
             .children(search_bar)
             .children(loader)
             .children(self.preview.as_ref().map(|preview| self.preview(preview, &theme, window, cx)))
+            .children(self.reader.as_ref().map(|reader| self.reader(reader, &theme, window, cx)))
             .into_any_element()
     }
 }
@@ -1978,6 +2345,18 @@ mod tests {
         assert_eq!(reveal_offset(s, 2, 20), Some(100)); // clamped to the oldest line
         let up = ScrollState { offset_from_bottom: 60, ..s };
         assert_eq!(reveal_offset(up, 118, 20), Some(0));
+    }
+
+    #[test]
+    fn a_machines_file_opens_over_the_editors_ssh() {
+        let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert_eq!(remote_argv(argv(&["/bin/zed", "/srv/app/a.rs:3"]), "box", Some(3)).unwrap(), ["/bin/zed", "ssh://box/srv/app/a.rs:3"]);
+        assert_eq!(
+            remote_argv(argv(&["/bin/code", "-g", "/srv/app/a.rs:3:4"]), "me@box", Some(3)).unwrap(),
+            ["/bin/code", "--remote", "ssh-remote+me@box", "-g", "/srv/app/a.rs:3:4"]
+        );
+        assert_eq!(remote_argv(argv(&["/bin/cursor", "-g", "/srv/app/a.rs"]), "box", None).unwrap(), ["/bin/cursor", "--remote", "ssh-remote+box", "/srv/app/a.rs"]);
+        assert_eq!(remote_argv(argv(&["/bin/ed", "/srv/app/a.rs"]), "box", None), None);
     }
 
     #[test]

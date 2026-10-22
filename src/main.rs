@@ -48,6 +48,8 @@ fn main() {
         });
         cx.set_global(shepherd::ui::settings::Tokio(handle.clone()));
         shepherd::update::start(cx);
+        shepherd::ui::loader::drive_slow_frames(cx);
+        shepherd::analytics::seen([]);
         shepherd::notify::warn_if_denied(cx);
 
         shepherd::shell::Shell::open(handle.clone(), cx);

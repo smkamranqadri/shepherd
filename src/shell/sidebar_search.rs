@@ -330,7 +330,7 @@ impl Shell {
     pub(super) fn shown_tree(&self, cx: &mut App) -> (TreeView, SessionKey, Option<Kept>) {
         let settings = &SettingsGlobal::of(cx).settings;
         let collapsed = sidebar_tree::saved_folds(settings);
-        let focus = settings.sidebar_focus;
+        let focus = settings.focus_mode();
         let (view, show_agents) = (settings.sidebar_view, settings.show_agents);
         let shown = self.shown_key().unwrap_or_default();
         // in the Agents view the search keeps agents: the tree (and Workspace1–9) stays as it is

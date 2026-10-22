@@ -1,10 +1,12 @@
 <h1 align="center"><img src="docs/icon.png" width="48" height="48" align="absmiddle" alt=""> Shepherd</h1>
 
-A native macOS window for [herdr](https://herdr.dev). herdr runs your shells and coding agents in workspaces, tabs and panes. Shepherd shows the same session with a sidebar, real tabs and a list of every agent, so you can see which one is waiting on you without cycling through panes.
+When five Claude Code or Codex agents run at once, one of them is always waiting on you, and you find out by cycling through panes. Shepherd lists every agent with its status and how long it has waited, notifies you when one needs an answer, and lets you approve it from the notification.
+
+It's a native app for macOS and Linux on top of [herdr](https://herdr.dev), which runs your shells and agents in workspaces, tabs and panes. Shepherd shows the same session with a sidebar and real tabs.
 
 It's written in Rust on [GPUI](https://github.com/zeronsh/zui) and styled after [Zeron](https://github.com/zeronsh/zeron). The terminal is [libghostty-vt](https://github.com/ghostty-org/ghostty) with its own glyph renderer.
 
-![Shepherd with a split tab, the workspace sidebar and four agents](docs/screenshot.png)
+https://github.com/user-attachments/assets/9b3f5fae-8eee-4697-89b4-37d232250117
 
 ## What it does
 
@@ -15,13 +17,14 @@ It's written in Rust on [GPUI](https://github.com/zeronsh/zui) and styled after 
 - When an agent you can't see starts waiting or finishes, macOS shows a notification and the Dock icon counts it until you look at that tab. Approve on the notification answers the agent without opening Shepherd.
 - Tabs show the agent or shell running in them. Drag tabs to reorder them. Drag a pane by its grip onto another pane to split or swap, or onto a tab to move it there.
 - Dividers between panes snap to the cell grid herdr lays out, and the terminal reflows while you drag.
-- The terminal draws ligatures, Kitty images and box drawing on its own. Scrollback is read from herdr once and scrolled locally. `⌘`-click opens links, files, folders and images.
+- The terminal draws ligatures, Kitty images and box drawing on its own. Shepherd reads scrollback from herdr once and scrolls it locally. `⌘`-click opens links, files, folders and images.
 - herdr's own `[keys]` work in Shepherd, and its popups float over the panes.
 - `⌥⌘B` opens the right panel: the workspace folder's files (to view or edit in a tab), its git changes and diffs, where whole files are staged, unstaged, discarded and committed (or the last commit amended), a search in its files, Go to file (`⌘P`: a few letters of a file's name, its open tabs first, `name:12` at a line), and the branch's PR (gh) or MR (glab) with its description, checks or pipeline jobs and their logs. The PR tab works for SSH machines too.
 - Unsaved changes in a file tab are kept as a draft until you save them or let them go, so a crash or a quick quit doesn't lose them; they come back the next time the file opens. Drafts are plain text in `drafts/` beside the settings file, readable by your user only, and last up to 30 days unopened. A home backup can copy them unencrypted, even for files from an encrypted or removable volume; files that look like secrets (`.env`, keys, certificates, `.ssh`, `.gnupg`) get no draft.
 - `⌘K` opens a command panel with every action, workspace and tab of the session shown. `⇧⌘A` opens the agents panel and Workspaces the workspaces panel, which list every session's, going there as a click in the sidebar does; a session out of reach is listed from what it last said, marked so.
 - Hold `⌘` for a moment and each tab shows its number; hold `⌃` and each workspace does (Ctrl and Ctrl+Shift on Linux). Settings can turn the hints off.
 - A status bar along the bottom, off until General settings turn it on, shows the branch, its PR and CI, the current folder, the focused agent's tokens and your Claude and Codex plan limits. Switch branch is in the command panel either way, and Usage settings show the limits.
+- Web pages (Settings → Web pages) list local tools, such as a dev server or a dashboard, above the workspaces. A click shows the page in the system web view in place of the tabs and panes, and it keeps its state while hidden. A page can be listed in one place only, and opened on the machine shown, through an SSH forward.
 - Settings cover fonts, themes, key bindings and usage. They also edit herdr's own `config.toml` for notifications and integrations, keeping your comments.
 - The Shortcuts page is the one place for keys: every herdr action (`[keys]`, its prefix key included), every herdr custom command (`[[keys.command]]`) and every Shepherd action, in one searchable list. A change to a herdr key is written to herdr's `config.toml` (comments kept, a copy of the file made the first time as `config.toml.shepherd-bak`) and herdr reloads it; Shepherd follows the file whoever edits it, no restart. Reset puts the default back by removing just that line. A prefix chord (`prefix+n`) works in a pane as in herdr: the prefix key, then the key. A herdr action Shepherd has no equivalent of is shown as herdr only and said so when pressed.
 
@@ -39,18 +42,12 @@ sudo apt install ./shepherd_<version>-1_<arch>.deb       # Debian, Ubuntu
 tar -xzf Shepherd-<version>-linux-<arch>.tar.gz -C ~/.local   # anywhere else: bin, .desktop file and icon
 ```
 
-It draws with Vulkan, so it needs a Vulkan driver (`mesa-vulkan-drivers`, which the packages recommend). There's no
-Dock badge, Secure Keyboard Entry or self-update on Linux; settings live in `~/.config/shepherd`. A release build made
-with `SHEPHERD_UPDATE_CHECK` set says when a new version is out and opens its page; other builds never check. A click
-on a notification requests activation for the window; compositors may grant it or mark the window for attention. The
-notification sound is the freedesktop sound theme's, played by `canberra-gtk-play`, or `paplay` where that is missing.
-Settings → Appearance can make the window translucent (whether it is blurred depends on your compositor), or hide its
-own buttons when the window manager provides its own controls or tiles windows. A right-click on the titlebar opens
-the window manager's window menu.
+It draws with Vulkan, so it needs a Vulkan driver (`mesa-vulkan-drivers`, which the packages recommend). Web pages need WebKitGTK 4.1 (`libwebkit2gtk-4.1-0`), which the packages depend on; with the tar.gz, install it yourself, or Shepherd won't start. On Wayland a web page opens in the browser. Linux gets no Dock badge, Secure Keyboard Entry or self-update: release builds only say in the sidebar that a new release is out, and a click opens its page. Settings live in `~/.config/shepherd`. Clicking a notification asks the compositor to raise the window. Some do, others only mark it for attention. The notification sound comes from the freedesktop sound theme, played by `canberra-gtk-play`, or by `paplay` if that's missing.
+Settings → Appearance can make the window translucent (your compositor decides whether it's blurred), or hide Shepherd's window buttons when the window manager has its own or tiles windows. Right-clicking the titlebar opens the window manager's window menu.
 
 ### Requirements
 
-Shepherd needs macOS 14 or later (or Linux) and herdr. It talks to the herdr server over `~/.config/herdr/herdr.sock`, so herdr has to be installed and running. You can point it at another binary or socket in Settings.
+Shepherd needs macOS 14 or later, or Linux. It talks to the herdr server over `~/.config/herdr/herdr.sock` and starts the server if nothing answers there. If herdr isn't installed, Shepherd downloads the build for your system from herdr.dev, checks its SHA-256 and puts it in `~/.local/bin`, as herdr's `install.sh` does. You can point it at another binary or socket in Settings.
 
 ## Keys
 
@@ -83,11 +80,11 @@ On Linux the app's chords follow Ghostty's: Ctrl with a letter stays the shell's
 right panel's chords take Ctrl+Alt beside its toggle. Settings can make Ctrl+C and Ctrl+V copy and paste in the panes
 too (Ctrl+C still sends ^C with nothing selected).
 
-Every binding can be changed in Settings.
+You can rebind any of them in Settings.
 
 ## Build
 
-You need a recent stable Rust toolchain, Xcode's command line tools and [Zig 0.16](https://ziglang.org/download/), which builds libghostty-vt. Put `zig` on your `PATH` and run with `ZIG=zig`, or point `ZIG` at the binary: `.cargo/config.toml` holds a local path that only fits one machine.
+You need a recent stable Rust toolchain, Xcode's command line tools and [Zig 0.16](https://ziglang.org/download/), which builds libghostty-vt. Put `zig` on your `PATH` and run with `ZIG=zig`, or point `ZIG` at the binary. The path in `.cargo/config.toml` only fits one machine.
 
 ```sh
 make run      # debug build, run as Shepherd.app
@@ -100,7 +97,7 @@ make linux    # Linux tar.gz, deb and rpm in target/linux-dist, built in Docker
 make help     # everything else
 ```
 
-`make app` signs with the Developer ID certificate in your keychain if it finds one, and ad hoc otherwise. Releases come from CI: bumping `version` in `Cargo.toml` on `main` builds, signs, notarizes and publishes a new release.
+`make app` signs with the Developer ID certificate in your keychain if it finds one, and ad hoc otherwise. CI makes the releases. Bumping `version` in `Cargo.toml` on `main` builds, signs, notarizes and publishes one.
 
 ## License
 

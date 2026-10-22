@@ -5,7 +5,7 @@
 //! `config.toml`, which herdr then reloads.
 use crate::bindings::rebind;
 use crate::herdr::{Client, HerdrConfig, config_path, set_binary, set_socket};
-use crate::settings::{Settings, SettingsGlobal, step_font_size, step_line_height};
+use crate::settings::{OpenFrom, Settings, SettingsGlobal, WebEntry, step_font_size, step_line_height};
 use crate::theme::{Appearance, AppearanceMode, StatusIcons, Theme, variants_for};
 use crate::ui::input_style;
 use crate::update::{self as updater, Updates};
@@ -38,19 +38,21 @@ enum Section {
     Notifications,
     Usage,
     Integrations,
+    WebPages,
     Herdr,
     Shortcuts,
     About,
 }
 
 impl Section {
-    const ALL: [Section; 9] = [
+    const ALL: [Section; 10] = [
         Section::General,
         Section::Terminal,
         Section::Appearance,
         Section::Notifications,
         Section::Usage,
         Section::Integrations,
+        Section::WebPages,
         Section::Herdr,
         Section::Shortcuts,
         Section::About,
@@ -64,6 +66,7 @@ impl Section {
             Section::Notifications => "Notifications",
             Section::Usage => "Usage",
             Section::Integrations => "Integrations",
+            Section::WebPages => "Web pages",
             Section::Herdr => "herdr",
             Section::Shortcuts => "Shortcuts",
             Section::About => "About",
@@ -78,7 +81,8 @@ impl Section {
             Section::Notifications => "icons/bell.svg",
             Section::Usage => "icons/clock-circle.svg",
             Section::Integrations => "icons/widget.svg",
-            Section::Herdr => "icons/remote-server.svg",
+            Section::WebPages => "icons/solar/global.svg",
+            Section::Herdr => "icons/solar/server-2.svg",
             Section::Shortcuts => "icons/keyboard.svg",
             Section::About => "icons/info-circle.svg",
         }
@@ -148,12 +152,41 @@ pub struct SettingsView {
     tap_recorder: crate::tap::TapRecorder,
     /// The page's scroll, so the shortcuts panel can bring an action's row into view.
     body_scroll: gpui::ScrollHandle,
+    /// The web pages' name and URL fields, in the settings' order; made as entries come, dropped as they go.
+    web_fields: Vec<WebFields>,
+    /// The places a web page can be listed in, as (key, name), once herdr has listed them.
+    places: Option<Vec<(String, String)>>,
     ping: Option<String>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<Close> for SettingsView {}
+
+/// One web page's fields, saved on Enter or when left.
+struct WebFields {
+    id: String,
+    name: Entity<InputState>,
+    url: Entity<InputState>,
+    _events: [Subscription; 2],
+}
+
+/// Changes the web page `id`, and saves.
+fn edit_web(cx: &mut App, id: &str, change: impl FnOnce(&mut WebEntry)) {
+    update(cx, |s| {
+        if let Some(e) = s.web_entries.iter_mut().find(|e| e.id == id) {
+            change(e)
+        }
+    });
+}
+
+/// The id of web page `id`'s `which` select (Show in, Open from): selects are keyed by a `&'static str`.
+// ponytail: two leaked strings per web page shown in this run; key selects by SharedString if that ever matters
+fn web_select_id(which: &str, id: &str) -> &'static str {
+    static IDS: std::sync::Mutex<std::collections::BTreeMap<String, &'static str>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let key = format!("web-{which}-{id}");
+    IDS.lock().unwrap().entry(key.clone()).or_insert_with(|| Box::leak(key.into_boxed_str()))
+}
 
 /// Changes the settings, saves them and applies them everywhere.
 pub fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) {
@@ -174,9 +207,15 @@ pub fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) {
     cx.set_global(settings.theme(cx.window_appearance()));
     if translucent_changed {
         let background = crate::shell::window_background(settings.translucent_window);
-        for window in cx.windows() {
-            let _ = window.update(cx, |_, window, _| window.set_background_appearance(background));
-        }
+        // deferred: the click that got us here is inside an update of the window being changed, and gpui takes that
+        // window out while it updates, so a nested update of it would fail
+        cx.defer(move |cx| {
+            for window in cx.windows() {
+                if let Err(e) = window.update(cx, |_, window, _| window.set_background_appearance(background)) {
+                    eprintln!("shepherd: cannot change a window's background: {e:#}");
+                }
+            }
+        });
     }
     if keys_changed {
         rebind(cx, &settings.keys);
@@ -374,6 +413,8 @@ impl SettingsView {
             keys_note: None,
             tap_recorder: Default::default(),
             body_scroll: gpui::ScrollHandle::new(),
+            web_fields: Vec::new(),
+            places: None,
             ping: None,
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -399,7 +440,188 @@ impl SettingsView {
             window.focus(&view.focus, cx);
         }
         view.load_integrations(cx);
+        view.load_places(cx);
         view
+    }
+
+    /// The herdr sessions and machines a web page can be listed in, named as the session bar names them.
+    fn load_places(&mut self, cx: &mut Context<Self>) {
+        let list = cx.background_spawn(async { (crate::herdr::sessions().unwrap_or_default(), crate::herdr::machines().unwrap_or_default()) });
+        cx.spawn(async move |v, cx| {
+            let (sessions, machines) = list.await;
+            let _ = v.update(cx, |v, cx| {
+                let looks = &SettingsGlobal::of(cx).settings.place_looks;
+                let name = |key: &str, herdr: &str| looks.get(key).and_then(|l| l.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| herdr.to_string());
+                let sessions = sessions.iter().map(|s| (s.socket_path.clone(), name(&s.socket_path, &s.name)));
+                let machines = machines.iter().filter(|m| m.enabled).map(|m| {
+                    let key = format!("machine:{}", m.id);
+                    let label = name(&key, &m.label);
+                    (key, label)
+                });
+                v.places = Some(sessions.chain(machines).collect());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Fields for the web pages in the settings: kept for the ones still there, made for new ones.
+    fn sync_web_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = SettingsGlobal::of(cx).settings.web_entries.clone();
+        if self.web_fields.iter().map(|f| &f.id).eq(entries.iter().map(|e| &e.id)) {
+            return;
+        }
+        let theme = Theme::of(cx).clone();
+        let mut old = std::mem::take(&mut self.web_fields);
+        for entry in entries {
+            if let Some(at) = old.iter().position(|f| f.id == entry.id) {
+                self.web_fields.push(old.remove(at));
+                continue;
+            }
+            let input = |value: &str, placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
+                cx.new(|cx| {
+                    let mut input = InputState::new(window, cx).placeholder(placeholder).default_value(value.to_string());
+                    input.set_editor_style(input_style(&theme));
+                    input
+                })
+            };
+            let name = input(&entry.name, "The page's title", window, cx);
+            let url = input(&entry.url, "http://localhost:4317", window, cx);
+            let setters: [(&Entity<InputState>, fn(&mut WebEntry, String)); 2] = [(&name, |e, v| e.name = v), (&url, |e, v| e.url = v)];
+            let events = setters.map(|(field, set)| {
+                let id = entry.id.clone();
+                cx.subscribe_in(field, window, move |_, field, event: &InputEvent, _, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                        let value = field.read(cx).value().trim().to_string();
+                        edit_web(cx, &id, |e| set(e, value));
+                    }
+                })
+            });
+            self.web_fields.push(WebFields { id: entry.id, name, url, _events: events });
+        }
+    }
+
+    /// Settings → Web pages, Zeron's way: each page a block of labelled fields on a two-column grid
+    /// (name and URL, where it is listed and where it opens) with a red bin to remove it, "Add page" by the section's
+    /// label, and the switch for links to other sites.
+    fn web_pages(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let settings = &SettingsGlobal::of(cx).settings;
+        let (entries, outside) = (settings.web_entries.clone(), settings.web_links_outside);
+        let muted = theme.text_muted;
+        // a control under its caption, sharing its row's width with its neighbour
+        let labelled = |label: &'static str, control: Div| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div().text_size(px(12.)).line_height(px(16.)).text_color(muted).child(label))
+                .child(control)
+        };
+        let pair = |left: Div, right: Div| div().flex().gap(px(12.)).child(left).child(right);
+        let rows: Vec<Div> = self
+            .web_fields
+            .iter()
+            .zip(&entries)
+            .enumerate()
+            .map(|(i, (fields, entry))| {
+                let id = entry.id.clone();
+                let places = self.places.clone().unwrap_or_default();
+                let labels = std::iter::once(SharedString::from("Everywhere")).chain(places.iter().map(|(_, n)| SharedString::from(n.clone()))).collect();
+                let current = match &entry.show_in {
+                    None => Some(0),
+                    Some(key) => places.iter().position(|(k, _)| k == key).map(|at| at + 1),
+                };
+                // a place no longer there (stopped, removed) shows as its key; until herdr answers, nothing
+                let fallback = match (&entry.show_in, &self.places) {
+                    (Some(key), Some(_)) => format!("{key} (gone)"),
+                    _ => String::new(),
+                };
+                let keys: Vec<Option<String>> = std::iter::once(None).chain(places.into_iter().map(|(k, _)| Some(k))).collect();
+                let pick_place = {
+                    let id = id.clone();
+                    move |i: usize, cx: &mut App| {
+                        let key = keys[i].clone();
+                        edit_web(cx, &id, |e| e.show_in = key)
+                    }
+                };
+                let show_in = self.select(theme, web_select_id("show", &id), labels, current, fallback.into(), |_| None, pick_place, cx);
+                const FROM: [(OpenFrom, &str); 2] = [(OpenFrom::Here, "This computer"), (OpenFrom::Machine, "The machine shown")];
+                let pick_from = {
+                    let id = id.clone();
+                    move |i: usize, cx: &mut App| edit_web(cx, &id, |e| e.open_from = FROM[i].0)
+                };
+                let from = FROM.iter().position(|(f, _)| *f == entry.open_from);
+                let open_from = self.select(theme, web_select_id("from", &id), FROM.iter().map(|(_, l)| SharedString::from(*l)).collect(), from, "".into(), |_| None, pick_from, cx);
+                let danger = theme.danger;
+                let remove = div()
+                    .id(SharedString::from(format!("web-remove-{id}")))
+                    .flex_none()
+                    // level with the fields under the first row's captions
+                    .mt(px(22.))
+                    .size(px(32.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(danger.opacity(0.12)))
+                    .child(gpui::svg().path("icons/solar/trash-bin-minimalistic.svg").size(px(16.)).text_color(danger))
+                    .on_click(move |_, _, cx| update(cx, |s| s.web_entries.retain(|e| e.id != id)));
+                div()
+                    .mx(px(16.))
+                    .py(px(14.))
+                    .when(i > 0, |el| el.border_t_1().border_color(theme.border.opacity(0.6)))
+                    .flex()
+                    .items_start()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.))
+                            .child(pair(labelled("Name", field(theme, &fields.name).w_full()), labelled("URL", field(theme, &fields.url).w_full())))
+                            .child(pair(labelled("Show in", show_in.w_full()), labelled("Open from", open_from.w_full()))),
+                    )
+                    .child(remove)
+            })
+            .collect();
+        let empty = rows.is_empty();
+        div()
+            .child(
+                div()
+                    .mt(px(32.))
+                    .mb(px(8.))
+                    .pl(px(8.))
+                    .flex()
+                    .items_center()
+                    .child(div().flex_1().text_color(muted).child("Pages"))
+                    .child(
+                        action(theme, "web-add", "Add page")
+                            .gap(px(6.))
+                            .child(gpui::svg().path("icons/solar/add-circle.svg").size(px(14.)).text_color(muted))
+                            .on_click(|_, _, cx| update(cx, |s| s.web_entries.push(WebEntry::new()))),
+                    ),
+            )
+            .child(
+                card(theme).mt(px(0.)).children(rows).when(empty, |el| {
+                    el.child(card_row(theme, true).child(row_text(
+                        theme,
+                        "No web pages yet",
+                        "Add one with its URL: a dev server, a dashboard, a tool on a machine.",
+                    )))
+                }),
+            )
+            .child(
+                card(theme).mt(px(12.)).child(
+                    card_row(theme, true)
+                        .child(row_text(theme, "Open links to other sites in the browser", "Off: they open in the page, inside Shepherd."))
+                        .child(toggle(theme, "web-links-outside", outside).on_click(|_, _, cx| update(cx, |s| s.web_links_outside = !s.web_links_outside))),
+                ),
+            )
     }
 
     /// A request to the herdr Shepherd is connected to; `done` gets the result on the main thread.
@@ -515,7 +737,7 @@ impl SettingsView {
         let label = current.and_then(|i| labels.get(i).cloned()).unwrap_or(fallback);
         let trigger = div()
             .id(id)
-            .w(px(240.))
+            .w_full()
             .h(px(32.))
             .px(px(10.))
             .flex()
@@ -638,7 +860,8 @@ impl SettingsView {
             // `anchored` is absolutely placed at its parent's origin: an in-flow wrapper puts that under the trigger.
             div().child(gpui::deferred(gpui::anchored().snap_to_window_with_margin(px(8.)).child(crate::ui::menu_motion("select-menu-in", menu, card))).with_priority(1))
         });
-        div().flex_none().flex().flex_col().child(trigger).children(menu)
+        // 240 px; a caller sets another width on this
+        div().w(px(240.)).flex_none().flex().flex_col().child(trigger).children(menu)
     }
 
     /// Closes the open select and gives the keyboard back to the page, which Escape then closes.
@@ -992,6 +1215,7 @@ pub(crate) fn display_chord(chord: &str) -> String {
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::ui::reap_popup(&mut self.open_select, window);
+        self.sync_web_fields(window, cx);
         let theme = Theme::of(cx).clone();
         let global = SettingsGlobal::of(cx);
         let settings = global.settings.clone();
@@ -1024,6 +1248,16 @@ impl Render for SettingsView {
             .bg(theme.wash(0.05))
             .border_r_1()
             .border_color(theme.border)
+            // Zeron's Back: a muted tab at the top of the column, an arrow and the word.
+            .child(
+                div().flex_none().px(px(8.)).child(
+                    crate::shell::row(&theme, false, "settings-back")
+                        .text_color(theme.text_muted)
+                        .child(gpui::svg().path("icons/arrow-left.svg").size(px(16.)).flex_none().text_color(theme.text_muted))
+                        .child("Back")
+                        .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(Close))),
+                ),
+            )
             .child(div().flex_1().min_h_0().flex().flex_col().gap(px(2.)).px(px(8.)).pt(px(12.)).children(Section::ALL.into_iter().map(
                 |section| {
                     let selected = self.section == section;
@@ -1041,17 +1275,7 @@ impl Render for SettingsView {
                             cx.notify();
                         }))
                 },
-            )))
-            // Back: a muted tab at the foot of the column, where the sidebar keeps New workspace; an arrow and the word.
-            .child(
-                div().flex_none().m(px(8.)).child(
-                    crate::shell::row(&theme, false, "settings-back")
-                        .text_color(theme.text_muted)
-                        .child(gpui::svg().path("icons/arrow-left.svg").size(px(16.)).flex_none().text_color(theme.text_muted))
-                        .child("Back")
-                        .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(Close))),
-                ),
-            );
+            )));
 
         let body = match self.section {
             Section::General => div().child(page_header(&theme, "General", "The window and what it shows.")).child(
@@ -1068,6 +1292,17 @@ impl Render for SettingsView {
                             .child(row_text(&theme, "Tabs in sidebar", "List each workspace's tabs under it in the sidebar, in place of the tab bar along the top."))
                             .child(toggle(&theme, "tabs-in-sidebar", settings.tabs_in_sidebar).on_click(cx.listener(
                                 |_, _: &ClickEvent, _, cx| update(cx, |s| s.tabs_in_sidebar = !s.tabs_in_sidebar),
+                            ))),
+                    )
+                    .child(
+                        card_row(&theme, false)
+                            .child(row_text(
+                                &theme,
+                                "Sessions bar",
+                                "A bar of sessions and machines under the sidebar, like Arc's spaces: the sidebar lists the session shown, a two-finger swipe goes to the next, and they drag into any order. Off: one tree of every machine and session.",
+                            ))
+                            .child(toggle(&theme, "sessions-bar", settings.sessions_bar).on_click(cx.listener(
+                                |_, _: &ClickEvent, _, cx| update(cx, |s| s.sessions_bar = !s.sessions_bar),
                             ))),
                     )
                     .child(card_row(&theme, false).child(row_text(
@@ -1227,8 +1462,10 @@ impl Render for SettingsView {
                                     "Translucent window",
                                     if cfg!(target_os = "macos") {
                                         "The desktop shows through the window, blurred."
-                                    } else {
+                                    } else if cfg!(target_os = "linux") {
                                         "The desktop shows through the window. Whether it is blurred depends on your compositor."
+                                    } else {
+                                        "The desktop shows through the window."
                                     },
                                 ))
                                 .child(toggle(&theme, "translucent-window", settings.translucent_window).on_click(cx.listener(
@@ -1434,6 +1671,13 @@ impl Render for SettingsView {
                     .child(body)
                     .children(self.herdr_note.clone().map(|text| note(&theme, text)))
             }
+            Section::WebPages => div()
+                .child(page_header(
+                    &theme,
+                    "Web pages",
+                    "Local tools, listed in the sidebar above the workspaces and shown in place of the tabs and panes.",
+                ))
+                .child(self.web_pages(&theme, cx)),
             Section::Herdr => div()
                 .child(page_header(&theme, "herdr", "Where Shepherd finds herdr. Empty fields use herdr's defaults."))
                 .child(
@@ -1503,7 +1747,7 @@ impl Render for SettingsView {
                 let button = match &updates {
                     Updates::Available(r) => {
                         let r = r.clone();
-                        action(&theme, "update-app", if updater::INSTALLS { format!("Update to {}", r.version) } else { format!("View {}", r.version) })
+                        action(&theme, "update-app", if updater::notifies() { format!("Open {}", r.version) } else { format!("Update to {}", r.version) })
                             .on_click(move |_: &ClickEvent, _, cx| updater::install(r.clone(), cx))
                     }
                     _ => action(&theme, "check-updates", "Check for Updates").on_click(|_: &ClickEvent, _, cx| updater::check(cx, false)),

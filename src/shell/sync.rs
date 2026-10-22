@@ -2,11 +2,26 @@
 use super::*;
 
 /// Subscribe, then snapshot; every event (coalesced) triggers another snapshot. Reconnects forever.
-pub(super) async fn sync_loop(this: gpui::WeakEntity<Shell>, rt: tokio::runtime::Handle, client: Client, cx: &mut gpui::AsyncApp) {
+pub(super) async fn sync_loop(this: gpui::WeakEntity<Shell>, rt: tokio::runtime::Handle, client: Client, resync: std::sync::Arc<tokio::sync::Notify>, cx: &mut gpui::AsyncApp) {
     // When nothing listens on the socket, Shepherd starts herdr's server itself: again after 10 s if it never came
     // up, after a minute if it could not be run at all.
-    let (mut next_start, mut spawned, mut start_error) = (Instant::now(), None::<Instant>, None::<String>);
-    // the panes whose agent status the subscription follows: herdr only sends that per pane
+    let (mut next_start, mut spawned, mut start_error, mut downloaded) = (Instant::now(), None::<Instant>, None::<String>, false);
+    // a fixture (`SHEPHERD_MOCK`) is the one snapshot there is
+    if let Some((snapshot, waited)) = crate::mock::snapshot() {
+        let _ = this.update(cx, |s, cx| {
+            let now = Instant::now();
+            snapshot.track(&mut s.since, now);
+            for (id, secs) in waited {
+                if let Some((_, at)) = s.since.get_mut(&id) {
+                    *at = now.checked_sub(Duration::from_secs(secs)).unwrap_or(now);
+                }
+            }
+            (s.snapshot, s.error, s.connecting) = (Some(snapshot), None, None);
+            cx.notify();
+        });
+        return;
+    }
+    // the agents' panes, whose status the subscription follows: herdr only sends that per pane
     let mut watched: Vec<String> = Vec::new();
     loop {
         let mut rx = match subscribe(&rt, &client, &mut watched).await {
@@ -19,10 +34,20 @@ pub(super) async fn sync_loop(this: gpui::WeakEntity<Shell>, rt: tokio::runtime:
                 // a server that answers but won't subscribe may speak another protocol: its ping says which
                 let outdated = if no_server { None } else { check_protocol(&this, &rt, &client, cx).await };
                 if no_server && Instant::now() >= next_start {
-                    match crate::herdr::start_server() {
+                    // no herdr anywhere: Shepherd downloads it, once a launch, then starts it
+                    let fetched = if crate::herdr::missing() && !std::mem::replace(&mut downloaded, true) {
+                        let _ = this.update(cx, |s, cx| {
+                            s.error = Some("Downloading herdr…".into());
+                            cx.notify()
+                        });
+                        rt.spawn_blocking(crate::herdr::install).await.expect("tokio").map(drop).map_err(|e| format!("herdr isn't installed and Shepherd couldn't download it: {e:#}"))
+                    } else {
+                        Ok(())
+                    };
+                    match fetched.and_then(|()| crate::herdr::start_server().map_err(|e| format!("herdr isn't running and Shepherd couldn't start it: {e}"))) {
                         Ok(()) => (spawned, start_error, next_start) = (Some(Instant::now()), None, Instant::now() + Duration::from_secs(10)),
                         Err(e) => {
-                            start_error = Some(format!("herdr isn't running and Shepherd couldn't start it: {e}. Install herdr or set its path in Settings."));
+                            start_error = Some(format!("{e}. Install herdr or set its path in Settings."));
                             next_start = Instant::now() + Duration::from_secs(60);
                         }
                     }
@@ -44,7 +69,7 @@ pub(super) async fn sync_loop(this: gpui::WeakEntity<Shell>, rt: tokio::runtime:
                 continue;
             }
         };
-        loop {
+        'snapshots: loop {
             let c = client.clone();
             let result = rt.spawn(async move { c.call("session.snapshot", json!({})).await }).await.expect("tokio");
             let update = result.and_then(|r| Snapshot::from_result(&r));
@@ -52,7 +77,9 @@ pub(super) async fn sync_loop(this: gpui::WeakEntity<Shell>, rt: tokio::runtime:
                 let mut panes = None;
                 match update {
                     Ok(snapshot) => {
-                        let mut ids: Vec<String> = snapshot.panes.iter().map(|p| p.pane_id.clone()).collect();
+                        // herdr polls each watched pane for its status: only the panes with an agent are worth it, and
+                        // one found later (pane.agent_detected) changes the set
+                        let mut ids: Vec<String> = snapshot.panes.iter().filter(|p| p.agent.is_some()).map(|p| p.pane_id.clone()).collect();
                         ids.sort(); // a reorder (a dragged tab) is the same set
                         panes = Some(ids);
                         // a workspace's agent that starts or stops has likely edited its worktree
@@ -63,6 +90,7 @@ pub(super) async fn sync_loop(this: gpui::WeakEntity<Shell>, rt: tokio::runtime:
                                 crate::ui::statusbar::refresh_changes(&crate::herdr::locate(&t.checkout_path), cx);
                             }
                         }
+                        crate::analytics::seen(snapshot.panes.iter().filter_map(|p| p.agent.as_deref()));
                         s.agents_changed(&snapshot, cx);
                         // herdr's focus moved (its TUI, another window, a command): Shepherd shows the same tab. Only a
                         // move counts, so a snapshot taken before your own switch reached herdr does not undo it.
@@ -72,7 +100,10 @@ pub(super) async fn sync_loop(this: gpui::WeakEntity<Shell>, rt: tokio::runtime:
                         // since stays.
                         let moved = moved_focus(old, snapshot.focused_tab_id.as_deref());
                         if let Some(tab) = moved.filter(|t| s.selected_tab.as_deref() != Some(*t) && !own_echo(&mut s.own_focus, t, Instant::now())) {
+                            // herdr's own focus move leaves a web page shown where it is
+                            let page = s.pages.shown.clone();
                             s.show_herdr_tab(Some(tab.into()), true, cx);
+                            s.pages.shown = page;
                         }
                         snapshot.track(&mut s.since, Instant::now());
                         s.snapshot = Some(snapshot);
@@ -93,25 +124,35 @@ pub(super) async fn sync_loop(this: gpui::WeakEntity<Shell>, rt: tokio::runtime:
             };
             if let Some(panes) = panes.filter(|p| *p != watched) {
                 watched = panes;
-                break; // panes came or went: follow the new set's agents
+                break; // agents came or went: follow the new set
             }
-            // ponytail: refetch the whole snapshot per event burst; incremental apply only if this shows up in profiles.
-            let Some(event) = rx.recv().await else {
-                break; // server gone or events_lost: resubscribe
-            };
-            cx.background_executor().timer(Duration::from_millis(30)).await;
-            let mut focused = crate::herdr::event_is(&event, "pane.focused");
-            while let Ok(event) = rx.try_recv() {
-                focused |= crate::herdr::event_is(&event, "pane.focused");
-            }
-            // ponytail: herdr's events do not name the client; a focus change Shepherd did not just cause is
-            // another client's (its TUI in a terminal, over ssh), and the client used last sizes the panes
-            if focused {
-                let _ = this.update(cx, |s, cx| {
-                    if s.touched.elapsed() > Duration::from_secs(2) {
+            // ponytail: the whole snapshot per event burst, but for a burst that changes nothing it holds (Claude Code's
+            // title spinner); apply pane_updated's pane in place if the remaining snapshots show up in profiles.
+            loop {
+                let event = tokio::select! {
+                    event = rx.recv() => event,
+                    _ = resync.notified() => Some(serde_json::Value::Null),
+                };
+                let Some(event) = event else {
+                    break 'snapshots; // server gone or events_lost: resubscribe
+                };
+                cx.background_executor().timer(Duration::from_millis(30)).await;
+                let mut burst = vec![event];
+                while let Ok(event) = rx.try_recv() {
+                    burst.push(event);
+                }
+                // ponytail: herdr's events do not name the client; a focus change Shepherd did not just cause is
+                // another client's (its TUI in a terminal, over ssh), and the client used last sizes the panes
+                let focused = burst.iter().any(|e| crate::herdr::event_is(e, "pane.focused"));
+                let held = this.update(cx, |s, cx| {
+                    if focused && s.touched.elapsed() > Duration::from_secs(2) {
                         cx.set_global(crate::terminal::pane::Yielded(true));
                     }
+                    s.snapshot.as_ref().is_some_and(|snap| burst.iter().all(|e| snap.holds(e)))
                 });
+                if !held.unwrap_or(false) {
+                    break;
+                }
             }
         }
     }

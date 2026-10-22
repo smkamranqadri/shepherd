@@ -123,6 +123,42 @@ pub fn show_machine(target: Option<String>) {
     *SHOWN.lock().unwrap() = target;
 }
 
+/// The SSH target of the machine shown; `None` while a local session is.
+pub fn shown_machine() -> Option<String> {
+    SHOWN.lock().unwrap().clone()
+}
+
+/// `path` as the machine at `target` has it, from a shell in `cwd` (`~/` is its home): the absolute path and
+/// whether it is a folder; `None` when nothing is there.
+pub fn find_file(target: &str, cwd: &str, path: &str) -> Option<(String, bool)> {
+    found(&ssh(target, &find_script(cwd, path)).ok()?.stdout)
+}
+
+/// The script [`find_file`] runs: `d` or `f` and the path, or nothing.
+fn find_script(cwd: &str, path: &str) -> String {
+    format!(
+        "p={}; case \"$p\" in '~/'*) p=\"$HOME/${{p#??}}\";; /*) ;; *) p={}/\"$p\";; esac; \
+         if [ -d \"$p\" ]; then echo \"d$p\"; elif [ -e \"$p\" ]; then echo \"f$p\"; fi",
+        quote(path),
+        quote(cwd)
+    )
+}
+
+fn found(out: &[u8]) -> Option<(String, bool)> {
+    let line = String::from_utf8_lossy(out).trim_end_matches('\n').to_string();
+    let (kind, path) = line.split_at_checked(1)?;
+    (!path.is_empty()).then(|| (path.to_string(), kind == "d"))
+}
+
+/// The file at `path` on the machine at `target`.
+pub fn read_file(target: &str, path: &str) -> std::io::Result<Vec<u8>> {
+    let out = ssh(target, &format!("cat -- {}", quote(path)))?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string()));
+    }
+    Ok(out.stdout)
+}
+
 /// A directory of the place shown, as the rest of Shepherd keeps it: a machine's path is that machine's, and git
 /// reaches it over SSH.
 pub fn locate(path: &str) -> String {
@@ -231,6 +267,11 @@ fn ssh_options() -> Vec<String> {
         "-o".into(), "ControlPersist=600".into(),
         "-o".into(), format!("ControlPath={}", control.display()),
     ];
+    ssh_base_options().into_iter().chain(shared.into_iter().filter(|_| !cfg!(windows))).collect()
+}
+
+/// [`ssh_options`] without the shared connection.
+fn ssh_base_options() -> Vec<String> {
     [
         "-C",
         "-o", "BatchMode=yes",
@@ -240,9 +281,83 @@ fn ssh_options() -> Vec<String> {
     ]
     .into_iter()
     .map(String::from)
-    .chain(shared.into_iter().filter(|_| !cfg!(windows)))
     .collect()
 }
+
+/// An SSH local forward to a port on a machine: `port` here reaches it. Its ssh stops when it drops, and when
+/// Shepherd goes however it goes: the ssh runs `cat` on the machine on a pipe only Shepherd holds, which ends with it.
+pub struct Tunnel {
+    child: std::process::Child,
+    _alive: Option<std::process::ChildStdin>,
+    pub port: u16,
+}
+
+impl Tunnel {
+    /// Whether its ssh still runs: the Mac slept, the network changed, the machine rebooted.
+    pub fn alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+impl Drop for Tunnel {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Forwards local port `local` (a free one when it is taken) to `host:port` as `target` sees it, over a connection
+/// of its own (never the shared one, whose forwards outlive the ssh that asked for them), and returns once the port
+/// takes connections. Blocking: call it off the main thread. Fails when ssh exits first, or nothing listens within 15 s.
+pub fn forward(target: &str, host: &str, port: u16, local: u16) -> std::io::Result<Tunnel> {
+    use std::io::{BufRead, Read};
+    use std::time::Duration;
+    let local = match std::net::TcpListener::bind(("127.0.0.1", local)) {
+        Ok(free) => free.local_addr()?.port(),
+        Err(_) => std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port(),
+    };
+    // ssh listens on its forwards before it runs the command, and with ExitOnForwardFailure exits when it can't: the
+    // command's mark means the port is ssh's, not a program's that took it after it was found free
+    let child = crate::process::command("ssh")
+        .args(ssh_base_options())
+        .args(["-T", "-o", "ExitOnForwardFailure=yes", "-L"])
+        .arg(format!("127.0.0.1:{local}:{host}:{port}"))
+        .arg("--")
+        .arg(target)
+        .arg(format!("echo {FORWARDING}; cat >/dev/null"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut tunnel = Tunnel { _alive: None, child, port: local };
+    tunnel._alive = tunnel.child.stdin.take();
+    let out = tunnel.child.stdout.take().expect("piped");
+    let (marked, mark) = std::sync::mpsc::channel();
+    // a login shell's rc files may print first; the lines end when ssh does
+    std::thread::spawn(move || {
+        let up = std::io::BufReader::new(out).lines().map_while(Result::ok).any(|l| l.trim() == FORWARDING);
+        let _ = marked.send(up);
+    });
+    let mut err = tunnel.child.stderr.take().expect("piped");
+    match mark.recv_timeout(Duration::from_secs(15)) {
+        Ok(true) => {
+            // ssh logs each refused connection on stderr; unread, the pipe fills and ssh blocks, forward and all
+            std::thread::spawn(move || std::io::copy(&mut err, &mut std::io::sink()));
+            Ok(tunnel)
+        }
+        Ok(false) => {
+            let status = tunnel.child.wait()?;
+            let mut why = String::new();
+            let _ = err.read_to_string(&mut why);
+            let why = why.trim();
+            Err(std::io::Error::other(if why.is_empty() { format!("ssh {target}: {status}") } else { why.to_string() }))
+        }
+        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("ssh {target}: no forward after 15 s"))),
+    }
+}
+
+/// What a forward's command prints once ssh listens on the forward.
+const FORWARDING: &str = "shepherd-forwarding";
 
 /// Where herdr may be on a host, for `sh`, in the order tried: on the PATH first, then where its installers put it
 /// (a non-interactive SSH shell has a bare PATH): cargo, Homebrew on Linux and macOS, Nix's profiles.
@@ -514,6 +629,14 @@ mod tests {
     use super::fake::{fake_ssh, host};
 
     #[test]
+    fn a_forward_that_cannot_connect_fails() {
+        // a host that can't resolve: ssh exits at once, well inside the wait
+        let at = std::time::Instant::now();
+        assert!(forward("nobody@shepherd-no-such-host.invalid", "localhost", 4317, 0).is_err());
+        assert!(at.elapsed() < std::time::Duration::from_secs(15));
+    }
+
+    #[test]
     fn machines_from_herdrs_list() {
         let json = br#"[{"id":"m-1a2b","label":"workbox/agents","target":"you@workbox","session":"agents","enabled":true,"selected":false}]"#;
         let list: Vec<Machine> = serde_json::from_slice(json).unwrap();
@@ -525,6 +648,23 @@ mod tests {
         let command = bridge_command("agents", "remote-client-bridge");
         assert!(command.contains("--session agents remote-client-bridge"));
         assert!(command.contains("\"$HOME/.local/bin/herdr\""));
+    }
+
+    // The script runs on the machine's POSIX shell; a Windows temp path isn't absolute there.
+    #[cfg(unix)]
+    #[test]
+    fn a_clicked_path_is_found_from_the_shells_folder() {
+        let dir = std::env::temp_dir().join(format!("shepherd-find-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("docs/it's.md"), "# hi").unwrap();
+        let cwd = dir.to_str().unwrap();
+        let run = |path: &str| found(&std::process::Command::new("sh").arg("-c").arg(find_script(cwd, path)).output().unwrap().stdout);
+        assert_eq!(run("docs/it's.md"), Some((format!("{cwd}/docs/it's.md"), false)));
+        assert_eq!(run(&format!("{cwd}/docs")), Some((format!("{cwd}/docs"), true)));
+        assert_eq!(run("nope.md"), None);
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(run("~/"), Some((format!("{home}/"), true)));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

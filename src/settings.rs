@@ -29,6 +29,8 @@ pub struct Settings {
     /// The names and icons given to herdr sessions and machines in Shepherd, by the place's key (a session's socket,
     /// `machine:<id>`).
     pub place_looks: BTreeMap<String, PlaceLook>,
+    /// The bar's order of herdr sessions and machines, by the place's key, as dragged; new ones go last.
+    pub place_order: Vec<String>,
     /// The command Cmd+click opens `path:line:col` with (`zed`, `code -g`, `nvim` in a pane to the right); `None`
     /// finds Zed, Cursor or VS Code.
     pub editor: Option<String>,
@@ -60,6 +62,9 @@ pub struct Settings {
     /// Each workspace's tabs listed under it in the left sidebar, and the tab bar along the top hidden (while the
     /// sidebar is out). Off: the bar, as before.
     pub tabs_in_sidebar: bool,
+    /// The sidebar as upstream's Arc-style sessions bar: the session shown alone, a bar of sessions and machines under
+    /// it (swipe between them, drag them into any order: `place_order`). Off: one tree of every machine and session.
+    pub sessions_bar: bool,
     /// The bottom status bar; off by default, General settings show it. Off, its own lookups (the shown pane's git
     /// status, the agent's tokens, the plan limits) are not asked.
     pub show_status_bar: bool,
@@ -127,6 +132,10 @@ pub struct Settings {
     pub session_order: Vec<String>,
     /// The SSH machines' groups in the order they were dragged to, by target, after this computer's sessions.
     pub machine_order: Vec<String>,
+    /// Web pages listed in the sidebar above the workspaces and shown in place of the tabs and panes.
+    pub web_entries: Vec<WebEntry>,
+    /// Links to another site open in the system browser instead of in the page.
+    pub web_links_outside: bool,
     /// Where the window was last; `None` opens it centered.
     pub window: Option<WindowFrame>,
 }
@@ -228,6 +237,40 @@ pub struct PlaceLook {
     pub icon: Option<String>,
 }
 
+/// A web page in the sidebar: a local tool's name and URL, where it is listed and where its URL is opened.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebEntry {
+    /// Stable for the entry's life, so its page and favicon survive renames, edits and reordering.
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    /// The place key (`Place::key`: a session's socket, `machine:<id>`) it is listed in; `None` is everywhere.
+    pub show_in: Option<String>,
+    pub open_from: OpenFrom,
+}
+
+impl WebEntry {
+    /// An empty entry with an id of its own.
+    pub fn new() -> WebEntry {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static MADE: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+        WebEntry { id: format!("{:x}{:x}", nanos, MADE.fetch_add(1, Ordering::Relaxed)), ..Default::default() }
+    }
+}
+
+/// Where a web entry's URL is opened: on this computer as written, or on the shown place's machine through an SSH
+/// forward of its port. An unknown (future) value reads as this computer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenFrom {
+    Machine,
+    #[default]
+    #[serde(other)]
+    Here,
+}
+
 /// The parts of a workspace row that can be hidden; all shown by default.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -312,6 +355,13 @@ pub const PANEL_WIDTH: f32 = 340.0;
 pub const PANEL_MIN: f32 = 280.0;
 pub const PANEL_MAX: f32 = 640.0;
 
+impl Settings {
+    /// The sidebar's tree lists the session shown alone: focus mode, or the sessions bar, which switches between them.
+    pub fn focus_mode(&self) -> bool {
+        self.sidebar_focus || self.sessions_bar
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         let font = FontSettings::default();
@@ -327,6 +377,7 @@ impl Default for Settings {
             herdr_socket: None,
             herdr_machine: None,
             place_looks: BTreeMap::new(),
+            place_order: Vec::new(),
             editor: None,
             keys: BTreeMap::new(),
             sidebar_width: SIDEBAR_WIDTH,
@@ -340,6 +391,7 @@ impl Default for Settings {
             agent_sort: AgentSort::default(),
             show_agents: true,
             tabs_in_sidebar: false,
+            sessions_bar: false,
             show_status_bar: false,
             status_bar_show: StatusBarShow::default(),
             usage_agent: UsageAgent::default(),
@@ -368,6 +420,8 @@ impl Default for Settings {
             collapsed_machines: Vec::new(),
             session_order: Vec::new(),
             machine_order: Vec::new(),
+            web_entries: Vec::new(),
+            web_links_outside: false,
             window: None,
         }
     }
@@ -565,6 +619,35 @@ mod tests {
     }
 
     #[test]
+    fn web_entries_default_to_none_and_round_trip() {
+        assert!(Settings::default().web_entries.is_empty());
+        assert!(!Settings::default().web_links_outside);
+        let (_dir, path) = tmp();
+        let mut s = Settings::default();
+        s.web_entries.push(WebEntry {
+            id: "a1".into(),
+            name: "board".into(),
+            url: "http://localhost:4317".into(),
+            show_in: Some("machine:m1".into()),
+            open_from: OpenFrom::Machine,
+        });
+        s.web_links_outside = true;
+        s.save(&path).unwrap();
+        assert_eq!(Settings::load(&path).0, s);
+    }
+
+    #[test]
+    fn an_unknown_open_from_reads_as_here() {
+        let e: WebEntry = serde_json::from_str(r#"{"open_from":"moon"}"#).unwrap();
+        assert_eq!(e.open_from, OpenFrom::Here);
+    }
+
+    #[test]
+    fn new_web_entries_get_distinct_ids() {
+        assert_ne!(WebEntry::new().id, WebEntry::new().id);
+    }
+
+    #[test]
     fn missing_file_gives_defaults_without_error() {
         let (_d, path) = tmp();
         let (s, err) = Settings::load(&path);
@@ -621,6 +704,17 @@ mod tests {
         let set = Settings { prefix_tap: Some("ctrl-shift".into()), ..Settings::default() };
         let back: Settings = serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
         assert_eq!(back.prefix_tap.as_deref(), Some("ctrl-shift"));
+    }
+
+    #[test]
+    fn the_sessions_bar_starts_off_and_shows_the_session_alone_when_on() {
+        assert!(!Settings::default().sessions_bar);
+        let old: Settings = serde_json::from_str(r#"{"font_size": 15}"#).unwrap();
+        assert!(!old.sessions_bar && !old.focus_mode(), "a file from before the bar");
+        let on: Settings = serde_json::from_str(r#"{"sessions_bar": true}"#).unwrap();
+        assert!(on.sessions_bar && on.focus_mode(), "the bar lists one session at a time, as focus mode does");
+        let focus: Settings = serde_json::from_str(r#"{"sidebar_focus": true}"#).unwrap();
+        assert!(focus.focus_mode() && !focus.sessions_bar);
     }
 
     #[test]

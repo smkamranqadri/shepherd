@@ -196,6 +196,8 @@ impl Shell {
             }
         }
         self.selected_tab = tab;
+        // a web page shown gives way to the tab picked
+        self.pages.shown = None;
         cx.notify();
     }
 

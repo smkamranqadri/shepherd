@@ -585,6 +585,7 @@ impl Shell {
         let sessions = self.session_agents(cx);
         let settings = &SettingsGlobal::of(cx).settings;
         let layout = sidebar_layout(settings.sidebar_view, settings.show_agents);
+        let bar = settings.sessions_bar;
         let (body, listed) = if layout.tree {
             let (tree, listed) = self.tree_rows(theme, snapshot, shown_ws, active, cx);
             let body = div()
@@ -593,6 +594,13 @@ impl Shell {
                 .min_h_0()
                 .overflow_y_scroll()
                 .track_scroll(&self.tree.scroll)
+                // a sideways swipe moves between places, not down the list
+                .map(|mut el| {
+                    if bar {
+                        el.style().restrict_scroll_to_axis = Some(true);
+                    }
+                    el
+                })
                 // a row dragged in the tree: its rows find where it lands, a release anywhere on it drops it
                 .on_drag_move(cx.listener(|this, e: &gpui::DragMoveEvent<tree_drag::DraggedTreeItem>, _, cx| this.tree_drag_left(e, cx)))
                 .on_drop(cx.listener(|this, d: &tree_drag::DraggedTreeItem, window, cx| this.drop_tree_item(d, window.mouse_position(), cx)))
@@ -622,11 +630,19 @@ impl Shell {
         };
         let toggle = layout.toggle.then(|| self.view_toggle(theme, layout.agents_view, self.waiting_everywhere(), cx));
         // focus mode narrows the Workspaces tree alone: its chip shows there
-        let focus = layout.tree && SettingsGlobal::of(cx).settings.sidebar_focus;
+        let focus = layout.tree && SettingsGlobal::of(cx).settings.sidebar_focus && !SettingsGlobal::of(cx).settings.sessions_bar;
         let header = self.sidebar_header(theme, listed, focus, cx);
         let waiting = self.error.is_none() && self.connecting.is_some_and(|at| crate::ui::loader::due(at, window));
+        // the sessions bar: the list goes under a swipe's fingers, then springs home, and beside it the place it goes to
+        // (or comes from)
+        let (list_offset, beside) = if bar { self.list_offset(window, cx) } else { (0., None) };
+        let list_fade = 1. - (list_offset.abs() / 400.).min(0.5);
+        let beside = beside.map(|(place, at)| {
+            div().absolute().top_0().bottom_0().w(px(self.sidebar_width - 1.)).left(px(at)).child(self.place_preview(&place, theme, window, cx))
+        });
         // Laid out at full width and clipped by its tweened box, so rows never reflow mid slide.
         div()
+            .when(bar, |el| el.on_scroll_wheel(cx.listener(|this, e: &gpui::ScrollWheelEvent, _, cx| this.sidebar_scroll(e, cx))))
             .w(px(self.sidebar_width - 1.))
             .h_full()
             .flex_none()
@@ -634,14 +650,17 @@ impl Shell {
             .flex_col()
             .pt(px(TITLEBAR_HEIGHT))
             .child(
-                div().relative().flex_1().min_h_0().overflow_hidden().child(
+                div().relative().flex_1().min_h_0().overflow_hidden().children(beside).child(
             div()
                 .relative()
+                .left(px(list_offset))
+                .opacity(list_fade)
                 .size_full()
                 .flex()
                 .flex_col()
             .child(header.when(waiting, |el| el.child(crate::ui::loader::mini_spinner(2., theme.text_faint, window))))
             .children(toggle)
+            .children(self.web_rows(self.shown_place_key().as_deref(), true, theme, cx))
             .child(
                 div()
                     .relative()
@@ -654,6 +673,7 @@ impl Shell {
             )
             ))
             .children(strip)
+            .children(bar.then(|| self.place_bar(theme, list_offset, window, cx)))
             .child(self.footer(theme, cx))
     }
 
@@ -724,6 +744,172 @@ impl Shell {
             .children(chip)
             .when(is_dev_build(), |el| el.child(dev_badge(theme)))
             .child(magnifier)
+    }
+
+
+    /// Arc's space bar (the sessions bar setting): a button for each herdr session and machine, in the order dragged
+    /// to, the shown one lit.
+    /// `offset` is the workspace list's: the lit square under the buttons moves as far toward the next place as the list
+    /// has moved toward it.
+    fn place_bar(&self, theme: &Theme, offset: f32, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let hover_bg = theme.hover;
+        let places = self.bar_places(cx);
+        let shown_at = places.iter().position(|p| self.places_shown(p));
+        // each button at its slot, springing there when the order or a drag's placeholder moves it
+        let keys: Vec<String> = places.iter().map(sessions::Place::key).collect();
+        let dragging = cx.has_active_drag();
+        let (slots, moving) = self.place_motion.borrow_mut().layout(&keys, dragging, Instant::now());
+        if moving {
+            window.request_animation_frame();
+        }
+        let held = self.place_motion.borrow().drag.as_ref().filter(|_| dragging).map(|d| d.key.clone());
+        // the slot it would land in, its mark faint there
+        let placeholder = held.as_ref().and_then(|key| keys.iter().position(|k| k == key)).map(|i| {
+            let place = &places[i];
+            let (name, icon) = place.look(cx);
+            let mark = sessions::place_mark(&name, icon.as_deref(), matches!(place, sessions::Place::Machine(_)), theme.text_muted);
+            div()
+                .absolute()
+                .top_0()
+                .left(px(slots[i].0))
+                .size(px(30.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.wash(0.04))
+                .child(div().opacity(0.4).child(mark))
+        });
+        let buttons = places.iter().enumerate().filter(|(i, _)| held.as_ref() != Some(&keys[*i])).map(|(i, place)| {
+            let shown = self.places_shown(place);
+            let (name, icon) = place.look(cx);
+            let machine = matches!(place, sessions::Place::Machine(_));
+            let mark = sessions::place_mark(&name, icon.as_deref(), machine, if shown { theme.accent } else { theme.text_faint });
+            let dragged = sessions::DraggedPlace {
+                index: i,
+                key: keys[i].clone(),
+                name: name.clone(),
+                icon,
+                machine,
+                theme: theme.clone(),
+                grab: Default::default(),
+                motion: self.place_motion.clone(),
+            };
+            let (to, menu) = (place.clone(), place.clone());
+            let (x, y) = slots[i];
+            div()
+                .id(("place", i))
+                .tooltip(tip(name.clone(), None))
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .size(px(30.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .cursor_pointer()
+                .text_color(if shown { theme.accent } else { theme.text_faint })
+                .when(!shown, |el| el.hover(move |s| s.bg(hover_bg)))
+                .child(mark)
+                .on_drag(dragged, |d, grab, _, cx| {
+                    d.motion.borrow_mut().drag = Some(sessions::PlaceDrag { key: d.key.clone(), slot: d.index, ghost: None });
+                    cx.new(|_| sessions::DraggedPlace { grab, ..d.clone() })
+                })
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if !this.places_shown(&to) {
+                        this.switch_to(to.clone(), cx)
+                    }
+                }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, e: &MouseDownEvent, _, cx| this.open_place_menu(menu.clone(), e.position, cx)),
+                )
+        });
+        let step = sessions::PLACE_STEP;
+        if let Some((from, to, at)) = self.bar_glide.get() {
+            let t = at.elapsed().as_secs_f32() / FOLD_DURATION.as_secs_f32();
+            let x = if t >= 1. { to } else { from + (to - from) * ease_out(t) };
+            self.places_scroll.set_offset(gpui::point(px(-x), px(0.)));
+            if t >= 1. {
+                self.bar_glide.set(None);
+            } else {
+                window.request_animation_frame();
+            }
+        }
+        let lit = shown_at.map(|at| {
+            let x = (at as f32 - offset / self.sidebar_width).clamp(0., (places.len() - 1) as f32) * step;
+            // a moved square glides to the row's middle; one that stays put leaves the row where it was scrolled
+            if x != self.lit_seen.get() {
+                self.lit_seen.set(x);
+                let width = f32::from(self.places_scroll.bounds().size.width);
+                let to = (x + 15. - width / 2.).clamp(0., f32::from(self.places_scroll.max_offset().x));
+                let from = -f32::from(self.places_scroll.offset().x);
+                if (to - from).abs() > 0.5 {
+                    self.bar_glide.set(Some((from, to, Instant::now())));
+                }
+            }
+            // the square stays on its button as that springs to another slot
+            let x = (x + slots[at].0 - at as f32 * step).clamp(0., (places.len() - 1) as f32 * step);
+            div().absolute().top_0().left(px(x)).size(px(30.)).rounded(px(8.)).bg(theme.selected)
+        });
+        if self.bar_glide.get().is_some() {
+            window.request_animation_frame(); // a glide set just now starts on the next frame
+        }
+        let bar_bounds = self.bar_bounds.clone();
+        let motion = self.place_motion.clone();
+        div()
+            .relative()
+            .flex_none()
+            // a place dragged over the bar holds the slot under the pointer; let go there, it moves to it
+            .on_drag_move(cx.listener(|this, e: &gpui::DragMoveEvent<sessions::DraggedPlace>, _, cx| {
+                let slot = this.place_motion.borrow().slot_at(e.event.position.x, this.places.len());
+                if let Some(drag) = this.place_motion.borrow_mut().drag.as_mut().filter(|d| d.slot != slot) {
+                    drag.slot = slot;
+                    cx.notify();
+                }
+            }))
+            .on_drop(cx.listener(|this, d: &sessions::DraggedPlace, _, cx| {
+                let slot = this.place_motion.borrow().drag.as_ref().map_or(d.index, |drag| drag.slot);
+                this.move_place(d.index, slot, cx);
+            }))
+            .pt(px(2.))
+            .pb(px(4.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .child(
+                gpui::canvas(move |bounds, _, _| bar_bounds.set(Some(bounds)), |_, _, _, _| {})
+                    .absolute()
+                    .size_full(),
+            )
+            // centred while they fit, scrolled sideways (faded at the edges) once they don't
+            .child(
+                div().flex_1().min_w_0().child(crate::ui::edge_fade::edge_faded_x(16., 
+                    &self.places_scroll,
+                    div()
+                        .id("places")
+                        .w_full()
+                        .flex()
+                        .overflow_x_scroll()
+                        .track_scroll(&self.places_scroll)
+                        // auto margins centre the row while it fits and fall to 0 once it scrolls
+                        .child(
+                            div()
+                                .flex_none()
+                                .mx_auto()
+                                .relative()
+                                .w(px(places.len() as f32 * step - (step - 30.)))
+                                .h(px(30.))
+                                .child(gpui::canvas(move |bounds, _, _| motion.borrow_mut().row = Some(bounds), |_, _, _, _| {}).absolute().size_full())
+                                .children(lit)
+                                .children(placeholder)
+                                .children(buttons),
+                        ),
+                )),
+            )
     }
 
     /// Under the sidebar: Settings, a new workspace in the session shown, and + for a new session or SSH machine.
