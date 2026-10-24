@@ -1595,16 +1595,18 @@ impl Render for SettingsView {
                 });
                 div()
                     .child(page_header(&theme, "Usage", "Your agents' plan limits, and whose the status bar shows."))
-                    .child(
-                        card(&theme).child(
-                            card_row(&theme, true).child(row_text(&theme, "Status bar shows", "The ring at the bar's right end, and its pop-up.")).child(
-                                div().flex().gap(px(8.)).children(UsageAgent::ALL.map(|agent| {
-                                    choice(&theme, SharedString::from(format!("usage-agent-{}", agent.key())), agent.label(), settings.usage_agent == agent)
-                                        .on_click(move |_: &ClickEvent, _, cx| update(cx, |s| s.usage_agent = agent))
-                                })),
-                            ),
-                        ),
-                    )
+                    // a switch per agent: its name and rings at the bar's right end, and their pop-up
+                    .child(card(&theme).children(UsageAgent::ALL.into_iter().enumerate().map(|(i, agent)| {
+                        let on = settings.usage_show.shows(agent);
+                        card_row(&theme, i == 0)
+                            .child(row_text(&theme, agent.label(), "In the status bar: a ring and its percent for each of its windows."))
+                            .child(toggle(&theme, SharedString::from(format!("usage-show-{}", agent.key())), on).on_click(move |_: &ClickEvent, _, cx| {
+                                update(cx, |s| {
+                                    let shown = s.usage_show.of(agent);
+                                    *shown = !*shown;
+                                })
+                            }))
+                    })))
                     .children(agents)
             }
             Section::Integrations => {

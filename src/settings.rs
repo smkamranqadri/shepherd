@@ -63,8 +63,9 @@ pub struct Settings {
     pub show_status_bar: bool,
     /// Which of its labels the status bar shows: its right-click menu.
     pub status_bar_show: StatusBarShow,
-    /// Whose plan limits the status bar shows; Usage settings pick it.
-    pub usage_agent: UsageAgent,
+    /// Whose plan limits the status bar shows, each agent on its own; Usage settings toggle them. An older file's
+    /// one-agent `usage_agent` reads as both on.
+    pub usage_show: UsageShow,
     /// What a workspace row shows besides its name: the sidebar `…` menu's Show.
     pub workspace_show: WorkspaceShow,
     /// Shorter workspace rows.
@@ -200,6 +201,40 @@ impl UsageAgent {
     }
 }
 
+/// The agents whose plan limits the status bar shows, each by its own switch; both by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UsageShow {
+    pub claude: bool,
+    pub codex: bool,
+}
+
+impl Default for UsageShow {
+    fn default() -> Self {
+        UsageShow { claude: true, codex: true }
+    }
+}
+
+impl UsageShow {
+    /// `agent`'s switch.
+    pub fn of(&mut self, agent: UsageAgent) -> &mut bool {
+        match agent {
+            UsageAgent::Claude => &mut self.claude,
+            UsageAgent::Codex => &mut self.codex,
+        }
+    }
+
+    /// Whether the bar shows `agent`'s limits.
+    pub fn shows(mut self, agent: UsageAgent) -> bool {
+        *self.of(agent)
+    }
+
+    /// The agents shown, in [`UsageAgent::ALL`]'s order.
+    pub fn shown(self) -> Vec<UsageAgent> {
+        UsageAgent::ALL.into_iter().filter(|a| self.shows(*a)).collect()
+    }
+}
+
 /// A herdr session's or machine's look in Shepherd, as Arc's spaces have one: `None` keeps herdr's name, or the
 /// name's first letter for the icon.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -275,7 +310,7 @@ pub struct StatusBarShow {
     pub folder: bool,
     /// The shown agent's token spend.
     pub tokens: bool,
-    /// Claude's plan limits.
+    /// The agents' plan limits (whose: `usage_show`).
     pub usage: bool,
 }
 
@@ -369,7 +404,7 @@ impl Default for Settings {
             sessions_bar: false,
             show_status_bar: false,
             status_bar_show: StatusBarShow::default(),
-            usage_agent: UsageAgent::default(),
+            usage_show: UsageShow::default(),
             workspace_show: WorkspaceShow::default(),
             compact_workspaces: false,
             status_icons: crate::theme::StatusIcons::Dots,
@@ -751,12 +786,35 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_usage_agent_reads_as_claude() {
+    fn the_status_bar_shows_both_agents_limits_unless_one_is_turned_off() {
+        assert_eq!(Settings::default().usage_show, UsageShow { claude: true, codex: true });
+        assert_eq!(Settings::default().usage_show.shown(), [UsageAgent::Claude, UsageAgent::Codex]);
         let (_d, path) = tmp();
-        std::fs::write(&path, r#"{"agent_sort": "workspace", "font_size": 15, "usage_agent": "gemini"}"#).unwrap();
-        let (s, err) = Settings::load(&path);
-        assert!(err.is_none());
-        assert_eq!((s.font_size, s.usage_agent), (15.0, UsageAgent::Claude));
+        // a file from the one-agent choice, whichever it picked (a future one too), loads with both on
+        for old in ["codex", "claude", "gemini"] {
+            std::fs::write(&path, format!(r#"{{"agent_sort": "workspace", "font_size": 15, "usage_agent": "{old}"}}"#)).unwrap();
+            let (s, err) = Settings::load(&path);
+            assert!(err.is_none(), "{err:?}");
+            assert_eq!((s.font_size, s.usage_show), (15.0, UsageShow::default()), "{old}");
+        }
+        // each switch on its own, kept through save and load; the old key is not written again
+        for agent in UsageAgent::ALL {
+            let mut s = Settings::default();
+            *s.usage_show.of(agent) = false;
+            s.save(&path).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(!text.contains("usage_agent"), "{text}");
+            let back = Settings::load(&path).0;
+            assert_eq!(back.usage_show, s.usage_show, "{agent:?}");
+            assert!(!back.usage_show.shows(agent), "{agent:?} off");
+            assert_eq!(back.usage_show.shown().len(), 1, "the other stays on");
+        }
+        let none = Settings { usage_show: UsageShow { claude: false, codex: false }, ..Default::default() };
+        none.save(&path).unwrap();
+        assert!(Settings::load(&path).0.usage_show.shown().is_empty());
+        // a file with only one of the two keys keeps the other on
+        std::fs::write(&path, r#"{"usage_show": {"codex": false}}"#).unwrap();
+        assert_eq!(Settings::load(&path).0.usage_show, UsageShow { claude: true, codex: false });
     }
 
     #[test]

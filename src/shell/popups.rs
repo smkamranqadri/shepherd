@@ -845,14 +845,14 @@ impl Shell {
                 if let Some(m) = this.usage_menu.as_mut() { m.close() }
                 this.open_usage_settings(window, cx);
             });
-            let card = crate::ui::statusbar::usage_card(theme, on_settings, cx).on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            let card = crate::ui::statusbar::usage_card(theme, menu.value.0, on_settings, cx).on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 if let Some(m) = this.usage_menu.as_mut() { m.close() }
                 cx.notify();
             }));
             gpui::deferred(
                 gpui::anchored()
                     .anchor(gpui::Anchor::BottomRight)
-                    .position(menu.value)
+                    .position(menu.value.1)
                     .snap_to_window_with_margin(px(8.))
                     .child(crate::ui::menu_motion("usage-menu-in", menu, card)),
             )

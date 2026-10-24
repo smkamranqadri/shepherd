@@ -234,8 +234,8 @@ pub struct Shell {
     spent_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
     /// The spend popup lists the most tokens first.
     spent_by_tokens: bool,
-    /// The status bar's limits popup, at its anchor.
-    usage_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
+    /// The status bar's limits popup: the agent whose label was clicked, and its anchor.
+    usage_menu: Option<crate::ui::Popup<(crate::settings::UsageAgent, gpui::Point<Pixels>)>>,
     /// The status bar's right-click menu of its labels, where it was clicked.
     statusbar_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
     tab_bar: tab_bar::TabBar,
@@ -1761,12 +1761,12 @@ impl Render for Shell {
                 this.spent_menu = Some(crate::ui::Popup::new(at));
                 cx.notify();
             });
-            let on_usage = cx.listener(|this, label: &Bounds<Pixels>, window, cx| {
+            let on_usage = cx.listener(|this, (agent, label): &(crate::settings::UsageAgent, Bounds<Pixels>), window, cx| {
                 // anchored at its right edge: the limits sit at the bar's right end
-                let at = gpui::point(label.right(), window.viewport_size().height - px(crate::ui::statusbar::HEIGHT + 4.));
-                this.usage_menu = Some(crate::ui::Popup::new(at));
+                this.usage_menu = Some(crate::ui::Popup::new(crate::ui::statusbar::usage_popup_at(*agent, label, window.viewport_size().height)));
                 cx.notify();
             });
+            let on_usage = move |agent, label: &Bounds<Pixels>, window: &mut Window, cx: &mut App| on_usage(&(agent, *label), window, cx);
             use crate::ui::statusbar::Item;
             let branches = self.command_panel.as_ref().is_some_and(|p| p.is_open() && p.value.0.read(cx).kind == crate::ui::command_panel::Kind::Branches);
             let open = if branches {
@@ -1774,7 +1774,7 @@ impl Render for Shell {
             } else if self.spent_menu.as_ref().is_some_and(|m| m.is_open()) {
                 Some(Item::Spent)
             } else {
-                self.usage_menu.as_ref().is_some_and(|m| m.is_open()).then_some(Item::Usage)
+                self.usage_menu.as_ref().filter(|m| m.is_open()).map(|m| Item::Usage(m.value.0))
             };
             let on_review = cx.listener(|this, _: &ClickEvent, window, cx| this.show_panel_tab(crate::settings::PanelTab::Pr, window, cx));
             let show = SettingsGlobal::of(cx).settings.status_bar_show;

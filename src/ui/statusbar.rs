@@ -423,10 +423,26 @@ pub fn limit_row(theme: &Theme, limit: &Limit) -> gpui::Div {
         .child(div().font_weight(gpui::FontWeight::MEDIUM).child(format!("{}%", limit.used.round())))
 }
 
-/// The limits popup's card: each window of the status bar's agent, and a way to Usage settings.
-pub fn usage_card(theme: &Theme, on_settings: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static, cx: &mut App) -> gpui::Stateful<gpui::Div> {
-    let agent = crate::settings::SettingsGlobal::of(cx).settings.usage_agent;
-    let limits = usage_of(agent, cx).unwrap_or_default();
+/// The agents the bar labels, from those `shown` in Usage settings, with their windows (`limits_of`): one not
+/// signed in, failing its endpoint or with no window gets no label.
+pub fn usage_labels(shown: &[UsageAgent], mut limits_of: impl FnMut(UsageAgent) -> Option<Vec<Limit>>) -> Vec<(UsageAgent, Vec<Limit>)> {
+    shown.iter().filter_map(|a| Some((*a, limits_of(*a).filter(|l| !l.is_empty())?))).collect()
+}
+
+/// The windows the limits popup of `agent` lists: that agent's, as its label in the bar shows them.
+pub fn card_limits(agent: UsageAgent, cx: &mut App) -> Vec<Limit> {
+    usage_of(agent, cx).unwrap_or_default()
+}
+
+/// Where a click on `agent`'s label (`label`, its bounds) opens the limits popup: at its right edge, just above
+/// the bar, in a window `height` high; the popup keeps the agent, so it lists that agent's limits.
+pub fn usage_popup_at(agent: UsageAgent, label: &gpui::Bounds<gpui::Pixels>, height: gpui::Pixels) -> (UsageAgent, gpui::Point<gpui::Pixels>) {
+    (agent, gpui::point(label.right(), height - px(HEIGHT + 4.)))
+}
+
+/// The limits popup's card: each window of `agent` (the label clicked), and a way to Usage settings.
+pub fn usage_card(theme: &Theme, agent: UsageAgent, on_settings: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static, cx: &mut App) -> gpui::Stateful<gpui::Div> {
+    let limits = card_limits(agent, cx);
     let hover = theme.hover;
     crate::shell::menu_card(theme, "usage-menu", 240.)
         .text_size(px(12.))
@@ -840,16 +856,22 @@ pub fn gate(show_bar: bool, pr_shown: bool) -> Gate {
     Gate { bar: show_bar, review: show_bar || pr_shown }
 }
 
-/// The bar's labels that open a popup.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// The bar's labels that open a popup; each agent's limits are a label of their own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Item {
     Branch,
     Spent,
-    Usage,
+    Usage(UsageAgent),
+}
+
+/// Whether `agent`'s limits label is lit: its own popup is the one up (`open`), not another agent's.
+pub fn usage_lit(open: Option<Item>, agent: UsageAgent) -> bool {
+    open == Some(Item::Usage(agent))
 }
 
 /// The bar for the pane `pane_id` of `snapshot`. `on_branch`, `on_spent` and `on_usage` run on a click on
-/// the branch, the spend and the limits (the last two with the label's bounds); `open` is the one whose popup is up.
+/// the branch, the spend and an agent's limits (the last two with the label's bounds, the last with its agent);
+/// `open` is the one whose popup is up.
 /// `on_review` runs on a click on the PR or MR (from `review`, with its CI's icon), which toggles the right panel's
 /// PR tab and is lit while `review_open` (that tab shows). `show` hides labels.
 pub fn bar(
@@ -862,7 +884,7 @@ pub fn bar(
     review_open: bool,
     on_branch: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_spent: impl Fn(&gpui::Bounds<gpui::Pixels>, &mut Window, &mut App) + 'static,
-    on_usage: impl Fn(&gpui::Bounds<gpui::Pixels>, &mut Window, &mut App) + 'static,
+    on_usage: impl Fn(UsageAgent, &gpui::Bounds<gpui::Pixels>, &mut Window, &mut App) + 'static,
     on_review: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     window: &mut Window,
     cx: &mut App,
@@ -870,7 +892,9 @@ pub fn bar(
     let pane = snapshot.zip(pane_id).and_then(|(s, id)| s.panes.iter().find(|p| p.pane_id == id));
     let dir = pane_dir(snapshot, pane_id);
     let git = dir.as_deref().filter(|_| show.branch).and_then(|d| cached(d, Lookup::Git.ttl(), read_git, cx));
-    let usage = show.usage.then(|| usage_of(crate::settings::SettingsGlobal::of(cx).settings.usage_agent, cx)).flatten().filter(|l| !l.is_empty());
+    let shown = if show.usage { crate::settings::SettingsGlobal::of(cx).settings.usage_show.shown() } else { Vec::new() };
+    let usage = usage_labels(&shown, |agent| usage_of(agent, cx));
+    let on_usage = std::rc::Rc::new(on_usage);
     let home = std::env::home_dir();
     let muted = theme.text_muted.opacity(0.7);
     div()
@@ -925,12 +949,17 @@ pub fn bar(
                 .child(format!("{} tok", short_count(s.total())))
         }))
         .child(div().flex_1())
-        .children(usage.map(|limits| {
-            // the dotfiles' statusbar: the ring fills with the first (shortest) window, colored by the worst one
-            let color = usage_color(limits.iter().map(|l| l.used).fold(0., f64::max), theme);
-            on_click_at(link(div().id("statusbar-usage").flex_none().flex().items_center().gap(px(6.)).px(px(8.)), theme, open == Some(Item::Usage)), on_usage)
-                .child(donut(limits[0].used, theme.text.opacity(0.2), color))
-                .child(format!("{}%", limits[0].used.round()))
+        // each agent's name, then a ring and its percent per window: `Claude ◔ 12% ◑ 40%`
+        .children(usage.into_iter().map(|(agent, limits)| {
+            let on_usage = on_usage.clone();
+            let id = SharedString::from(format!("statusbar-usage-{}", agent.key()));
+            on_click_at(link(div().id(id).flex_none().flex().items_center().gap(px(5.)).px(px(8.)), theme, usage_lit(open, agent)), move |label, window, cx| {
+                on_usage(agent, label, window, cx)
+            })
+            .child(agent.label())
+            .children(limits.iter().map(|l| {
+                div().flex().items_center().gap(px(4.)).child(donut(l.used, theme.text.opacity(0.2), usage_color(l.used, theme))).child(format!("{}%", l.used.round()))
+            }))
         }))
         .into_any_element()
 }
@@ -1001,6 +1030,61 @@ mod tests {
         let labels: Vec<_> = parse_codex_usage(plus).unwrap().into_iter().map(|l| (l.label, l.used)).collect();
         assert_eq!(labels, [("5-hour".to_string(), 12.5), ("Weekly".to_string(), 3.0)]);
         assert_eq!(parse_codex_usage(r#"{"detail":"Unauthorized"}"#), None);
+    }
+
+    /// The bodies of `parses_claude_usage` and `parses_codex_usage`, Claude's and a Plus plan's two windows with the
+    /// agreed look's percents, a Free plan's one window as the endpoint sent it.
+    fn bodies() -> (Vec<Limit>, Vec<Limit>, Vec<Limit>) {
+        let claude = parse_claude_usage(r#"{"five_hour":{"utilization":12.0,"resets_at":"2026-10-11T15:00:00.000Z"},"seven_day":{"utilization":40,"resets_at":null}}"#).unwrap();
+        let plus = parse_codex_usage(r#"{"rate_limit":{"primary_window":{"used_percent":55,"limit_window_seconds":18000,"reset_at":10},"secondary_window":{"used_percent":71,"limit_window_seconds":604800,"reset_at":20}}}"#).unwrap();
+        let free = parse_codex_usage(r#"{"plan_type":"free","rate_limit":{"allowed":true,"primary_window":{"used_percent":0,"limit_window_seconds":2592000,"reset_after_seconds":2590751,"reset_at":1794569896},"secondary_window":null}}"#).unwrap();
+        (claude, plus, free)
+    }
+
+    fn windows(labels: &[(UsageAgent, Vec<Limit>)]) -> Vec<(&'static str, Vec<String>)> {
+        labels.iter().map(|(a, l)| (a.label(), l.iter().map(|l| format!("{} {}%", l.label, l.used.round())).collect())).collect()
+    }
+
+    #[test]
+    fn each_shown_agent_gets_a_label_with_a_ring_per_window() {
+        let (claude, plus, free) = bodies();
+        let both = [UsageAgent::Claude, UsageAgent::Codex];
+        let of = |codex: Option<Vec<Limit>>| {
+            let claude = claude.clone();
+            move |a: UsageAgent| if a == UsageAgent::Claude { Some(claude.clone()) } else { codex.clone() }
+        };
+        assert_eq!(
+            windows(&usage_labels(&both, of(Some(plus.clone())))),
+            [("Claude", vec!["5-hour 12%".to_string(), "Weekly 40%".to_string()]), ("Codex", vec!["5-hour 55%".to_string(), "Weekly 71%".to_string()])],
+            "two windows each"
+        );
+        assert_eq!(windows(&usage_labels(&both, of(Some(free))))[1], ("Codex", vec!["30-day 0%".to_string()]), "a Free plan's one window");
+        assert_eq!(windows(&usage_labels(&both, of(None))), [("Claude", vec!["5-hour 12%".to_string(), "Weekly 40%".to_string()])], "not signed in: no label");
+        assert_eq!(windows(&usage_labels(&both, of(Some(Vec::new())))).len(), 1, "no window: no label");
+        assert_eq!(windows(&usage_labels(&[UsageAgent::Codex], of(Some(plus)))).len(), 1, "Claude turned off: Codex alone");
+        assert!(usage_labels(&[], of(None)).is_empty(), "both off: nothing");
+    }
+
+    /// A click on an agent's label opens the popup over it with that agent's limits, the cache seeded as a poll
+    /// leaves it; only that label is lit.
+    #[gpui::test]
+    fn the_popup_opens_the_clicked_agent_s_limits(cx: &mut gpui::TestAppContext) {
+        let (claude, plus, _) = bodies();
+        cx.update(|cx| {
+            let cache = &mut cx.default_global::<Cache<Vec<Limit>>>().0;
+            for (agent, limits) in [(UsageAgent::Claude, claude.clone()), (UsageAgent::Codex, plus.clone())] {
+                cache.insert(agent.key().into(), Entry { value: Some(limits), fetched: Some(Instant::now()), busy: false });
+            }
+            let label = gpui::Bounds::new(gpui::point(px(600.), px(780.)), gpui::size(px(120.), px(20.)));
+            let (agent, at) = usage_popup_at(UsageAgent::Codex, &label, px(800.));
+            assert_eq!((agent, at), (UsageAgent::Codex, gpui::point(px(720.), px(800. - HEIGHT - 4.))), "at its right edge, over the bar");
+            assert_eq!(card_limits(agent, cx), plus, "Codex's, not Claude's");
+            assert_eq!(card_limits(UsageAgent::Claude, cx), claude);
+            let open = Some(Item::Usage(agent));
+            assert!(usage_lit(open, UsageAgent::Codex));
+            assert!(!usage_lit(open, UsageAgent::Claude), "Claude's label is not lit");
+            assert!(!usage_lit(Some(Item::Spent), UsageAgent::Codex) && !usage_lit(None, UsageAgent::Codex));
+        });
     }
 
     #[test]
