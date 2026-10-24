@@ -11,19 +11,26 @@ use crate::herdr::{Machine, SessionInfo};
 use gpui::DragMoveEvent;
 use std::collections::HashSet;
 use tree_drag::{DraggedTreeItem, Item, Over};
-use super::sidebar_focus::TreeView;
+use super::sidebar_focus::{Kept, TreeView};
 
-/// What a session's workspace rows do: whether they drag (another place's preview's do not).
+/// What a session's workspace rows show and do: in focus mode the workspaces it keeps (`None` without it), and
+/// whether they drag (not in focus mode, nor another place's preview).
 #[derive(Clone, Copy)]
-pub(super) struct RowFilter {
+pub(super) struct RowFilter<'a> {
+    pub keep: Option<&'a HashSet<String>>,
     pub drags: bool,
 }
 
-impl RowFilter {
+impl RowFilter<'_> {
     /// Whether a row may drag or take a drop that it otherwise would (`ok`).
     pub(super) fn allows(self, ok: bool) -> bool {
         self.drags && ok
     }
+}
+
+/// A faint line where the tree has nothing to list.
+fn no_match(theme: &Theme, text: &'static str) -> gpui::AnyElement {
+    div().flex_none().px(px(8.)).py(px(6.)).text_size(px(11.)).text_color(theme.text_faint).child(text).into_any_element()
 }
 
 /// How long another session's branch, read from its HEAD, is kept before it is read again.
@@ -247,10 +254,11 @@ pub(super) fn panel_workspaces<'a>(sessions: &'a [SessionAgents], ordered: &'a [
         .collect()
 }
 
-/// The tree's rows as the sidebar draws them: [`tree`]'s, and a socket of one's own (no session of herdr's list), or
-/// the session shown before the list came, shows its workspaces first, without a header.
-pub(super) fn model_rows(places: &[Place], w: &Watchers, collapsed: &HashSet<String>, snapshot: Option<&Snapshot>, shown: &SessionKey) -> Vec<TreeRow> {
-    let mut rows = tree(places, w, collapsed, snapshot);
+/// The tree's rows as the sidebar draws them: [`tree`]'s (every session with its header when `headed`, a lone one
+/// too: focus mode), and a socket of one's own (no session of herdr's list), or the session shown before the list
+/// came, shows its workspaces first, without a header.
+pub(super) fn model_rows(places: &[Place], w: &Watchers, collapsed: &HashSet<String>, snapshot: Option<&Snapshot>, shown: &SessionKey, headed: bool) -> Vec<TreeRow> {
+    let mut rows = tree(places, w, collapsed, snapshot, headed);
     if !places.iter().any(|p| SessionKey::of(p) == *shown) {
         rows.insert(0, TreeRow::Workspaces { key: shown.clone() });
     }
@@ -354,8 +362,9 @@ pub(super) fn longest_waiting_among<'a>(sessions: impl IntoIterator<Item = (Sess
 }
 
 /// The tree's rows for `places` (in [`tree_order`]), their watchers and the folds (`saved_folds`: sessions, and
-/// machines' groups); `shown` is the shown session's snapshot, which its watcher does not hold.
-pub(super) fn tree(places: &[Place], w: &Watchers, collapsed: &HashSet<String>, shown: Option<&Snapshot>) -> Vec<TreeRow> {
+/// machines' groups); `shown` is the shown session's snapshot, which its watcher does not hold. Every session gets
+/// its header when `headed` (focus mode), a lone one too.
+pub(super) fn tree(places: &[Place], w: &Watchers, collapsed: &HashSet<String>, shown: Option<&Snapshot>, headed: bool) -> Vec<TreeRow> {
     let mut machines: Vec<(&str, Vec<&Place>)> = Vec::new();
     for place in places {
         match machines.iter_mut().find(|(id, _)| *id == machine_of(place)) {
@@ -370,7 +379,7 @@ pub(super) fn tree(places: &[Place], w: &Watchers, collapsed: &HashSet<String>, 
         }
     }
     let show_machines = machines.len() + off.len() > 1;
-    let show_sessions = show_machines || machines.first().is_some_and(|(_, list)| list.len() > 1);
+    let show_sessions = headed || show_machines || machines.first().is_some_and(|(_, list)| list.len() > 1);
     let mut rows = Vec::new();
     for (id, list) in &machines {
         let statuses: Vec<Status> = list.iter().map(|p| w.get(&SessionKey::of(p)).map_or(Status::Connecting, |w| w.status)).collect();
@@ -419,19 +428,30 @@ pub(super) fn tree(places: &[Place], w: &Watchers, collapsed: &HashSet<String>, 
     rows
 }
 
-/// A session's worktree groups as its rows draw them and Workspace1–9 count them: herdr's.
-pub(super) fn shown_groups(snapshot: &Snapshot) -> Vec<(&crate::model::Workspace, Vec<&crate::model::Workspace>)> {
+/// A session's worktree groups as its rows draw them and Workspace1–9 count them: herdr's, and in focus mode
+/// (`keep`) only the workspaces it keeps (a worktree's checkout whenever it keeps the worktree).
+pub(super) fn shown_groups<'s>(snapshot: &'s Snapshot, keep: Option<&HashSet<String>>) -> Vec<(&'s crate::model::Workspace, Vec<&'s crate::model::Workspace>)> {
+    let shows = |id: &str| keep.is_none_or(|k| k.contains(id));
     crate::model::groups(snapshot.workspace_tree())
+        .into_iter()
+        .filter(|(w, _)| shows(&w.workspace_id))
+        .map(|(w, kids)| (w, kids.into_iter().filter(|k| shows(&k.workspace_id)).collect()))
+        .collect()
 }
 
 /// The workspaces Workspace1–9 go to: the tree's visible rows from the top, each group's worktrees under it (a
-/// group always shows them).
-pub(super) fn workspace_order<'a>(rows: &[TreeRow], snaps: impl Fn(&SessionKey) -> Option<&'a Snapshot>) -> Vec<(SessionKey, String)> {
+/// group always shows them); in focus mode (`kept`) only those it keeps.
+pub(super) fn workspace_order<'a>(rows: &[TreeRow], snaps: impl Fn(&SessionKey) -> Option<&'a Snapshot>, kept: Option<&Kept>) -> Vec<(SessionKey, String)> {
     let mut order = Vec::new();
     for row in rows {
         let TreeRow::Workspaces { key } = row else { continue };
         let Some(snapshot) = snaps(key) else { continue };
-        for (w, kids) in shown_groups(snapshot) {
+        // focus mode keeps nothing of the session: its rows are gone
+        let keep = match kept.map(|k| k.get(key)) {
+            Some(None) => continue,
+            keep => keep.flatten(),
+        };
+        for (w, kids) in shown_groups(snapshot, keep) {
             order.push((key.clone(), w.workspace_id.clone()));
             order.extend(kids.iter().map(|k| (key.clone(), k.workspace_id.clone())));
         }
@@ -470,6 +490,7 @@ pub(super) fn numbered<'a>(
     snaps: impl Fn(&SessionKey) -> Option<&'a Snapshot>,
     pending: &HashMap<SessionKey, tree_drag::Pending>,
     now: Instant,
+    kept: Option<&Kept>,
 ) -> Vec<(SessionKey, String)> {
     let ordered: HashMap<SessionKey, Snapshot> = pending
         .iter()
@@ -479,20 +500,20 @@ pub(super) fn numbered<'a>(
             Some((k.clone(), tree_drag::with_order(s, p.order(&list, now)?)))
         })
         .collect();
-    workspace_order(rows, |k| ordered.get(k).or_else(|| snaps(k)))
+    workspace_order(rows, |k| ordered.get(k).or_else(|| snaps(k)), kept)
 }
 
 impl Shell {
     /// The workspaces Workspace1–9 go to and their hint chips sit on, in the order of the tree shown (`shown_tree`).
-    pub(super) fn numbered_workspaces(&self, rows: &[TreeRow], shown: &SessionKey) -> Vec<(SessionKey, String)> {
+    pub(super) fn numbered_workspaces(&self, rows: &[TreeRow], shown: &SessionKey, kept: Option<&Kept>) -> Vec<(SessionKey, String)> {
         let snap = |k: &SessionKey| if k == shown { self.snapshot.as_ref() } else { self.watchers.snapshot(k) };
-        numbered(rows, snap, &self.tree.pending, Instant::now())
+        numbered(rows, snap, &self.tree.pending, Instant::now(), kept)
     }
 
     /// Workspace1–9: the `index`th workspace the tree shows, in whichever session.
     pub(super) fn go_to_tree_workspace(&mut self, index: usize, cx: &mut Context<Self>) {
         let (view, shown) = self.shown_tree(cx);
-        if let Some((key, ws)) = self.numbered_workspaces(&view.rows, &shown).into_iter().nth(index) {
+        if let Some((key, ws)) = self.numbered_workspaces(&view.rows, &shown, view.kept.as_ref()).into_iter().nth(index) {
             self.go_to(key, Goal::Workspace(ws), cx);
         }
     }
@@ -636,11 +657,11 @@ impl Shell {
 
     /// The tree's elements, and whether it lists sessions (then the header leaves out the shown one's name).
     pub(super) fn tree_rows(&self, theme: &Theme, snapshot: &Option<Snapshot>, shown_ws: &Option<String>, active: bool, cx: &mut Context<Self>) -> (Vec<gpui::AnyElement>, bool) {
-        let (TreeView { rows, drags }, shown) = self.shown_tree(cx);
+        let (TreeView { rows, drags, kept, empty }, shown) = self.shown_tree(cx);
         let listed = rows.iter().any(|r| matches!(r, TreeRow::Session { .. }));
         // held Ctrl+Shift (Ctrl on macOS): each of the first nine visible workspaces' chord
         let hints: Option<Chords> = self.hints_of(hints::HintMode::Workspaces).map(|opacity| {
-            let order = self.numbered_workspaces(&rows, &shown);
+            let order = self.numbered_workspaces(&rows, &shown, kept.as_ref());
             (opacity, order.into_iter().zip(WORKSPACE_ACTIONS).filter_map(|((k, w), a)| Some((k, w, chord_of(cx, a)?))).collect())
         });
         let mut out = Vec::new();
@@ -662,7 +683,8 @@ impl Shell {
                 }
                 TreeRow::Notice { key, text, action } => out.push(self.notice_row(theme, key, text, action, cx)),
                 TreeRow::Workspaces { key } => {
-                    let filter = RowFilter { drags };
+                    // focus mode: only what it keeps of the session
+                    let filter = RowFilter { keep: kept.as_ref().and_then(|k| k.get(&key)), drags };
                     let ws = if key == shown {
                         self.workspace_rows(theme, snapshot.as_ref(), shown_ws, RowMode::Live, hints.as_ref(), active, filter, cx)
                     } else {
@@ -694,6 +716,7 @@ impl Shell {
                 out.push(tree_drag::with_line(el, theme, Some(edge)));
             }
         }
+        out.extend(empty.map(|text| no_match(theme, text)));
         (out, listed)
     }
 
@@ -1277,11 +1300,11 @@ mod tests {
             w.apply(&SessionKey(k.into()), Ok(snapshot(&[("w1", None)])), now);
         }
         let shown = snapshot(&[("w1", None)]);
-        let rows = tree(&places, &w, &HashSet::new(), Some(&shown));
+        let rows = tree(&places, &w, &HashSet::new(), Some(&shown), false);
         let machine_rows: Vec<String> = kinds(&rows).into_iter().filter(|r| r.starts_with("M ")).collect();
         assert_eq!(machine_rows, ["M This computer", "M you@other", "M you@box"]);
         let snaps = |k: &SessionKey| if *k == key("menqal") { Some(&shown) } else { w.snapshot(k) };
-        let order: Vec<String> = workspace_order(&rows, snaps).into_iter().map(|(k, _)| k.0).collect();
+        let order: Vec<String> = workspace_order(&rows, snaps, None).into_iter().map(|(k, _)| k.0).collect();
         assert_eq!(order, ["/tmp/menqal.sock", "machine:b", "machine:c", "machine:a"]);
     }
 
@@ -1305,7 +1328,7 @@ mod tests {
     #[test]
     fn one_machine_with_one_session_looks_as_before() {
         let places = [Place::Session(info("default", true))];
-        let rows = tree(&places, &watched(&places, "default"), &HashSet::new(), None);
+        let rows = tree(&places, &watched(&places, "default"), &HashSet::new(), None, false);
         assert_eq!(kinds(&rows), ["W /tmp/default.sock"]);
     }
 
@@ -1313,7 +1336,7 @@ mod tests {
     fn one_machine_lists_its_sessions_without_a_machine_row() {
         let places = [Place::Session(info("default", true)), Place::Session(info("menqal", true)), Place::Session(info("old", false))];
         let shown = snapshot(&[("w1", None)]);
-        let rows = tree(&places, &watched(&places, "default"), &HashSet::new(), Some(&shown));
+        let rows = tree(&places, &watched(&places, "default"), &HashSet::new(), Some(&shown), false);
         assert_eq!(kinds(&rows), ["S /tmp/default.sock", "W /tmp/default.sock", "S /tmp/menqal.sock", "S /tmp/old.sock", "N Stopped"]);
         assert!(matches!(rows[0], TreeRow::Session { waiting: 1, status: Status::Shown, .. }));
         assert!(matches!(rows.last(), Some(TreeRow::Notice { action: Some(NoticeAction::Start), .. })));
@@ -1325,7 +1348,7 @@ mod tests {
         let mut w = watched(&places, "default");
         w.disabled = off;
         let collapsed: HashSet<String> = ["/tmp/default.sock".to_string()].into();
-        let rows = tree(&places, &w, &collapsed, Some(&snapshot(&[("w1", None)])));
+        let rows = tree(&places, &w, &collapsed, Some(&snapshot(&[("w1", None)])), false);
         assert_eq!(kinds(&rows), ["M This computer", "S /tmp/default.sock", "S /tmp/menqal.sock", "M you@box", "S machine:a", "M you@gone"]);
         assert!(matches!(rows[1], TreeRow::Session { collapsed: true, .. }));
         assert!(matches!(rows.last(), Some(TreeRow::Machine { enabled: false, .. })));
@@ -1342,7 +1365,7 @@ mod tests {
         w.apply(&k, Ok(snapshot(&[("w1", None)])), now);
         w.apply(&k, Err(anyhow::anyhow!("timed out")), now);
         w.apply(&k, Err(anyhow::anyhow!("timed out")), now);
-        let rows = tree(&places, &w, &HashSet::new(), None);
+        let rows = tree(&places, &w, &HashSet::new(), None, false);
         assert_eq!(&kinds(&rows)[4..], ["S machine:a", "N Can't reach host", "W machine:a"]);
     }
 
@@ -1356,13 +1379,13 @@ mod tests {
             TreeRow::Workspaces { key: key("menqal") },
         ];
         let snaps = |k: &SessionKey| if *k == key("default") { Some(&shown) } else if *k == key("menqal") { Some(&other) } else { None };
-        let order = workspace_order(&rows, snaps);
+        let order = workspace_order(&rows, snaps, None);
         let ids: Vec<String> = order.iter().map(|(k, w)| format!("{}:{w}", &k.0[5..k.0.len() - 5])).collect();
         assert_eq!(ids, ["default:w1", "default:w2", "default:w3", "menqal:w1", "menqal:w2"], "a repo's worktree under its checkout");
         // never past nine
         let many = snapshot(&[("a", None), ("b", None), ("c", None), ("d", None), ("e", None), ("f", None)]);
         let rows = vec![TreeRow::Workspaces { key: key("x") }, TreeRow::Workspaces { key: key("y") }];
-        assert_eq!(workspace_order(&rows, |_| Some(&many)).len(), 9);
+        assert_eq!(workspace_order(&rows, |_| Some(&many), None).len(), 9);
     }
 
     #[test]
@@ -1377,10 +1400,10 @@ mod tests {
         let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         p.push(Move { ids: ids(&["w3"]), before: Some("w1".into()) }, ids(&["w1", "w2", "w3"]), ids(&["w3", "w1", "w2"]), now);
         pending.insert(key("default"), p);
-        let order: Vec<String> = numbered(&rows, snaps, &pending, now).into_iter().map(|(_, w)| w).collect();
+        let order: Vec<String> = numbered(&rows, snaps, &pending, now, None).into_iter().map(|(_, w)| w).collect();
         // the chips sit on the same order: `tree_rows` zips it with Workspace1–9's chords
         assert_eq!(order, ["w3", "w1", "w2"]);
-        let none: Vec<String> = numbered(&rows, snaps, &HashMap::new(), now).into_iter().map(|(_, w)| w).collect();
+        let none: Vec<String> = numbered(&rows, snaps, &HashMap::new(), now, None).into_iter().map(|(_, w)| w).collect();
         assert_eq!(none, ["w1", "w2", "w3"]);
     }
 
@@ -1434,20 +1457,20 @@ mod tests {
         let places = [Place::Session(info("default", true)), Place::Session(info("menqal", true))];
         let w = watched(&places, "default");
         let shown = snapshot(&[("w1", None)]);
-        let rows = tree(&places, &w, &HashSet::new(), Some(&shown));
+        let rows = tree(&places, &w, &HashSet::new(), Some(&shown), false);
         assert!(foldable(&rows, &key("default")), "the shown session's header");
         // folded, its header stays, so the key opens it again
         let folded: HashSet<String> = ["/tmp/default.sock".to_string()].into();
-        assert!(foldable(&tree(&places, &w, &folded, Some(&shown)), &key("default")));
+        assert!(foldable(&tree(&places, &w, &folded, Some(&shown), false), &key("default")));
         // one session alone: no header to fold
         let one = [Place::Session(info("default", true))];
-        assert!(!foldable(&tree(&one, &watched(&one, "default"), &HashSet::new(), Some(&shown)), &key("default")));
+        assert!(!foldable(&tree(&one, &watched(&one, "default"), &HashSet::new(), Some(&shown), false), &key("default")));
         // a socket of one's own, outside herdr's list: its workspaces lead without a header, as the sidebar draws them
-        let own = model_rows(&places, &w, &HashSet::new(), Some(&shown), &key("mine"));
+        let own = model_rows(&places, &w, &HashSet::new(), Some(&shown), &key("mine"), false);
         assert_eq!(kinds(&own)[..2], ["W /tmp/mine.sock", "S /tmp/default.sock"]);
         assert!(!foldable(&own, &key("mine")));
         // a listed session shown gets no second row
-        let listed = model_rows(&places, &w, &HashSet::new(), Some(&shown), &key("default"));
+        let listed = model_rows(&places, &w, &HashSet::new(), Some(&shown), &key("default"), false);
         assert_eq!(listed, rows);
         assert!(foldable(&listed, &key("default")));
     }
@@ -1498,7 +1521,7 @@ mod tests {
         assert_eq!(session_waiting(&w, &m, Some(&shown)), 1, "out of reach: its last snapshot");
         assert_eq!(session_waiting(&w, &key("gone"), Some(&shown)), 0);
         // the tree's rows count the same
-        let rows = tree(&places, &w, &HashSet::new(), Some(&shown));
+        let rows = tree(&places, &w, &HashSet::new(), Some(&shown), false);
         let counts: Vec<(String, usize)> = rows
             .iter()
             .filter_map(|r| match r {
@@ -1555,7 +1578,7 @@ mod tests {
     #[test]
     fn a_folded_machine_hides_its_sessions_and_counts_their_agents() {
         let (places, w, shown) = two_machines();
-        let rows = tree(&places, &w, &[group_key("you@box")].into(), Some(&shown));
+        let rows = tree(&places, &w, &[group_key("you@box")].into(), Some(&shown), false);
         assert_eq!(kinds(&rows), ["M This computer", "S /tmp/default.sock", "W /tmp/default.sock", "S /tmp/menqal.sock", "M you@box"]);
         assert_eq!(
             rows[4],
@@ -1564,15 +1587,15 @@ mod tests {
         );
         assert!(matches!(rows[0], TreeRow::Machine { collapsed: false, waiting: 0, .. }), "open, its sessions show their own");
         // this computer folds the same way, the shown session's live count in it (menqal has no snapshot)
-        let rows = tree(&places, &w, &[group_key(LOCAL)].into(), Some(&shown));
+        let rows = tree(&places, &w, &[group_key(LOCAL)].into(), Some(&shown), false);
         assert_eq!(kinds(&rows), ["M This computer", "M you@box", "S machine:a", "W machine:a", "S machine:c", "W machine:c"]);
         assert!(matches!(rows[0], TreeRow::Machine { collapsed: true, waiting: 1, .. }));
         // a session's fold folds no machine, and no machine's fold any session
-        let rows = tree(&places, &w, &["you@box".to_string(), LOCAL.to_string()].into(), Some(&shown));
+        let rows = tree(&places, &w, &["you@box".to_string(), LOCAL.to_string()].into(), Some(&shown), false);
         assert!(rows.iter().all(|r| !matches!(r, TreeRow::Machine { collapsed: true, .. } | TreeRow::Session { collapsed: true, .. })));
         // a folded machine's group still moves as one: the drag line goes under its row
         use super::super::tree_drag::{Edge, Line};
-        let rows = tree(&places, &w, &[group_key("you@box")].into(), Some(&shown));
+        let rows = tree(&places, &w, &[group_key("you@box")].into(), Some(&shown), false);
         assert_eq!(line_row(&rows, &Line::Machine("you@box".into(), Edge::Below)), Some((4, Edge::Below)));
         assert_eq!(line_row(&rows, &Line::Machine(LOCAL.into(), Edge::Below)), Some((3, Edge::Below)));
     }
@@ -1580,7 +1603,7 @@ mod tests {
     #[test]
     fn a_lone_machine_has_no_row_to_fold() {
         let places = [Place::Session(info("default", true)), Place::Session(info("menqal", true))];
-        let rows = tree(&places, &watched(&places, "default"), &[group_key(LOCAL)].into(), None);
+        let rows = tree(&places, &watched(&places, "default"), &[group_key(LOCAL)].into(), None, false);
         assert_eq!(kinds(&rows), ["S /tmp/default.sock", "W /tmp/default.sock", "S /tmp/menqal.sock"], "no machine row, so nothing folded out of reach");
     }
 
@@ -1603,13 +1626,26 @@ mod tests {
     }
 
     #[test]
-    fn focus_mode_shows_a_folded_machine_s_session_open() {
+    fn the_sessions_bar_shows_a_folded_machine_s_session_open_and_focus_keeps_the_fold() {
         use super::super::sidebar_focus::tree_view;
         let (places, w, shown) = two_machines();
         let folds: HashSet<String> = [group_key("you@box")].into();
-        // focus mode on a machine's session shows its workspaces whatever its machine's fold
-        let focused = tree_view(&places, &w, &folds, Some(&shown), &SessionKey("machine:a".into()), true);
-        assert_eq!(kinds(&focused.rows), ["W machine:a"]);
+        // the sessions bar on a machine's session shows its workspaces whatever its machine's fold
+        let bar = tree_view(&places, &w, &folds, Some(&shown), &SessionKey("machine:a".into()), true, false);
+        assert_eq!(kinds(&bar.rows), ["W machine:a"]);
+        // focus mode keeps the folded machine's header, its sessions having agents, and drops menqal, which has none
+        let focused = tree_view(&places, &w, &folds, Some(&shown), &key("default"), false, true);
+        assert_eq!(kinds(&focused.rows), ["M This computer", "S /tmp/default.sock", "W /tmp/default.sock", "M you@box"]);
+        assert!(matches!(focused.rows[3], TreeRow::Machine { collapsed: true, waiting: 2, .. }));
+        // its sessions' agents gone: the machine goes too, folded or open
+        let mut w = w;
+        for k in ["machine:a", "machine:c"] {
+            w.apply(&SessionKey(k.into()), Ok(agents_snapshot(&[])), Instant::now());
+        }
+        for folds in [folds, HashSet::new()] {
+            let focused = tree_view(&places, &w, &folds, Some(&shown), &key("default"), false, true);
+            assert_eq!(kinds(&focused.rows), ["M This computer", "S /tmp/default.sock", "W /tmp/default.sock"]);
+        }
     }
 
     #[test]
@@ -1625,12 +1661,12 @@ mod tests {
     #[test]
     fn fold_or_unfold_the_session_opens_its_folded_machine_first() {
         let (places, w, shown) = two_machines();
-        let folded = tree(&places, &w, &[group_key(LOCAL)].into(), Some(&shown));
+        let folded = tree(&places, &w, &[group_key(LOCAL)].into(), Some(&shown), false);
         assert_eq!(shown_fold(&folded, &key("default"), Some(LOCAL)), ShownFold::UnfoldMachine(LOCAL.into()));
-        let open = tree(&places, &w, &HashSet::new(), Some(&shown));
+        let open = tree(&places, &w, &HashSet::new(), Some(&shown), false);
         assert_eq!(shown_fold(&open, &key("default"), Some(LOCAL)), ShownFold::FoldSession);
         // another machine folded: only the shown session folds
-        let other = tree(&places, &w, &[group_key("you@box")].into(), Some(&shown));
+        let other = tree(&places, &w, &[group_key("you@box")].into(), Some(&shown), false);
         assert_eq!(shown_fold(&other, &key("default"), Some(LOCAL)), ShownFold::FoldSession);
         // a socket of one's own: no header, nothing
         assert_eq!(shown_fold(&open, &key("own"), None), ShownFold::Nothing);
@@ -1645,13 +1681,13 @@ mod tests {
                 w.apply(&SessionKey(k.into()), Err(anyhow::anyhow!("timed out")), now);
             }
         }
-        let rows = tree(&places, &w, &[group_key("you@box")].into(), Some(&shown));
+        let rows = tree(&places, &w, &[group_key("you@box")].into(), Some(&shown), false);
         assert!(matches!(rows[4], TreeRow::Machine { status: Status::Unreachable, collapsed: true, waiting: 2, .. }), "{:?}", rows[4]);
         assert!(pill_faded(Status::Unreachable));
         assert!(!pill_faded(Status::Live));
         // one session still answering: the machine is live, its count not faded
         w.apply(&SessionKey("machine:a".into()), Ok(snapshot(&[("w1", None)])), now);
-        let rows = tree(&places, &w, &[group_key("you@box")].into(), Some(&shown));
+        let rows = tree(&places, &w, &[group_key("you@box")].into(), Some(&shown), false);
         assert!(matches!(rows[4], TreeRow::Machine { status: Status::Live, .. }));
     }
 

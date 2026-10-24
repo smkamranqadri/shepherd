@@ -561,7 +561,7 @@ impl Shell {
         };
         // the rows the sidebar draws once the swipe lands, on the tab herdr would show there first
         let shown_ws = snapshot.pick_tab_in(None, None).map(|t| t.workspace_id.clone());
-        let filter = sidebar_tree::RowFilter { drags: false };
+        let filter = sidebar_tree::RowFilter { keep: None, drags: false };
         let rows = self.workspace_rows(theme, Some(&snapshot), &shown_ws, sidebar_tree::RowMode::Other(key), None, window.is_window_active(), filter, cx);
         let workspaces = div().flex_1().min_h_0().overflow_hidden().px(px(8.)).flex().flex_col().gap(px(2.)).children(rows);
         column.child(workspaces).into_any_element()

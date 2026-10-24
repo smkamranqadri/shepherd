@@ -101,8 +101,9 @@ pub struct Settings {
     /// With the sidebar hidden, the pointer at the window's left edge slides it out floating over the panes. Off,
     /// only `⌘B` brings it back; on by default, as before the switch, so an older file keeps it.
     pub sidebar_peek: bool,
-    /// Focus mode: the sidebar's Workspaces tree shows the session shown alone, without its header. The panels still
-    /// list every session.
+    /// Focus mode: the sidebar's Workspaces tree keeps the workspaces with an agent, in any status, under every
+    /// session's header (a lone one's too); a session with none goes. With the sessions bar, the shown session's.
+    /// Nothing in the tree drags meanwhile; the panels still list every session.
     pub sidebar_focus: bool,
     /// The workspaces sidebar is shown; `⌘B` hides it.
     pub sidebar_open: bool,
@@ -328,9 +329,14 @@ pub const PANEL_MIN: f32 = 280.0;
 pub const PANEL_MAX: f32 = 640.0;
 
 impl Settings {
-    /// The sidebar's tree lists the session shown alone: focus mode, or the sessions bar, which switches between them.
-    pub fn focus_mode(&self) -> bool {
-        self.sidebar_focus || self.sessions_bar
+    /// The sidebar's tree lists the session shown alone, without its header: the sessions bar switches between them.
+    pub fn tree_one_session(&self) -> bool {
+        self.sessions_bar
+    }
+
+    /// The sidebar's tree keeps the workspaces with an agent alone, and takes no drags: focus mode.
+    pub fn tree_agents_only(&self) -> bool {
+        self.sidebar_focus
     }
 }
 
@@ -688,11 +694,11 @@ mod tests {
     fn the_sessions_bar_starts_off_and_shows_the_session_alone_when_on() {
         assert!(!Settings::default().sessions_bar);
         let old: Settings = serde_json::from_str(r#"{"font_size": 15}"#).unwrap();
-        assert!(!old.sessions_bar && !old.focus_mode(), "a file from before the bar");
+        assert!(!old.sessions_bar && !old.tree_one_session(), "a file from before the bar");
         let on: Settings = serde_json::from_str(r#"{"sessions_bar": true}"#).unwrap();
-        assert!(on.sessions_bar && on.focus_mode(), "the bar lists one session at a time, as focus mode does");
+        assert!(on.tree_one_session() && !on.tree_agents_only(), "the bar lists one session at a time, every workspace of it");
         let focus: Settings = serde_json::from_str(r#"{"sidebar_focus": true}"#).unwrap();
-        assert!(focus.focus_mode() && !focus.sessions_bar);
+        assert!(focus.tree_agents_only() && !focus.tree_one_session(), "focus mode lists every session");
     }
 
     #[test]

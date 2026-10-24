@@ -612,6 +612,10 @@ impl Shell {
     /// A row's drag listener: the row under the pointer sets where the drop lands, or that it lands nowhere. A row
     /// scrolled out of the tree's view keeps its bounds, so the pointer must be in the view too.
     pub(super) fn tree_drag_over(&mut self, over: Over, e: &DragMoveEvent<DraggedTreeItem>, cx: &mut Context<Self>) {
+        // focus mode: no drop among the rows it leaves out, a drag begun before it included
+        if !self.tree_drags(cx) {
+            return;
+        }
         if self.tree.view.is_some_and(|v| !v.contains(&e.event.position)) {
             return;
         }
@@ -700,6 +704,10 @@ impl Shell {
     /// A release over the tree, `at` the pointer: on the row the line is at, planned again against what is shown
     /// now, then carried out.
     pub(super) fn drop_tree_item(&mut self, d: &DraggedTreeItem, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.tree_drags(cx) {
+            self.tree.drop = None;
+            return;
+        }
         // a wheel scroll since the last move moved the rows under the pointer
         let Some(TreeDrop { over, edge, .. }) = released(self.tree.drop.take(), self.tree.scroll.offset().y, at) else { return };
         cx.notify();

@@ -167,12 +167,13 @@ impl Shell {
         let snapshot = pending.as_ref().or(snapshot);
         // a workspace row's height, one line; a worktree's, which always has a branch line unless compact
         let (ws_h, kid_h) = if SettingsGlobal::of(cx).settings.compact_workspaces { (26., 26.) } else { (32., WS_TWO_LINES) };
-        // as Workspace1–9 count them
+        // as Workspace1–9 count them: in focus mode, what it keeps
         let groups: Vec<(crate::model::Workspace, Vec<crate::model::Workspace>)> = snapshot
             .as_ref()
-            .map(|s| sidebar_tree::shown_groups(s).into_iter().map(|(w, kids)| (w.clone(), kids.into_iter().cloned().collect())).collect())
+            .map(|s| sidebar_tree::shown_groups(s, filter.keep).into_iter().map(|(w, kids)| (w.clone(), kids.into_iter().cloned().collect())).collect())
             .unwrap_or_default();
-        // a workspace moves with its worktrees among the others, a worktree among its siblings; not one being removed
+        // a workspace moves with its worktrees among the others, a worktree among its siblings; not one being removed,
+        // nor any in focus mode
         let movable = filter.allows(self.can_drag_workspaces(&key));
         let draggable: std::collections::HashSet<String> = groups
             .iter()
@@ -416,8 +417,8 @@ impl Shell {
         self.tidy_tree_drag(window, cx);
         let settings = &SettingsGlobal::of(cx).settings;
         let bar = settings.sessions_bar;
-        // focus mode's chip shows unless the sessions bar lists the shown session anyway
-        let focus = settings.sidebar_focus && !bar;
+        // focus mode's chip, with the sessions bar too: it filters the shown session there
+        let focus = settings.sidebar_focus;
         let (tree, listed) = self.tree_rows(theme, snapshot, shown_ws, active, cx);
         let body = div()
             .id("workspaces")
@@ -485,7 +486,7 @@ impl Shell {
             .child(self.footer(theme, cx))
     }
 
-    /// The sidebar's head: the shown session's name when the tree names none (with one session, or in focus mode),
+    /// The sidebar's head: the shown session's name when the tree names none (with one session, or the sessions bar),
     /// and the Focus chip that turns focus mode off. The place's spinner goes after it.
     fn sidebar_header(&self, theme: &Theme, listed: bool, focus: bool, cx: &mut Context<Self>) -> Div {
         let head = div().px(px(16.)).pt(px(8.)).pb(px(6.)).flex().items_center().gap(px(6.)).text_size(px(11.)).text_color(theme.text_faint);
@@ -511,7 +512,7 @@ impl Shell {
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_focus_mode(cx)))
         });
         head
-            // the tree names every session; with one, or in focus mode, its name heads the list
+            // the tree names every session; with one, or the sessions bar, its name heads the list
             .child(div().flex_1().min_w_0().truncate().when(!listed, |el| el.child(self.place_label(cx))))
             .children(chip)
             .when(is_dev_build(), |el| el.child(dev_badge(theme)))
