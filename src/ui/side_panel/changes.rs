@@ -139,6 +139,9 @@ pub(super) struct ChangeList {
     stale: Option<GitError>,
     /// The change last clicked: its group and path.
     selected: Option<(Group, String)>,
+    /// The row under the pointer (a change or a header), which shows its actions. Held here rather than a group hover: a hover style turns up
+    /// only by paint, too late for a hidden child's prepaint, and gpui panics painting what it never prepainted.
+    hovered: Option<usize>,
     scroll: UniformListScrollHandle,
     /// Stages, discards and commits landed: a run started before the last of them answers for the index as it was,
     /// and is dropped for one asked after.
@@ -170,6 +173,7 @@ impl ChangeList {
             halted: false,
             stale: None,
             selected: None,
+            hovered: None,
             scroll: UniformListScrollHandle::new(),
             ops: 0,
         }
@@ -500,6 +504,7 @@ impl SidePanel {
     /// change, and follows it when it changed in place (a delete staged, say: its menu no longer offers Open).
     fn rebuild_changes(&mut self, cx: &mut Context<Self>) {
         let Some(list) = self.changes.as_mut() else { return };
+        let hovered_kind = list.hovered.and_then(|ix| list.rows.get(ix)).map(std::mem::discriminant);
         list.rows = match list.answer() {
             Some(a) => change_rows(&a.status.changes, a.status.outside_root, &self.changes_folded),
             None => Vec::new(),
@@ -509,6 +514,11 @@ impl SidePanel {
         {
             list.selected = None;
         }
+        // a row of another kind where the hovered one was is another element, which gpui counts as unhovered until
+        // the pointer moves: so does the list
+        if list.hovered.and_then(|ix| list.rows.get(ix)).map(std::mem::discriminant) != hovered_kind {
+            list.hovered = None;
+        }
         if let Some(menu) = self.change_menu.as_mut() {
             match list.find(menu.value.change.group, &menu.value.change.path) {
                 Some(found) => menu.value.change = found.clone(),
@@ -516,6 +526,21 @@ impl SidePanel {
             }
         }
         cx.notify();
+    }
+
+    /// The pointer came onto row `ix` or left it.
+    fn hover_change(&mut self, ix: usize, on: bool, cx: &mut Context<Self>) {
+        let Some(list) = self.changes.as_mut() else { return };
+        let hovered = match (on, list.hovered) {
+            (true, _) => Some(ix),
+            // another row's hover may have come first
+            (false, Some(at)) if at != ix => Some(at),
+            (false, _) => None,
+        };
+        if list.hovered != hovered {
+            list.hovered = hovered;
+            cx.notify();
+        }
     }
 
     fn toggle_group(&mut self, group: Group, cx: &mut Context<Self>) {
@@ -613,6 +638,14 @@ impl SidePanel {
                 .relative()
                 .flex_1()
                 .min_h_0()
+                // the rows move under a still pointer, which hovers none of them again until it moves
+                .on_scroll_wheel(cx.listener(|this, _: &gpui::ScrollWheelEvent, _, cx| {
+                    if let Some(list) = this.changes.as_mut()
+                        && list.hovered.take().is_some()
+                    {
+                        cx.notify();
+                    }
+                }))
                 .child(crate::ui::edge_fade::edge_faded(12., &scroll, rows))
                 .child(crate::ui::scrollbar("changes-scrollbar", &list.scroll, theme))
                 .into_any_element()
@@ -671,10 +704,10 @@ impl SidePanel {
                         Group::Staged => Some(("icons/solar/minus.svg", format!("Unstage all in this folder{elsewhere}"), Op::UnstageAll)),
                         Group::Conflicts => None,
                     };
-                    let action = action.map(|(icon, label, op)| {
+                    // shown while hovered, as a change's actions
+                    let action = action.filter(|_| list.hovered == Some(ix)).map(|(icon, label, op)| {
                         super::commit::action_button(&theme, ("change-group-action", ix), icon, label, busy)
-                            .hidden()
-                            .group_hover("change-group", |s| s.flex())
+                            .debug_selector(|| format!("change-group-action-{ix}"))
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                                 cx.stop_propagation();
                                 this.run_git_op(op.clone(), window, cx);
@@ -682,7 +715,6 @@ impl SidePanel {
                     });
                     div()
                         .id(("change-group", ix))
-                        .group("change-group")
                         .h(px(ROW_HEIGHT))
                         .w_full()
                         .pl(px(8.))
@@ -705,6 +737,7 @@ impl SidePanel {
                         .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).font_weight(gpui::FontWeight::MEDIUM).text_color(theme.text_muted).child(group.label()))
                         .children(action)
                         .child(div().flex_none().text_size(px(11.)).text_color(theme.text_faint).child(count.to_string()))
+                        .on_hover(cx.listener(move |this, on: &bool, _, cx| this.hover_change(ix, *on, cx)))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_group(group, cx)))
                         .into_any_element()
                 }
@@ -729,6 +762,7 @@ impl SidePanel {
                     };
                     let key = (change.group, change.path.clone());
                     let selected = list.selected.as_ref() == Some(&key) || menu.as_ref() == Some(&key);
+                    let hovered = list.hovered == Some(ix);
                     let icon = material_icon(name, change.is_folder(), false);
                     let deleted = change.absent();
                     let tooltip = match (&change.orig, &change.moved_to) {
@@ -759,10 +793,10 @@ impl SidePanel {
                             },
                         ))
                     });
-                    let actions = div().flex_none().gap(px(2.)).hidden().group_hover("change-row", |s| s.flex()).when(selected, |el| el.flex()).children(actions);
+                    let actions = (selected || hovered).then(|| div().debug_selector(|| format!("change-actions-{ix}")).flex_none().flex().gap(px(2.)).children(actions));
                     div()
                         .id(("change-row", ix))
-                        .group("change-row")
+                        .debug_selector(|| format!("change-row-{ix}"))
                         .h(px(ROW_HEIGHT))
                         .w_full()
                         .pl(px(28.))
@@ -786,7 +820,7 @@ impl SidePanel {
                                 .child(name.to_string()),
                         )
                         .child(div().flex_1().min_w_0().truncate().text_size(px(11.5)).text_color(theme.text_faint).child(dir.to_string()))
-                        .child(actions)
+                        .children(actions)
                         .child(
                             div()
                                 .w(px(12.))
@@ -797,6 +831,7 @@ impl SidePanel {
                                 .child(change.code.to_string()),
                         )
                         .tooltip(tip(tooltip, None))
+                        .on_hover(cx.listener(move |this, on: &bool, _, cx| this.hover_change(ix, *on, cx)))
                         .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
                             window.focus(&this.focus, cx);
                             if let Some(list) = this.changes.as_mut() {
@@ -1366,6 +1401,80 @@ mod tests {
             p.take_status(id, 1, Instant::now(), Some(Ok(answer.clone())), cx);
             assert_eq!(p.changes_count(), Some(1));
         });
+    }
+
+    /// A row under the pointer shows its actions, and they go when it leaves. A group hover showing them came too late
+    /// for their prepaint, and painting them panicked.
+    #[gpui::test]
+    fn hovering_a_row_shows_its_actions(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        cx.update(|cx| cx.set_global(Theme::for_appearance(gpui::WindowAppearance::Dark)));
+        let (panel, cx) = cx.add_window_view(|_, cx| SidePanel::new(rt.handle().clone(), crate::settings::PanelTab::Changes, cx));
+        let answer = Answer { status: Status { changes: vec![change(Group::Changes, "notes.txt")], ..Default::default() }, prefix: String::new(), repo: RepoState::default() };
+        panel.update(cx, |p, cx| {
+            p.context.root = Some("/tmp/fictional-repo".into());
+            p.context.workspace_id = Some("w1".into());
+            p.changes = Some(ChangeList::new("/tmp/fictional-repo".into()));
+            let id = p.changes.as_ref().unwrap().id;
+            p.take_status(id, 0, Instant::now(), Some(Ok(answer)), cx);
+            assert_eq!(p.changes.as_ref().unwrap().rows, [ChangeRow::Header { group: Group::Changes, count: 1, folded: false }, ChangeRow::Change(0)]);
+        });
+        cx.run_until_parked();
+        let row = cx.debug_bounds("change-row-1").expect("the change's row drawn");
+        let hovered = |cx: &mut gpui::VisualTestContext| panel.read_with(cx, |p, _| p.changes.as_ref().unwrap().hovered);
+        assert_eq!(hovered(cx), None);
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(hovered(cx), Some(1));
+        let actions = cx.debug_bounds("change-actions-1").expect("the row's actions drawn");
+        assert!(row.contains(&actions.center()), "{actions:?} not in {row:?}");
+        // off the row: gone, and taking no space
+        cx.simulate_mouse_move(row.bottom_left() + gpui::point(px(0.), px(200.)), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!((hovered(cx), cx.debug_bounds("change-actions-1")), (None, None));
+    }
+
+    /// A stage that rebuilds the rows under a still pointer puts a header under it; drawn then, its Stage All shown by a
+    /// group hover was never prepainted and painting it panicked.
+    #[gpui::test]
+    fn a_header_rebuilt_under_a_still_pointer_draws(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        cx.update(|cx| cx.set_global(Theme::for_appearance(gpui::WindowAppearance::Dark)));
+        let (panel, cx) = cx.add_window_view(|_, cx| SidePanel::new(rt.handle().clone(), crate::settings::PanelTab::Changes, cx));
+        let answer = |changes| Answer { status: Status { changes, ..Default::default() }, prefix: String::new(), repo: RepoState::default() };
+        let before = answer(vec![change(Group::Changes, "notes.txt"), change(Group::Changes, "draft.txt"), change(Group::Untracked, "sketch.txt")]);
+        let id = panel.update(cx, |p, cx| {
+            p.context.root = Some("/tmp/fictional-repo".into());
+            p.context.workspace_id = Some("w1".into());
+            p.changes = Some(ChangeList::new("/tmp/fictional-repo".into()));
+            let id = p.changes.as_ref().unwrap().id;
+            p.take_status(id, 0, Instant::now(), Some(Ok(before)), cx);
+            assert_eq!(p.changes.as_ref().unwrap().rows[2], ChangeRow::Change(1));
+            id
+        });
+        cx.run_until_parked();
+        let row = cx.debug_bounds("change-row-2").expect("draft.txt's row drawn");
+        let hovered = |cx: &mut gpui::VisualTestContext| panel.read_with(cx, |p, _| p.changes.as_ref().unwrap().hovered);
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(hovered(cx), Some(2));
+        // draft.txt gone (staged elsewhere, say): the Untracked header lands under the pointer, which has not moved
+        let after = answer(vec![change(Group::Changes, "notes.txt"), change(Group::Untracked, "sketch.txt")]);
+        panel.update(cx, |p, cx| {
+            p.take_status(id, 0, Instant::now(), Some(Ok(after)), cx);
+            assert_eq!(p.changes.as_ref().unwrap().rows[2], ChangeRow::Header { group: Group::Untracked, count: 1, folded: false });
+        });
+        cx.run_until_parked();
+        // another row is there now, which gpui counts as unhovered until the pointer moves
+        assert_eq!((hovered(cx), cx.debug_bounds("change-group-action-2")), (None, None));
+        cx.simulate_mouse_move(row.center() + gpui::point(px(1.), px(0.)), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(hovered(cx), Some(2));
+        let action = cx.debug_bounds("change-group-action-2").expect("the header's Stage All drawn");
+        assert!(row.contains(&action.center()), "{action:?} not in {row:?}");
+        cx.simulate_mouse_move(row.bottom_left() + gpui::point(px(0.), px(200.)), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!((hovered(cx), cx.debug_bounds("change-group-action-2")), (None, None));
     }
 
     /// A stage past its deadline is stopped, not killed: git takes its `index.lock` away and its slow clean filter
