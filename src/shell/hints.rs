@@ -286,6 +286,7 @@ impl Shell {
         open(&self.view_menu)
             || open(&self.agents_menu)
             || open(&self.ws_menu)
+            || open(&self.web_menu)
             || open(&self.pane_menu)
             || open(&self.spent_menu)
             || open(&self.usage_menu)

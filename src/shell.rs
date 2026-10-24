@@ -29,6 +29,7 @@ mod motion;
 mod pane_drag;
 mod popups;
 mod quick_open;
+mod reorder;
 mod review;
 mod right_panel;
 mod kept_views;
@@ -121,6 +122,8 @@ pub struct Shell {
     folded: std::collections::HashSet<String>,
     /// A workspace's right-click menu and where it opened.
     ws_menu: Option<crate::ui::Popup<(String, gpui::Point<Pixels>)>>,
+    /// A web page's right-click menu in the sidebar: its entry's id, and where it was clicked.
+    web_menu: Option<crate::ui::Popup<(String, gpui::Point<Pixels>)>>,
     /// Groups mid fold or unfold, by workspace id.
     fold_motion: HashMap<String, FoldMotion>,
     /// Resize seams' hover: (hovered, flip count), keyed by the strip id.
@@ -605,6 +608,7 @@ impl Shell {
                     fold_motion: Default::default(),
                     seam_hover: Default::default(),
                     ws_menu: None,
+                    web_menu: None,
                     shown_workspace: None,
                     sidebar_width: SettingsGlobal::of(cx).settings.sidebar_width,
                     sidebar_open: SettingsGlobal::of(cx).settings.sidebar_open,
@@ -810,6 +814,16 @@ impl Shell {
         if let Some((view, _)) = &self.settings {
             window.focus(&view.focus_handle(cx), cx);
             view.update(cx, |v, cx| v.show_shortcut(action, window, cx));
+        }
+    }
+
+    /// Settings on its Web pages page, opened if it is not up: a page's menu's way there.
+    pub(super) fn open_web_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_none() {
+            self.toggle_settings_here(window, cx);
+        }
+        if let Some((view, _)) = &self.settings {
+            view.update(cx, |v, cx| v.show_web_pages(cx));
         }
     }
 
@@ -1456,6 +1470,7 @@ impl Render for Shell {
         crate::ui::reap_popup(&mut self.view_menu, window);
         crate::ui::reap_popup(&mut self.agents_menu, window);
         crate::ui::reap_popup(&mut self.ws_menu, window);
+        crate::ui::reap_popup(&mut self.web_menu, window);
         crate::ui::reap_popup(&mut self.pane_menu, window);
         crate::ui::reap_popup(&mut self.spent_menu, window);
         crate::ui::reap_popup(&mut self.usage_menu, window);

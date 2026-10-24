@@ -79,6 +79,8 @@ pub(super) struct Pages {
     made: u64,
     /// The setting that sends links to other sites to the browser, as the pages' handlers read it.
     links_outside: Rc<Cell<bool>>,
+    /// The sidebar's rows of them, as dragged to reorder.
+    reorder: Rc<std::cell::RefCell<reorder::Reorder>>,
     /// `SHEPHERD_WEB`'s entry was shown.
     hooked: bool,
     /// GPUI draws its deferred layer (menus, dialogs, panels, toasts) above the pages, so they needn't hide for it.
@@ -633,29 +635,117 @@ impl Shell {
             .child(div().ml(px(6.)).flex_1().min_w_0().truncate().text_color(theme.text_muted).child(title))
     }
 
+    /// A web page's right-click menu in the sidebar, while it is up.
+    pub(super) fn web_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let menu = self.web_menu.as_ref()?;
+        let (id, at) = menu.value.clone();
+        let entry = SettingsGlobal::of(cx).settings.web_entries.iter().find(|e| e.id == id).cloned()?;
+        let url = normalize(&entry.url);
+        let view = self.pages.live.get(&self.page_key(&entry)).map(|p| p.view.clone());
+        type Pick = Box<dyn Fn(&mut Shell, &mut Window, &mut Context<Shell>)>;
+        let item = |key: &'static str, label: &'static str, pick: Pick| {
+            row(theme, false, key).h(px(28.)).rounded(px(6.)).child(label).on_pick(
+                at,
+                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    if let Some(m) = this.web_menu.as_mut() {
+                        m.close()
+                    }
+                    pick(this, window, cx);
+                    cx.notify();
+                }),
+            )
+        };
+        let (copied, removed) = (url.clone(), id.clone());
+        let card = menu_card(theme, "web-menu", 160.)
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                if let Some(m) = this.web_menu.as_mut() {
+                    m.close()
+                }
+                cx.notify();
+            }))
+            // a page not opened yet has nothing to reload
+            .children(view.map(|view| {
+                item("web-menu-reload", "Reload", Box::new(move |_, _, _| drop(view.reload())))
+            }))
+            .child(item("web-menu-browser", "Open in Browser", Box::new(move |_, _, cx| cx.open_url(&url))))
+            .child(item(
+                "web-menu-copy",
+                "Copy URL",
+                Box::new(move |_, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(copied.clone()))),
+            ))
+            .child(item("web-menu-edit", "Edit…", Box::new(|this, window, cx| this.open_web_settings(window, cx))))
+            .child(div().mx(px(-4.)).my(px(4.)).h(px(1.)).bg(theme.border))
+            .child(
+                item(
+                    "web-menu-remove",
+                    "Remove",
+                    Box::new(move |_, _, cx| {
+                        let id = removed.clone();
+                        save_from_sidebar(cx, move |s| s.web_entries.retain(|e| e.id != id))
+                    }),
+                )
+                .text_color(theme.danger),
+            );
+        let menu = crate::ui::menu_motion("web-menu-in", menu, card);
+        Some(
+            gpui::deferred(gpui::anchored().position(at).snap_to_window_with_margin(px(8.)).child(menu))
+                .with_priority(1)
+                .into_any_element(),
+        )
+    }
+
     /// The sidebar's rows of the entries listed for the place shown, above the workspaces, with a hairline under them.
-    /// `place`'s rows; `live` for the sidebar itself, not for the place a swipe shows beside it, whose rows are only
-    /// drawn.
-    pub(super) fn web_rows(&self, place: Option<&str>, live: bool, theme: &Theme, cx: &mut Context<Self>) -> Option<Div> {
+    /// `place`'s rows; `live` for the sidebar itself, dragged to reorder them, not for the place a swipe shows beside
+    /// it, whose rows are only drawn.
+    pub(super) fn web_rows(&self, place: Option<&str>, live: bool, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
         let entries = self.entries_in(place, cx);
         if entries.is_empty() {
             return None;
         }
         let shown = self.pages.shown.clone().filter(|_| live);
-        let rows = entries.into_iter().map(|e| {
-            let key = self.page_key(&e);
-            let name = label(&e, self.pages.live.get(&key).and_then(|p| p.title.as_deref()));
-            let selected = shown.as_deref() == Some(e.id.as_str());
-            let id = e.id.clone();
-            let icon = match self.pages.favicons.get(&key) {
-                Some((_, Favicon::Image(image))) => gpui::img(image.clone()).size(px(16.)).rounded(px(3.)).into_any_element(),
-                _ => sessions::place_mark(&name, None, false, theme.text_muted),
-            };
-            crate::shell::row(theme, selected, SharedString::from(format!("web-{}", e.id)))
-                .child(div().size(px(16.)).flex_none().flex().items_center().justify_center().child(icon))
-                .child(div().flex_1().min_w_0().truncate().child(name))
-                .when(live, |el| el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.show_web(id.clone(), window, cx))))
-        });
+        let rows: Vec<(String, gpui::AnyElement)> = entries
+            .into_iter()
+            .map(|e| {
+                let key = self.page_key(&e);
+                let name = label(&e, self.pages.live.get(&key).and_then(|p| p.title.as_deref()));
+                let selected = shown.as_deref() == Some(e.id.as_str());
+                let id = e.id.clone();
+                let icon = match self.pages.favicons.get(&key) {
+                    Some((_, Favicon::Image(image))) => gpui::img(image.clone()).size(px(16.)).rounded(px(3.)).into_any_element(),
+                    _ => sessions::place_mark(&name, None, false, theme.text_muted),
+                };
+                let menu_id = e.id.clone();
+                let row = crate::shell::row(theme, selected, SharedString::from(format!("web-{}", e.id)))
+                    .h(px(if SettingsGlobal::of(cx).settings.compact_workspaces { 26. } else { 32. }))
+                    .child(div().size(px(16.)).flex_none().flex().items_center().justify_center().child(icon))
+                    .child(div().flex_1().min_w_0().truncate().child(name))
+                    .when(live, |el| {
+                        reorder::draggable(el, &self.pages.reorder, &e.id)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.show_web(id.clone(), window, cx)))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                                    this.web_menu = Some(crate::ui::Popup::new((menu_id.clone(), e.position)));
+                                    cx.notify();
+                                }),
+                            )
+                    });
+                (e.id, row.into_any_element())
+            })
+            .collect();
+        let keys: Vec<String> = rows.iter().map(|(k, _)| k.clone()).collect();
+        let column = match live {
+            true => {
+                let (column, dropped) = reorder::column(&self.pages.reorder, rows, 2., theme, window, cx.has_active_drag());
+                // the dropped row takes the place of the one it was dropped on
+                if let Some((from, to)) = dropped {
+                    let (id, to) = (keys[from].clone(), keys[to].clone());
+                    cx.defer(move |cx| save_from_sidebar(cx, move |s| crate::web::move_entry(&mut s.web_entries, &id, &to)));
+                }
+                column
+            }
+            false => div().flex().flex_col().gap(px(2.)).children(rows.into_iter().map(|(_, row)| row)),
+        };
         Some(
             div()
                 .flex_none()
@@ -663,9 +753,8 @@ impl Shell {
                 .pt(px(8.))
                 .flex()
                 .flex_col()
-                .gap(px(2.))
-                .children(rows)
-                .child(div().mt(px(6.)).mx(px(8.)).h(px(1.)).bg(theme.border)),
+                .child(column)
+                .child(div().mt(px(8.)).mx(px(8.)).h(px(1.)).bg(theme.border)),
         )
     }
 }
@@ -679,7 +768,7 @@ mod host {
     use objc2::rc::Retained;
     use objc2::{MainThreadMarker, MainThreadOnly, msg_send};
     use objc2::runtime::AnyObject;
-    use objc2_app_kit::{NSAutoresizingMaskOptions, NSEvent, NSEventMask, NSEventModifierFlags, NSView, NSWindowOrderingMode};
+    use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSEvent, NSEventMask, NSEventModifierFlags, NSView, NSWindowOrderingMode};
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use std::ptr::NonNull;
     use std::rc::Rc;
@@ -730,12 +819,22 @@ mod host {
                     alt: flags.contains(NSEventModifierFlags::Option),
                     shift: flags.contains(NSEventModifierFlags::Shift),
                 };
-                let characters = e.charactersIgnoringModifiers().map(|c| c.to_string()).unwrap_or_default();
-                match in_page.then(|| crate::web::shepherds_key(mods, &characters, &shortcuts.borrow())).flatten() {
-                    Some(keystroke) => {
-                        key(keystroke);
-                        std::ptr::null_mut()
-                    }
+                // the key as ⌘ types it: Latin in a layout like Russian, whose own letters ⌘ doesn't use (Shift kept,
+                // ⌥ left out, as `charactersIgnoringModifiers` would)
+                let as_cmd = NSEventModifierFlags::Command | (flags & NSEventModifierFlags::Shift);
+                let characters = e.charactersByApplyingModifiers(as_cmd).map(|c| c.to_string()).unwrap_or_default();
+                if !in_page {
+                    return event.as_ptr();
+                }
+                if let Some(keystroke) = crate::web::shepherds_key(mods, &characters, &shortcuts.borrow()) {
+                    key(keystroke);
+                    return std::ptr::null_mut();
+                }
+                // ⌘C, ⌘V and the rest go to the page's first responder, as an Edit menu's items would send them
+                let edit = crate::web::edit_action(mods, &characters).map(objc2::runtime::Sel::register);
+                // SAFETY: an action sent up the responder chain, on the main thread
+                match edit.filter(|&sel| unsafe { NSApplication::sharedApplication(mtm).sendAction_to_from(sel, None, None) }) {
+                    Some(_) => std::ptr::null_mut(),
                     None => event.as_ptr(),
                 }
             });

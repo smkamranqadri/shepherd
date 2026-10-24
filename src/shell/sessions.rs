@@ -550,7 +550,7 @@ impl Shell {
     /// its watcher last took, or a word on why there is none.
     pub(super) fn place_preview(&self, place: &Place, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let heading = div().px(px(16.)).pt(px(8.)).pb(px(6.)).text_size(px(11.)).text_color(theme.text_faint).truncate().child(place.look(cx).0);
-        let column = div().size_full().flex().flex_col().children(self.web_rows(Some(&place.key()), false, theme, cx)).child(heading);
+        let column = div().size_full().flex().flex_col().children(self.web_rows(Some(&place.key()), false, theme, window, cx)).child(heading);
         let key = watchers::SessionKey::of(place);
         let Some(snapshot) = self.watchers.snapshot(&key).cloned() else {
             if let Place::Session(s) = place && !s.running {

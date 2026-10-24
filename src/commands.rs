@@ -30,6 +30,8 @@ pub enum Command {
     MoveTab { tab_id: String, insert_index: usize },
     NewWorkspace { cwd: Option<String> },
     CloseWorkspace { workspace_id: String },
+    /// Moves `workspace_ids` together to before `before`, or to the end.
+    MoveWorkspaces { workspace_ids: Vec<String>, before: Option<String> },
     /// A linked worktree of the workspace's repo, opened as its own workspace; without a branch herdr names one.
     CreateWorktree { workspace_id: String, branch: Option<String> },
     /// Deletes a linked worktree's checkout and closes its workspace; the branch stays. Without `force` herdr
@@ -40,9 +42,6 @@ pub enum Command {
     /// Opens a worktree of the workspace's repo at `path` as its own workspace.
     OpenWorktree { workspace_id: String, path: String },
     RenameWorkspace { workspace_id: String, label: String },
-    /// Moves workspaces, in this order, before `before` (to the end with `None`); herdr takes ids that aren't next to
-    /// each other, gathers them, and renumbers every workspace to its new place. It refuses a `before` among them.
-    MoveWorkspaces { workspace_ids: Vec<String>, before: Option<String> },
     Split { pane_id: String, down: bool },
     ClosePane { pane_id: String },
     FocusPane { pane_id: String, direction: Direction },
@@ -101,6 +100,9 @@ impl Command {
             Command::CloseWorkspace { workspace_id } => {
                 ("workspace.close", json!({"workspace_id": workspace_id, "close_group": false}))
             }
+            Command::MoveWorkspaces { workspace_ids, before } => {
+                ("workspace.move_block", json!({"workspace_ids": workspace_ids, "before_workspace_id": before}))
+            }
             Command::CreateWorktree { workspace_id, branch } => {
                 let mut params = json!({"workspace_id": workspace_id, "focus": false});
                 if let Some(branch) = branch {
@@ -117,9 +119,6 @@ impl Command {
             }
             Command::RenameWorkspace { workspace_id, label } => {
                 ("workspace.rename", json!({"workspace_id": workspace_id, "label": label}))
-            }
-            Command::MoveWorkspaces { workspace_ids, before } => {
-                ("workspace.move_block", json!({"workspace_ids": workspace_ids, "before_workspace_id": before}))
             }
             Command::Split { pane_id, down } => (
                 "pane.split",
@@ -253,6 +252,10 @@ mod tests {
         assert_eq!(
             req(Command::CloseWorkspace { workspace_id: "w1".into() }),
             ("workspace.close", json!({"workspace_id": "w1", "close_group": false}))
+        );
+        assert_eq!(
+            req(Command::MoveWorkspaces { workspace_ids: vec!["w2".into(), "w3".into()], before: None }),
+            ("workspace.move_block", json!({"workspace_ids": ["w2", "w3"], "before_workspace_id": null}))
         );
         assert_eq!(
             req(Command::RemoveWorktree { workspace_id: "w2".into(), force: false }),

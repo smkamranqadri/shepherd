@@ -28,6 +28,15 @@ pub fn listed<'a>(entries: &'a [WebEntry], place: Option<&str>) -> Vec<&'a WebEn
     entries.iter().filter(|e| e.show_in.is_none() || e.show_in.as_deref() == place).collect()
 }
 
+/// Moves entry `id` to where entry `to` is: a row dropped on another takes its place, so it lands after it when
+/// moved down and before it when moved up.
+pub fn move_entry(entries: &mut Vec<WebEntry>, id: &str, to: &str) {
+    let at = |id: &str| entries.iter().position(|e| e.id == id);
+    let (Some(from), Some(to)) = (at(id), at(to)) else { return };
+    let entry = entries.remove(from);
+    entries.insert(to, entry);
+}
+
 /// A URL's scheme, lowercased host and port (the scheme's default when none is written); `None` for anything but
 /// http and https.
 fn origin(url: &str) -> Option<(String, String, u16)> {
@@ -203,6 +212,24 @@ pub fn shepherds_key(mods: Mods, characters: &str, chords: &[String]) -> Option<
         .find(|k| pressed.iter().flatten().any(|p| p == k))
 }
 
+/// The edit action (AppKit's selector) of a standard editing chord pressed in a page: WebKit takes these from the
+/// Edit menu, which Shepherd hasn't, so the page's key monitor sends them itself.
+pub fn edit_action(mods: Mods, characters: &str) -> Option<&'static std::ffi::CStr> {
+    if !mods.cmd || mods.ctrl {
+        return None;
+    }
+    Some(match (characters.to_lowercase().as_str(), mods.alt, mods.shift) {
+        ("c", false, false) => c"copy:",
+        ("x", false, false) => c"cut:",
+        ("v", false, false) => c"paste:",
+        ("v", true, true) => c"pasteAsPlainText:",
+        ("a", false, false) => c"selectAll:",
+        ("z", false, false) => c"undo:",
+        ("z", false, true) => c"redo:",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +372,29 @@ mod tests {
         assert_eq!(image_format(b"GIF89a"), Some(ImageFormat::Gif));
         assert_eq!(image_format(b"RIFF\0\0\0\0WEBPVP8 "), Some(ImageFormat::Webp));
         assert_eq!(image_format(b"nope"), None);
+    }
+
+    #[test]
+    fn a_dropped_entry_takes_the_place_of_the_one_it_is_dropped_on() {
+        let mut entries: Vec<WebEntry> = ["a", "b", "c"].map(|id| WebEntry { id: id.into(), ..Default::default() }).into();
+        let ids = |e: &[WebEntry]| e.iter().map(|e| e.id.clone()).collect::<Vec<_>>().join("");
+        move_entry(&mut entries, "a", "c");
+        assert_eq!(ids(&entries), "bca");
+        move_entry(&mut entries, "a", "b");
+        assert_eq!(ids(&entries), "abc");
+        move_entry(&mut entries, "a", "gone");
+        assert_eq!(ids(&entries), "abc");
+    }
+
+    #[test]
+    fn a_standard_editing_chord_in_a_page_is_its_edit_action() {
+        let cmd = Mods { cmd: true, ..Mods::default() };
+        assert_eq!(edit_action(cmd, "c"), Some(c"copy:"));
+        assert_eq!(edit_action(cmd, "v"), Some(c"paste:"));
+        assert_eq!(edit_action(Mods { shift: true, ..cmd }, "Z"), Some(c"redo:"));
+        assert_eq!(edit_action(Mods { ctrl: true, ..cmd }, "c"), None);
+        assert_eq!(edit_action(Mods::default(), "c"), None);
+        assert_eq!(edit_action(cmd, "k"), None);
     }
 
     #[test]
