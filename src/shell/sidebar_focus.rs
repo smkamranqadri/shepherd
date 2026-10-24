@@ -122,25 +122,35 @@ mod tests {
         assert!(tree_view(&places, &w, &open, Some(&shown), &key("default"), true).drags, "focus mode drags");
     }
 
+    /// A settings file from before groups always showed their worktrees: its saved folds (a bare id, as the first
+    /// builds kept them, and one by session) load and hide nothing; the rows drawn, each of `shown_groups` with its
+    /// worktrees under it, are what Workspace1–9 number, in order. Its session fold still folds and opens.
     #[test]
-    fn numbering_counts_the_rows_as_they_are_drawn() {
-        let s = web();
-        let folded = |root: &str| root == "w1";
-        // what `workspace_rows` draws: `shown_groups`, a group's worktrees while `kids_shown`
-        let drawn = || {
-            sidebar_tree::shown_groups(&s)
-                .into_iter()
-                .flat_map(|(w, kids)| {
-                    let open = sidebar_tree::kids_shown(folded(&w.workspace_id));
-                    std::iter::once(w.workspace_id.clone()).chain(kids.into_iter().filter(move |_| open).map(|k| k.workspace_id.clone()))
-                })
-                .collect::<Vec<_>>()
-        };
-        let rows = [TreeRow::Workspaces { key: key("web") }];
-        let folds: HashSet<String> = [root_key(&key("web").0, "w1")].into();
-        let numbered = workspace_order(&rows, |_| Some(&s), &folds).into_iter().map(|(_, w)| w).collect::<Vec<_>>();
-        assert_eq!(numbered, drawn());
-        assert_eq!(numbered, ["w1", "w4"]);
+    fn legacy_worktree_folds_hide_nothing_and_numbering_is_the_rows_drawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let file = json!({"folded": ["w1", root_key(&key("default").0, "w1")], "collapsed_sessions": [key("notes").0]});
+        std::fs::write(&path, file.to_string()).unwrap();
+        let (settings, err) = crate::settings::Settings::load(&path);
+        assert!(err.is_none(), "{err:?}");
+        let (places, w, shown) = sessions();
+        let rows = tree_view(&places, &w, &sidebar_tree::saved_folds(&settings), Some(&shown), &key("default"), false).rows;
+        assert_eq!(kinds(&rows), ["S default", "W default", "S notes folded", "S old", "N Stopped"]);
+        // what `workspace_rows` draws: each of `shown_groups`, its worktrees under it
+        let drawn: Vec<String> = sidebar_tree::shown_groups(&shown).into_iter().flat_map(|(w, kids)| std::iter::once(w).chain(kids)).map(|w| w.workspace_id.clone()).collect();
+        assert_eq!(drawn, ["w1", "w2", "w3", "w4"], "the folded checkout's worktrees drawn");
+        let snaps = |k: &SessionKey| (*k == key("default")).then_some(&shown);
+        let numbered: Vec<String> = workspace_order(&rows, snaps).into_iter().map(|(_, w)| w).collect();
+        assert_eq!(numbered, drawn);
+        // the session's fold still opens, and folds again
+        let mut collapsed = settings.collapsed_sessions.clone();
+        sidebar_tree::toggle_in(&mut collapsed, &key("notes").0);
+        assert!(collapsed.is_empty());
+        sidebar_tree::toggle_in(&mut collapsed, &key("notes").0);
+        assert_eq!(collapsed, [key("notes").0]);
+        // saved again, the old folds are gone
+        settings.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("\"folded\""));
     }
 
     #[test]
@@ -151,7 +161,7 @@ mod tests {
         assert_eq!(kinds(&focus.rows), ["W default"], "no machine or session rows, its fold aside");
         let notes = w.snapshot(&key("notes")).unwrap().clone();
         let snaps = |k: &SessionKey| if *k == key("default") { Some(&shown) } else if *k == key("notes") { Some(&notes) } else { None };
-        let order: Vec<String> = workspace_order(&focus.rows, snaps, &HashSet::new()).into_iter().map(|(_, w)| w).collect();
+        let order: Vec<String> = workspace_order(&focus.rows, snaps).into_iter().map(|(_, w)| w).collect();
         assert_eq!(order, ["w1", "w2", "w3", "w4"], "Workspace1–9 number the shown session's");
         let plain = tree_view(&places, &w, &collapsed, Some(&shown), &key("default"), false);
         assert_eq!(kinds(&plain.rows)[..2], ["S default folded", "S notes"], "off, every session, its saved fold kept");

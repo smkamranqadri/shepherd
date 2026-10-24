@@ -1,28 +1,10 @@
-//! The sidebar: its slide, resize and folds.
+//! The sidebar: its slide and resize, its rows and its foot.
 use super::*;
 
 /// How long the floating sidebar stays after the pointer leaves it.
 const PEEK_LINGER: Duration = Duration::from_millis(200);
 
 impl Shell {
-    /// Folds or unfolds a worktree group, tweening from wherever its body is now.
-    pub(super) fn toggle_fold(&mut self, id: &str, full: f32, cx: &mut Context<Self>) {
-        let open = !self.folded.contains(id);
-        let prev = self.fold_motion.get(id).copied();
-        let from = prev.filter(|m| m.animating()).map(FoldMotion::current).unwrap_or(if open { full } else { 0. });
-        let epoch = prev.map_or(1, |m| m.epoch + 1);
-        self.fold_motion.insert(id.to_string(), FoldMotion { epoch, from, to: if open { 0. } else { full }, started: Instant::now() });
-        if open {
-            self.folded.insert(id.to_string());
-        } else {
-            self.folded.remove(id);
-        }
-        // ponytail: ids of workspaces since closed stay in the list; prune against the snapshot if it grows
-        let mut folded: Vec<String> = self.folded.iter().cloned().collect();
-        folded.sort();
-        save_from_sidebar(cx, |s| s.folded = folded);
-    }
-
     /// The sidebar's width this frame: mid tween, or where it rests.
     pub(super) fn sidebar_now(&self) -> f32 {
         match self.sidebar_motion.filter(|m| m.animating()) {
@@ -161,7 +143,7 @@ impl Shell {
         self.restore = None;
     }
 
-    /// The workspace list's rows for `snapshot`: each workspace with its worktrees folded under it. `Live` rows answer
+    /// The workspace list's rows for `snapshot`: each workspace with its worktrees under it. `Live` rows answer
     /// clicks, renames and drags and show worktrees being made; another session's (`Other`) switch there on a click.
     /// `hints` holds the numbered workspaces' chords across the tree; `filter`, whether they drag.
     #[allow(clippy::too_many_arguments)]
@@ -177,9 +159,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         let live = mode == sidebar_tree::RowMode::Live;
-        // folds are kept per session, and ids told apart by session: workspace ids repeat across sessions
+        // ids told apart by session: workspace ids repeat across sessions
         let (session, idx) = self.row_keys(&mode);
-        let fold_key = |id: &str| crate::files::roots::root_key(&session, id);
         // a drop herdr hasn't answered yet shows its order already
         let key = watchers::SessionKey(session.clone());
         let pending = snapshot.and_then(|s| self.pending_order(&key, s));
@@ -214,8 +195,7 @@ impl Shell {
         };
         // held Ctrl+Shift (Ctrl on macOS): each of the first nine workspaces' chord, in `go_to_workspace`'s order
         let hint = hints;
-        // `takes_drop`: the row takes a drop; a folded group's hidden worktrees keep their bounds under the rows after it
-        let ws_row = |w: &crate::model::Workspace, nested: bool, chevron: Option<gpui::AnyElement>, folded: Option<usize>, takes_drop: bool, cx: &mut Context<Self>| {
+        let ws_row = |w: &crate::model::Workspace, nested: bool, cx: &mut Context<Self>| {
             let chip = hint.and_then(|(opacity, chords)| {
                 let (_, _, chord) = chords.iter().find(|(k, id, _)| k.0 == session && *id == w.workspace_id)?;
                 Some(hints::chip(theme, chord, *opacity))
@@ -266,7 +246,7 @@ impl Shell {
                 div().flex_none().flex().gap(px(4.)).text_size(px(11.)).text_color(theme.text_faint).children(changes).children(pr)
             });
             // Zeron's card: the name, and under it the branch with what it changed; one line when compact
-            // a worktree always has its branch line, so a folding group knows its height
+            // a worktree always has its branch line
             let two = !compact && (nested || branch.is_some() || extras.is_some());
             let (inline, below) = if two { (None, extras) } else { (extras, None) };
             // a repo's own artwork or its monogram; its worktrees, indented under its name, go without
@@ -311,7 +291,6 @@ impl Shell {
                                 .gap(px(8.))
                                 .children(icon)
                                 .child(name)
-                                .children(folded.map(|n| count_badge(theme, n)))
                                 .children(sync_inline)
                                 .child(div().flex_1())
                                 .children(inline),
@@ -348,15 +327,14 @@ impl Shell {
                         el.when(show.status, |el| el.child(status_dot(w.agent_status, theme)))
                     }
                 })
-                .children(chevron)
-                // over the row's right end (its status and chevron), so nothing in it moves
+                // over the row's right end (its status), so nothing in it moves
                 .when_some(chip, |el, chip| el.relative().child(chip))
                 .when(draggable.contains(&w.workspace_id), |el| {
                     let item = if nested { tree_drag::Item::Kid(w.workspace_id.clone()) } else { tree_drag::Item::Group(w.workspace_id.clone()) };
                     let dragged = tree_drag::DraggedTreeItem { from: key.clone(), item, label: w.label.clone(), theme: theme.clone() };
                     el.on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone()))
                 })
-                .when(filter.allows(takes_drop), |el| {
+                .when(filter.drags, |el| {
                     let over = tree_drag::Over::Workspace(key.clone(), w.workspace_id.clone());
                     el.on_drag_move(cx.listener(move |this, e: &gpui::DragMoveEvent<tree_drag::DraggedTreeItem>, _, cx| this.tree_drag_over(over.clone(), e, cx)))
                 })
@@ -405,56 +383,25 @@ impl Shell {
                 .map(|(_, branch)| branch.clone())
                 .collect();
             if kids.is_empty() && pending.is_empty() {
-                return tree_drag::with_line(ws_row(&w, false, None, None, true, cx), theme, group_line(&w.workspace_id));
+                return tree_drag::with_line(ws_row(&w, false, cx), theme, group_line(&w.workspace_id));
             }
-            // A folded group opens while one of its worktrees is being created.
-            let fold = fold_key(&w.workspace_id);
-            let open = sidebar_tree::kids_shown(self.folded.contains(&fold)) || !pending.is_empty();
-            let full = (kids.len() + pending.len()) as f32 * (kid_h + 2.);
-            let tween = self.fold_motion.get(&fold).copied().filter(|m| m.animating());
-            let chevron = fold_chevron(theme, &format!("{idx}-{}", w.workspace_id), open, full, tween).map(|el| {
-                el.on_click(cx.listener({
-                    let id = fold.clone();
-                    move |this, _: &ClickEvent, _, cx| {
-                        cx.stop_propagation();
-                        this.toggle_fold(&id, full, cx);
-                        cx.notify();
-                    }
-                }))
-            });
-            let header = ws_row(&w, false, Some(chevron.into_any_element()), (!open).then_some(kids.len()), true, cx);
-            let kids_take_drops = open && tween.is_none();
+            // a group always shows its worktrees, and those being created
+            let header = ws_row(&w, false, cx);
             let body = div()
                 .w_full()
                 .flex_none()
-                .overflow_hidden()
                 .flex()
                 .flex_col()
                 .pt(px(2.))
                 .gap(px(2.))
-                .children(kids.iter().map(|k| tree_drag::with_line(ws_row(k, true, None, None, kids_take_drops, cx), theme, kid_line(&k.workspace_id))).collect::<Vec<_>>())
+                .children(kids.iter().map(|k| tree_drag::with_line(ws_row(k, true, cx), theme, kid_line(&k.workspace_id))).collect::<Vec<_>>())
                 .children(pending.iter().map(|b| pending_worktree_row(theme, b).h(px(kid_h)).into_any_element()));
-            let body = match tween {
-                None => body.h(px(if open { full } else { 0. })).into_any_element(),
-                // Zeron's disclosure: the height tweens, the rows fade up from 35 % and slide 3 px.
-                Some(m) => body
-                    .with_animation(
-                        SharedString::from(format!("fold-{idx}-{}-{}", w.workspace_id, m.epoch)),
-                        fold_animation(),
-                        move |el, t| {
-                            let h = m.from + (m.to - m.from) * t;
-                            let reveal = (h / full).clamp(0., 1.);
-                            el.h(px(h)).opacity(0.35 + 0.65 * reveal).relative().top(px(-3. * (1. - reveal)))
-                        },
-                    )
-                    .into_any_element(),
-            };
             let group = div().flex().flex_col().flex_none().child(header).child(body);
             tree_drag::with_line(group, theme, group_line(&w.workspace_id))
         }).collect::<Vec<_>>()
     }
 
-    /// The sidebar's rows: workspaces with their worktrees folded under them and the update strip.
+    /// The sidebar's rows: workspaces with their worktrees under them and the update strip.
     pub(super) fn render_sidebar(
         &mut self,
         theme: &Theme,
@@ -754,7 +701,10 @@ impl Shell {
         };
         div()
             .flex_none()
-            // close under the agents list, the window's edge kept below
+            // a line over it as the sidebar's right edge draws, its color and width
+            .border_t_1()
+            .border_color(theme.border_strong)
+            // the window's edge kept below
             .pt(px(2.))
             .pb(px(8.))
             .px(px(8.))

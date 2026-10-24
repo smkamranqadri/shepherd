@@ -7,7 +7,6 @@
 use super::sessions::Place;
 use super::watchers::{Kind, SessionKey, Status, Watchers};
 use super::*;
-use crate::files::roots::root_key;
 use crate::herdr::{Machine, SessionInfo};
 use gpui::DragMoveEvent;
 use std::collections::HashSet;
@@ -111,8 +110,6 @@ pub(super) struct TreeState {
     pub(super) discover: Option<crate::ui::Popup<super::discover::Discover>>,
     /// The sessions being added as machines from that popup, kept while it closes and opens again.
     pub(super) adds: super::discover::Adds,
-    /// Bare folded ids (an older Shepherd's) were moved under the shown session's key.
-    folds_migrated: bool,
     /// Where a row being dragged would land.
     pub(super) drop: Option<tree_drag::TreeDrop>,
     /// The tree's view while a row is dragged: rows scrolled out of it don't take a drop.
@@ -427,22 +424,16 @@ pub(super) fn shown_groups(snapshot: &Snapshot) -> Vec<(&crate::model::Workspace
     crate::model::groups(snapshot.workspace_tree())
 }
 
-/// Whether a group's worktrees show: unfolded.
-pub(super) fn kids_shown(folded: bool) -> bool {
-    !folded
-}
-
-/// The workspaces Workspace1–9 go to: the tree's visible rows from the top, worktrees of a folded group left out.
-pub(super) fn workspace_order<'a>(rows: &[TreeRow], snaps: impl Fn(&SessionKey) -> Option<&'a Snapshot>, folded: &HashSet<String>) -> Vec<(SessionKey, String)> {
+/// The workspaces Workspace1–9 go to: the tree's visible rows from the top, each group's worktrees under it (a
+/// group always shows them).
+pub(super) fn workspace_order<'a>(rows: &[TreeRow], snaps: impl Fn(&SessionKey) -> Option<&'a Snapshot>) -> Vec<(SessionKey, String)> {
     let mut order = Vec::new();
     for row in rows {
         let TreeRow::Workspaces { key } = row else { continue };
         let Some(snapshot) = snaps(key) else { continue };
         for (w, kids) in shown_groups(snapshot) {
             order.push((key.clone(), w.workspace_id.clone()));
-            if kids_shown(folded.contains(&root_key(&key.0, &w.workspace_id))) {
-                order.extend(kids.iter().map(|k| (key.clone(), k.workspace_id.clone())));
-            }
+            order.extend(kids.iter().map(|k| (key.clone(), k.workspace_id.clone())));
         }
     }
     order.truncate(9);
@@ -478,7 +469,6 @@ pub(super) fn numbered<'a>(
     rows: &[TreeRow],
     snaps: impl Fn(&SessionKey) -> Option<&'a Snapshot>,
     pending: &HashMap<SessionKey, tree_drag::Pending>,
-    folded: &HashSet<String>,
     now: Instant,
 ) -> Vec<(SessionKey, String)> {
     let ordered: HashMap<SessionKey, Snapshot> = pending
@@ -489,24 +479,14 @@ pub(super) fn numbered<'a>(
             Some((k.clone(), tree_drag::with_order(s, p.order(&list, now)?)))
         })
         .collect();
-    workspace_order(rows, |k| ordered.get(k).or_else(|| snaps(k)), folded)
-}
-
-/// Moves an older Shepherd's folded workspaces (bare ids) under the shown session's key; true when any moved.
-pub(super) fn migrate_folds(folded: &mut HashSet<String>, shown: &str) -> bool {
-    let bare: Vec<String> = folded.iter().filter(|f| !f.contains('\n')).cloned().collect();
-    for id in &bare {
-        folded.remove(id);
-        folded.insert(root_key(shown, id));
-    }
-    !bare.is_empty()
+    workspace_order(rows, |k| ordered.get(k).or_else(|| snaps(k)))
 }
 
 impl Shell {
     /// The workspaces Workspace1–9 go to and their hint chips sit on, in the order of the tree shown (`shown_tree`).
     pub(super) fn numbered_workspaces(&self, rows: &[TreeRow], shown: &SessionKey) -> Vec<(SessionKey, String)> {
         let snap = |k: &SessionKey| if k == shown { self.snapshot.as_ref() } else { self.watchers.snapshot(k) };
-        numbered(rows, snap, &self.tree.pending, &self.folded, Instant::now())
+        numbered(rows, snap, &self.tree.pending, Instant::now())
     }
 
     /// Workspace1–9: the `index`th workspace the tree shows, in whichever session.
@@ -570,20 +550,11 @@ impl Shell {
         true
     }
 
-    /// The shown session sent a snapshot of its own: a goal waiting for it is shown, and folds an older Shepherd
-    /// kept by bare id move under its key.
+    /// The shown session sent a snapshot of its own: a goal waiting for it is shown.
     pub(super) fn after_snapshot(&mut self, cx: &mut Context<Self>) {
         // before a goal: the panes a view brought back that this snapshot no longer backs go first
         self.check_parked(cx);
         let shown = self.shown_key();
-        if !self.tree.folds_migrated && let Some(key) = &shown {
-            self.tree.folds_migrated = true;
-            if migrate_folds(&mut self.folded, &key.0) {
-                let mut folded: Vec<String> = self.folded.iter().cloned().collect();
-                folded.sort();
-                save_from_sidebar(cx, |s| s.folded = folded);
-            }
-        }
         let Some((key, goal, at)) = self.tree.pending_goal.clone() else { return };
         // given up on after a while, else shown once the session lists it
         if at.elapsed() > GOAL_EXPIRY || (shown.as_ref() == Some(&key) && self.apply_goal(&goal, cx)) {
@@ -830,7 +801,6 @@ impl Shell {
     #[allow(clippy::too_many_arguments)]
     fn session_row(&self, theme: &Theme, place: Place, key: SessionKey, collapsed: bool, waiting: usize, status: Status, drags: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         let idx = self.watchers.index_of(&key).unwrap_or(0);
-        let hover_bg = theme.hover;
         let stale = self.watchers.get(&key).is_some_and(|w| w.stale(Instant::now()));
         let dot = match status {
             Status::Shown | Status::Live if !stale => theme.success,
@@ -871,31 +841,13 @@ impl Shell {
         let dragged = DraggedTreeItem { from: key.clone(), item: Item::Session(key.clone()), label: name.clone(), theme: theme.clone() };
         let over = key.clone();
         let chevron = fold_chevron(theme, &format!("session-{idx}"), !collapsed, 1., None);
-        let group = SharedString::from(format!("tree-session-group-{idx}"));
-        let open = self.place_menu.as_ref().is_some_and(|m| m.is_open() && m.value.0.key() == place.key());
-        let (menu_place, right_place) = (place.clone(), place);
-        let more = div()
-            .id(("tree-session-menu", idx))
-            .size(px(18.))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(4.))
-            .cursor_pointer()
-            .hover(move |s| s.bg(hover_bg))
-            .when(!open, |el| el.opacity(0.).group_hover(group.clone(), |s| s.opacity(1.)))
-            .child(gpui::svg().path("icons/more-horizontal.svg").size(px(12.)).text_color(theme.text_faint))
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
-                cx.stop_propagation();
-                this.open_place_menu(menu_place.clone(), e.position, cx);
-            }));
-        // a header: the chevron, the session's icon and its name in bold; a click anywhere folds its workspaces
+        // the dot in a box as wide as a workspace row's status, at the row's right padding as theirs are: one column
+        let dot = div().size(px(12.)).flex_none().flex().items_center().justify_center().child(div().size(px(6.)).rounded_full().bg(dot));
+        // a header: the chevron, the session's icon and its name in bold; a click anywhere folds its workspaces, a
+        // right-click opens its menu
         row(theme, false, ("tree-session", idx))
-            .group(group)
             .h(px(28.))
             .pl(px(2.))
-            .pr(px(4.))
             .gap(px(6.))
             .text_size(px(12.5))
             .text_color(ink)
@@ -904,12 +856,11 @@ impl Shell {
             .child(mark)
             .child(div().flex_1().min_w_0().truncate().child(name))
             .children(badge)
-            .child(div().size(px(6.)).flex_none().rounded_full().bg(dot))
-            .child(more)
+            .child(dot)
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_collapsed(&toggle_key, cx)))
             .when(movable, |el| el.on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone())))
             .when(drags, |el| el.on_drag_move(cx.listener(move |this, e: &DragMoveEvent<DraggedTreeItem>, _, cx| this.tree_drag_over(Over::Session(over.clone()), e, cx))))
-            .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, _, cx| this.open_place_menu(right_place.clone(), e.position, cx)))
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, _, cx| this.open_place_menu(place.clone(), e.position, cx)))
             .into_any_element()
     }
 
@@ -1330,7 +1281,7 @@ mod tests {
         let machine_rows: Vec<String> = kinds(&rows).into_iter().filter(|r| r.starts_with("M ")).collect();
         assert_eq!(machine_rows, ["M This computer", "M you@other", "M you@box"]);
         let snaps = |k: &SessionKey| if *k == key("menqal") { Some(&shown) } else { w.snapshot(k) };
-        let order: Vec<String> = workspace_order(&rows, snaps, &HashSet::new()).into_iter().map(|(k, _)| k.0).collect();
+        let order: Vec<String> = workspace_order(&rows, snaps).into_iter().map(|(k, _)| k.0).collect();
         assert_eq!(order, ["/tmp/menqal.sock", "machine:b", "machine:c", "machine:a"]);
     }
 
@@ -1405,16 +1356,13 @@ mod tests {
             TreeRow::Workspaces { key: key("menqal") },
         ];
         let snaps = |k: &SessionKey| if *k == key("default") { Some(&shown) } else if *k == key("menqal") { Some(&other) } else { None };
-        let order = workspace_order(&rows, snaps, &HashSet::new());
+        let order = workspace_order(&rows, snaps);
         let ids: Vec<String> = order.iter().map(|(k, w)| format!("{}:{w}", &k.0[5..k.0.len() - 5])).collect();
-        assert_eq!(ids, ["default:w1", "default:w2", "default:w3", "menqal:w1", "menqal:w2"]);
-        // a folded repo's worktrees are skipped
-        let folded: HashSet<String> = [root_key("/tmp/default.sock", "w1")].into();
-        assert_eq!(workspace_order(&rows, snaps, &folded).len(), 4);
+        assert_eq!(ids, ["default:w1", "default:w2", "default:w3", "menqal:w1", "menqal:w2"], "a repo's worktree under its checkout");
         // never past nine
         let many = snapshot(&[("a", None), ("b", None), ("c", None), ("d", None), ("e", None), ("f", None)]);
         let rows = vec![TreeRow::Workspaces { key: key("x") }, TreeRow::Workspaces { key: key("y") }];
-        assert_eq!(workspace_order(&rows, |_| Some(&many), &HashSet::new()).len(), 9);
+        assert_eq!(workspace_order(&rows, |_| Some(&many)).len(), 9);
     }
 
     #[test]
@@ -1429,20 +1377,11 @@ mod tests {
         let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         p.push(Move { ids: ids(&["w3"]), before: Some("w1".into()) }, ids(&["w1", "w2", "w3"]), ids(&["w3", "w1", "w2"]), now);
         pending.insert(key("default"), p);
-        let order: Vec<String> = numbered(&rows, snaps, &pending, &HashSet::new(), now).into_iter().map(|(_, w)| w).collect();
+        let order: Vec<String> = numbered(&rows, snaps, &pending, now).into_iter().map(|(_, w)| w).collect();
         // the chips sit on the same order: `tree_rows` zips it with Workspace1–9's chords
         assert_eq!(order, ["w3", "w1", "w2"]);
-        let none: Vec<String> = numbered(&rows, snaps, &HashMap::new(), &HashSet::new(), now).into_iter().map(|(_, w)| w).collect();
+        let none: Vec<String> = numbered(&rows, snaps, &HashMap::new(), now).into_iter().map(|(_, w)| w).collect();
         assert_eq!(none, ["w1", "w2", "w3"]);
-    }
-
-    #[test]
-    fn bare_folds_move_under_the_shown_session() {
-        let mut folded: HashSet<String> = ["w1".to_string(), root_key("/tmp/menqal.sock", "w2")].into();
-        assert!(migrate_folds(&mut folded, "/tmp/default.sock"));
-        assert!(folded.contains(&root_key("/tmp/default.sock", "w1")) && folded.contains(&root_key("/tmp/menqal.sock", "w2")));
-        assert_eq!(folded.len(), 2);
-        assert!(!migrate_folds(&mut folded, "/tmp/default.sock"), "once");
     }
 
     #[test]

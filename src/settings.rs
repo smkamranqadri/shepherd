@@ -106,9 +106,6 @@ pub struct Settings {
     pub sidebar_focus: bool,
     /// The workspaces sidebar is shown; `⌘B` hides it.
     pub sidebar_open: bool,
-    /// Worktree groups folded in the sidebar, by their session's key and workspace id (`roots::root_key`); a bare
-    /// workspace id is an older Shepherd's, read as the session shown's.
-    pub folded: Vec<String>,
     /// Sessions whose workspaces the sidebar's tree hides, by key (a socket, `machine:<id>`).
     pub collapsed_sessions: Vec<String>,
     /// Machine groups whose sessions the sidebar's tree hides, by machine (`local` for this computer, else the SSH
@@ -384,7 +381,6 @@ impl Default for Settings {
             sidebar_peek: true,
             sidebar_focus: false,
             sidebar_open: true,
-            folded: Vec::new(),
             collapsed_sessions: Vec::new(),
             collapsed_machines: Vec::new(),
             session_order: Vec::new(),

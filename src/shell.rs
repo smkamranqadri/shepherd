@@ -118,13 +118,10 @@ pub struct Shell {
     settling: Option<(Vec<bool>, f32)>,
     /// The tab or workspace label being edited in place.
     renaming: Option<Rename>,
-    folded: std::collections::HashSet<String>,
     /// A workspace's right-click menu and where it opened.
     ws_menu: Option<crate::ui::Popup<(String, gpui::Point<Pixels>)>>,
     /// A web page's right-click menu in the sidebar: its entry's id, and where it was clicked.
     web_menu: Option<crate::ui::Popup<(String, gpui::Point<Pixels>)>>,
-    /// Groups mid fold or unfold, by workspace id.
-    fold_motion: HashMap<String, FoldMotion>,
     /// Resize seams' hover: (hovered, flip count), keyed by the strip id.
     seam_hover: HashMap<SharedString, (bool, u64)>,
     /// The workspace shown last, so closing its tab stays in it.
@@ -596,8 +593,6 @@ impl Shell {
                     divider: None,
                     settling: None,
                     renaming: None,
-                    folded: SettingsGlobal::of(cx).settings.folded.iter().cloned().collect(),
-                    fold_motion: Default::default(),
                     seam_hover: Default::default(),
                     ws_menu: None,
                     web_menu: None,

@@ -175,23 +175,6 @@ pub(super) fn solid_button(id: &'static str, label: &'static str, fill: gpui::Hs
         .child(label)
 }
 
-/// Zeron's folded-section count: a muted badge with monospace digits, here the worktrees a folded repo holds.
-pub(super) fn count_badge(theme: &Theme, count: usize) -> Div {
-    div()
-        .flex_none()
-        .h(px(16.))
-        .px(px(4.))
-        .flex()
-        .items_center()
-        .rounded(px(4.))
-        .bg(theme.wash(0.06))
-        .text_size(px(10.))
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .font_family("Geist Mono")
-        .text_color(theme.text_muted.opacity(0.7))
-        .child(count.to_string())
-}
-
 /// A session's agents waiting or done, as ●N in the warning colour: the tree's session rows and the session switcher
 /// draw the same pill, so the count reads the same everywhere.
 pub(crate) fn waiting_pill(theme: &Theme, n: usize) -> Div {
