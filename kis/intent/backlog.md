@@ -15,9 +15,10 @@ Kamran's list. Items 1–9 are done (`plan-sidebar-statusbar.md`, merged 2026-10
 8. Workspace with worktrees: remove the collapse chevron (worktree groups don't need folding). It indents the green dot the same way.
 9. Sidebar foot (Settings, New workspace): add a border on its top edge, styled like the sidebar's right border.
 
-13. Machine row: remove its ⋯ too, like the session row (Kamran, 2026-10-25); the right-click menu stays.
+14. Focus chip: with focus mode on, the chip draws on a row of its own under the sidebar header, taking vertical space. Put it in the header row, beside the ⋯ (Kamran, 2026-10-25).
 
 ## Later
+13. Machine row (a saved SSH machine's header): remove its hover ⋯ like the session row's, the right-click menu staying (`sidebar_tree.rs` `tree-machine-menu-*`). Kamran has no SSH machines today (2026-10-25).
 10. Agent usage for Command Code, as for Claude and Codex.
 11. Port upstream's drag look (lift, placeholder, spring) onto the tree's drag (`tree_drag.rs`).
 12. Earlier open items: `[[keys.command]]` add/remove, lone-prefix flush, Agents picker.
