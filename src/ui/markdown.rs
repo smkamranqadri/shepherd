@@ -777,6 +777,67 @@ fn rects(layout: &TextLayout, range: &Range<usize>) -> Vec<Bounds<Pixels>> {
 mod tests {
     use super::*;
 
+    struct Page(Vec<Block>, gpui::ScrollHandle);
+
+    impl gpui::Render for Page {
+        fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+            let theme = Theme::of(cx).clone();
+            crate::ui::viewer::markdown_preview("page", &self.0, &Links::web(), &self.1, &theme)
+        }
+    }
+
+    /// The pairs of paragraphs painted last frame whose drawn lines run into each other, and the paragraphs whose
+    /// box is shorter than their lines: what a reader sees as one block drawn over the next.
+    fn overlaps() -> Vec<String> {
+        let lines: Vec<(Bounds<Pixels>, Pixels, SharedString)> = PAINTED.with(|p| {
+            p.borrow()
+                .iter()
+                .map(|e| {
+                    let line = e.layout.line_height();
+                    let drawn = e.layout.position_for_index(e.text.len()).map_or(px(0.), |p| p.y + line);
+                    (e.layout.bounds(), drawn, e.text.clone())
+                })
+                .collect()
+        });
+        let slack = px(0.5);
+        let head = |text: &SharedString| text.chars().take(30).collect::<String>();
+        let rect = |(b, drawn, _): &(Bounds<Pixels>, Pixels, SharedString)| (b.left(), b.top(), b.right(), (*drawn).max(b.bottom()));
+        let mut found = Vec::new();
+        for (i, a) in lines.iter().enumerate() {
+            if a.1 > a.0.bottom() + slack {
+                found.push(format!("{:?} is drawn to {:?}, past its box's {:?}", head(&a.2), a.1, a.0.bottom()));
+            }
+            for b in &lines[i + 1..] {
+                let (a_rect, b_rect) = (rect(a), rect(b));
+                if a_rect.0 < b_rect.2 - slack && b_rect.0 < a_rect.2 - slack && a_rect.1 < b_rect.3 - slack && b_rect.1 < a_rect.3 - slack {
+                    found.push(format!("{:?} ({:?}..{:?}) runs into {:?} ({:?}..{:?})", head(&a.2), a_rect.1, a_rect.3, head(&b.2), b_rect.1, b_rect.3));
+                }
+            }
+        }
+        found
+    }
+
+    /// Shepherd's own README at the widths a window has, laid out by the reader's preview: no paragraph drawn over
+    /// another. The blocks once sat in a flex column, whose items are sized at the container's width before the
+    /// page's `max_w` narrows them: a long paragraph got the box of its lines across the window, and the next block
+    /// drew over its last ones.
+    #[gpui::test]
+    fn the_readme_paints_no_block_over_another(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::for_appearance(gpui::WindowAppearance::Dark)));
+        let blocks = crate::ui::review::markdown(include_str!("../../README.md"));
+        let (_, cx) = cx.add_window_view(|_, _| Page(blocks.clone(), gpui::ScrollHandle::new()));
+        for width in [1348., 900., 600., 400.] {
+            cx.simulate_resize(size(px(width), px(900.)));
+            PAINTED.with(|p| p.borrow_mut().clear());
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            let painted = PAINTED.with(|p| p.borrow().len());
+            assert!(painted > 100, "at {width} px only {painted} paragraphs were painted");
+            let found = overlaps();
+            assert!(found.is_empty(), "at {width} px: {found:#?}");
+        }
+    }
+
     #[test]
     fn spans_cover_the_paragraphs_between_either_way() {
         let painted: Vec<(SharedString, SharedString)> = [("a", "first"), ("b", "second"), ("c", "third")].map(|(k, t)| (k.into(), t.into())).into();

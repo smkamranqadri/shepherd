@@ -925,10 +925,14 @@ pub(crate) fn shown_path(path: &Path, root: Option<&Path>) -> String {
 
 /// Markdown's preview: Zeron's blocks, selectable through `ui::markdown`, in a column a page wide. Each block is a
 /// child of the scrolled element after a spacer, so a `#heading` link scrolls to its block (child `ix + 1`).
+///
+/// The scrolled element lays its children out as blocks, not as a flex column: a flex item's height is worked out at
+/// the container's width, before `max_w` narrows it, so a paragraph that wraps to more lines in the page's column
+/// than across the window got the shorter box and the next block drew over its last lines.
 pub(crate) fn markdown_preview(id: &'static str, blocks: &[Block], links: &Links, scroll: &ScrollHandle, theme: &Theme) -> AnyElement {
-    // with the gap, 20 px above the first block and below the last
-    let space = || div().h(px(8.)).flex_none().into_any_element();
-    let column = |block: AnyElement| div().w_full().max_w(px(820.)).mx_auto().px(px(24.)).child(block).into_any_element();
+    // 12 px between the blocks, 20 px above the first and below the last
+    let space = |height: f32| div().h(px(height)).into_any_element();
+    let column = |block: AnyElement| div().w_full().max_w(px(820.)).mx_auto().px(px(24.)).pt(px(12.)).child(block).into_any_element();
     div()
         .id(id)
         .size_full()
@@ -936,12 +940,9 @@ pub(crate) fn markdown_preview(id: &'static str, blocks: &[Block], links: &Links
         .track_scroll(scroll)
         .font_family(theme.font_ui.clone())
         .text_size(px(13.5))
-        .flex()
-        .flex_col()
-        .gap(px(12.))
-        .child(space())
+        .child(space(8.))
         .children(crate::ui::markdown::render(blocks, id, links, theme).into_iter().map(column))
-        .child(space())
+        .child(space(20.))
         .into_any_element()
 }
 
