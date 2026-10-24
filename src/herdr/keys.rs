@@ -83,6 +83,8 @@ pub fn bindings(actions: &[Action], config: &HerdrConfig, tap: bool) -> Vec<(Bin
         out.extend(chords.into_iter().map(|c| match &target {
             Target::App(app) => (Bind::App(app), c),
             Target::HerdrOnly(name) => (Bind::HerdrOnly(HerdrOnly { name: name.clone(), chord: label.clone() }), c),
+            // swallowed without a word, as Esc after the prefix is
+            Target::Nothing => (Bind::Unbound(HerdrUnbound { chord: String::new() }), c),
         }));
     }
     for entry in config.commands() {

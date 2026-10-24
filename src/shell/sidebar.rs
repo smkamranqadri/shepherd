@@ -1,4 +1,4 @@
-//! The sidebar: its slide, resize and folds, and the agents list's sort.
+//! The sidebar: its slide, resize and folds.
 use super::*;
 
 /// How long the floating sidebar stays after the pointer leaves it.
@@ -7,10 +7,6 @@ const PEEK_LINGER: Duration = Duration::from_millis(200);
 impl Shell {
     /// Folds or unfolds a worktree group, tweening from wherever its body is now.
     pub(super) fn toggle_fold(&mut self, id: &str, full: f32, cx: &mut Context<Self>) {
-        // a search shows every group open: a click then must not change the folds it gives back
-        if self.search_query(cx).is_some() {
-            return;
-        }
         let open = !self.folded.contains(id);
         let prev = self.fold_motion.get(id).copied();
         let from = prev.filter(|m| m.animating()).map(FoldMotion::current).unwrap_or(if open { full } else { 0. });
@@ -76,11 +72,8 @@ impl Shell {
                 let menu = open(shell.ws_menu.as_ref().map(|m| m.is_open()))
                     || open(shell.web_menu.as_ref().map(|m| m.is_open()))
                     || open(shell.view_menu.as_ref().map(|m| m.is_open()))
-                    || open(shell.agents_menu.as_ref().map(|m| m.is_open()))
                     || open(shell.place_menu.as_ref().map(|m| m.is_open()))
                     || shell.tree.menu_open()
-                    // searching in it: the card stays until the search closes
-                    || shell.sidebar_search.is_some()
                     // a drag out of it would drop it mid-way
                     || cx.has_active_drag();
                 if !shell.peek_hovered && !menu {
@@ -161,84 +154,6 @@ impl Shell {
         save_from_sidebar(cx, |s| s.sidebar_width = width);
     }
 
-    /// The sidebar's view, Workspaces or Agents, kept in the settings. A drop being aimed in the tree goes: its rows
-    /// are not there to take it in the Agents view.
-    pub(super) fn set_sidebar_view(&mut self, view: SidebarView, cx: &mut Context<Self>) {
-        // the segment already shown: nothing to save
-        if SettingsGlobal::of(cx).settings.sidebar_view == view {
-            return;
-        }
-        self.tree.drop = None;
-        // a ticker scrolling the tree mid drag stops at its next frame: the tree is not shown
-        self.tree.scroll_speed = 0.;
-        save_from_sidebar(cx, |s| s.sidebar_view = view);
-        cx.notify();
-    }
-
-    /// The ToggleAgentsView action: the other view, while the toggle shows (the Agents section is on).
-    pub(super) fn toggle_agents_view(&mut self, cx: &mut Context<Self>) {
-        let settings = &SettingsGlobal::of(cx).settings;
-        if !settings.show_agents {
-            return;
-        }
-        let next = if settings.sidebar_view == SidebarView::Agents { SidebarView::Workspaces } else { SidebarView::Agents };
-        self.set_sidebar_view(next, cx);
-    }
-
-    /// The agents' `…`: their sort and filter menu, opened under it, or closed when it is open.
-    fn agents_sort_button(&self, theme: &Theme, id: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
-        icon_button(theme, id, "")
-            .tooltip(tip("Sort agents", None))
-            .size(px(20.))
-            .child(gpui::svg().path("icons/more-horizontal.svg").size(px(14.)).text_color(theme.text_faint))
-            .when(self.agents_menu.as_ref().is_some_and(|m| m.is_open()), |el| el.bg(theme.hover))
-            // capture, like the sidebar's `…`: a press on the open menu's trigger closes it
-            .capture_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, _, cx| {
-                cx.stop_propagation();
-                match this.agents_menu.as_mut() {
-                    Some(menu) if menu.is_open() => menu.close(),
-                    _ => this.agents_menu = Some(crate::ui::Popup::new(e.position)),
-                }
-                cx.notify();
-            }))
-    }
-
-    /// The toggle at the sidebar's top, uherdr's: Workspaces | Agents with ●N of the agents waiting everywhere (the
-    /// Dock's count), two equal segments drawn as the right panel's tabs; in the Agents view, its sort menu beside.
-    fn view_toggle(&self, theme: &Theme, agents: bool, n: usize, cx: &mut Context<Self>) -> Div {
-        let hover = theme.hover;
-        let segment = |id: &'static str, label: &'static str, on: bool, view: SidebarView| {
-            div()
-                .id(id)
-                .flex_1()
-                .min_w_0()
-                .h(px(26.))
-                .px(px(6.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap(px(5.))
-                .rounded(px(6.))
-                .cursor_pointer()
-                .text_size(px(12.))
-                .text_color(if on { theme.text } else { theme.text_muted })
-                .when(on, |el| el.bg(theme.selected).font_weight(gpui::FontWeight::MEDIUM))
-                .when(!on, |el| el.hover(move |s| s.bg(hover)))
-                .child(div().min_w_0().truncate().child(label))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_sidebar_view(view, cx)))
-        };
-        div()
-            .flex_none()
-            .px(px(8.))
-            .pb(px(6.))
-            .flex()
-            .items_center()
-            .gap(px(2.))
-            .child(segment("sidebar-view-workspaces", "Workspaces", !agents, SidebarView::Workspaces))
-            .child(segment("sidebar-view-agents", "Agents", agents, SidebarView::Agents).when(n > 0, |el| el.child(waiting_pill(theme, n))))
-            .when(agents, |el| el.child(self.agents_sort_button(theme, "agents-view-sort", cx)))
-    }
-
     /// Brings the agent's tab up and its pane to the keyboard.
     pub(super) fn show_agent(&mut self, tab_id: String, pane_id: String, cx: &mut Context<Self>) {
         self.show_herdr_tab(Some(tab_id), true, cx);
@@ -246,16 +161,9 @@ impl Shell {
         self.restore = None;
     }
 
-    pub(super) fn set_agent_sort(&mut self, sort: AgentSort, cx: &mut Context<Self>) {
-        self.agent_sort = sort;
-        if let Some(m) = self.agents_menu.as_mut() { m.close() }
-        save_from_sidebar(cx, |s| s.agent_sort = sort);
-        cx.notify();
-    }
-
     /// The workspace list's rows for `snapshot`: each workspace with its worktrees folded under it. `Live` rows answer
     /// clicks, renames and drags and show worktrees being made; another session's (`Other`) switch there on a click.
-    /// `hints` holds the numbered workspaces' chords across the tree; `filter`, what a search keeps of them.
+    /// `hints` holds the numbered workspaces' chords across the tree; `filter`, whether they drag.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn workspace_rows(
         &self,
@@ -278,19 +186,12 @@ impl Shell {
         let snapshot = pending.as_ref().or(snapshot);
         // a workspace row's height, one line; a worktree's, which always has a branch line unless compact
         let (ws_h, kid_h) = if SettingsGlobal::of(cx).settings.compact_workspaces { (26., 26.) } else { (32., WS_TWO_LINES) };
-        // tabs listed under their workspace instead of in the bar along the top
-        let tabs_in = SettingsGlobal::of(cx).settings.tabs_in_sidebar;
-        let tab_count = |ws: &str| match (tabs_in, snapshot.as_ref()) {
-            (true, Some(s)) => self.sidebar_tab_count(s, ws, live),
-            _ => 0,
-        };
-        // as Workspace1–9 count them: with a search, what it keeps
+        // as Workspace1–9 count them
         let groups: Vec<(crate::model::Workspace, Vec<crate::model::Workspace>)> = snapshot
             .as_ref()
-            .map(|s| sidebar_tree::shown_groups(s, filter.keep).into_iter().map(|(w, kids)| (w.clone(), kids.into_iter().cloned().collect())).collect())
+            .map(|s| sidebar_tree::shown_groups(s).into_iter().map(|(w, kids)| (w.clone(), kids.into_iter().cloned().collect())).collect())
             .unwrap_or_default();
-        // a workspace moves with its worktrees among the others, a worktree among its siblings; not one being removed,
-        // nor any while the tree is searched
+        // a workspace moves with its worktrees among the others, a worktree among its siblings; not one being removed
         let movable = filter.allows(self.can_drag_workspaces(&key));
         let draggable: std::collections::HashSet<String> = groups
             .iter()
@@ -484,20 +385,6 @@ impl Shell {
                     }))
                 })
         };
-        // a workspace's row with its tabs under it
-        let with_tabs = |row: gpui::Stateful<Div>, w: &crate::model::Workspace, nested: bool, cx: &mut Context<Self>| -> gpui::AnyElement {
-            let n = tab_count(&w.workspace_id);
-            match snapshot.as_ref().filter(|_| n > 0) {
-                Some(s) => div()
-                    .flex()
-                    .flex_col()
-                    .flex_none()
-                    .child(row)
-                    .child(div().flex().flex_col().flex_none().pt(px(2.)).gap(px(2.)).children(self.sidebar_tab_rows(theme, s, &w.workspace_id, nested, &mode, idx, cx)))
-                    .into_any_element(),
-                None => row.into_any_element(),
-            }
-        };
         groups.into_iter().map(|(w, kids)| {
             // Pending worktrees join the group of the workspace their dialog was opened on.
             // herdr opens the worktree's workspace before it answers (hooks still run): once
@@ -518,12 +405,12 @@ impl Shell {
                 .map(|(_, branch)| branch.clone())
                 .collect();
             if kids.is_empty() && pending.is_empty() {
-                return tree_drag::with_line(with_tabs(ws_row(&w, false, None, None, true, cx), &w, false, cx), theme, group_line(&w.workspace_id));
+                return tree_drag::with_line(ws_row(&w, false, None, None, true, cx), theme, group_line(&w.workspace_id));
             }
-            // A folded group opens while one of its worktrees is being created, and while the tree is searched.
+            // A folded group opens while one of its worktrees is being created.
             let fold = fold_key(&w.workspace_id);
-            let open = sidebar_tree::kids_shown(self.folded.contains(&fold), filter.keep.is_some()) || !pending.is_empty();
-            let full = kids.iter().map(|k| kid_h + 2. + tab_bar::tab_block_h(tab_count(&k.workspace_id))).sum::<f32>() + pending.len() as f32 * (kid_h + 2.);
+            let open = sidebar_tree::kids_shown(self.folded.contains(&fold)) || !pending.is_empty();
+            let full = (kids.len() + pending.len()) as f32 * (kid_h + 2.);
             let tween = self.fold_motion.get(&fold).copied().filter(|m| m.animating());
             let chevron = fold_chevron(theme, &format!("{idx}-{}", w.workspace_id), open, full, tween).map(|el| {
                 el.on_click(cx.listener({
@@ -545,7 +432,7 @@ impl Shell {
                 .flex_col()
                 .pt(px(2.))
                 .gap(px(2.))
-                .children(kids.iter().map(|k| tree_drag::with_line(with_tabs(ws_row(k, true, None, None, kids_take_drops, cx), k, true, cx), theme, kid_line(&k.workspace_id))).collect::<Vec<_>>())
+                .children(kids.iter().map(|k| tree_drag::with_line(ws_row(k, true, None, None, kids_take_drops, cx), theme, kid_line(&k.workspace_id))).collect::<Vec<_>>())
                 .children(pending.iter().map(|b| pending_worktree_row(theme, b).h(px(kid_h)).into_any_element()));
             let body = match tween {
                 None => body.h(px(if open { full } else { 0. })).into_any_element(),
@@ -562,76 +449,50 @@ impl Shell {
                     )
                     .into_any_element(),
             };
-            let group = div().flex().flex_col().flex_none().child(with_tabs(header, &w, false, cx)).child(body);
+            let group = div().flex().flex_col().flex_none().child(header).child(body);
             tree_drag::with_line(group, theme, group_line(&w.workspace_id))
         }).collect::<Vec<_>>()
     }
 
-    /// The sidebar's rows: workspaces with their worktrees folded under them, the agents list and the update strip.
+    /// The sidebar's rows: workspaces with their worktrees folded under them and the update strip.
     pub(super) fn render_sidebar(
         &mut self,
         theme: &Theme,
         snapshot: &Option<Snapshot>,
         shown_ws: &Option<String>,
-        shown_tab: &Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let active = window.is_window_active();
         let strip = update_strip(theme, cx);
-        // a drag's line and drops herdr carried out are tidied whichever view shows
+        // a drag's line and drops herdr carried out are tidied
         self.tidy_tree_drag(window, cx);
-        self.retitle_sidebar_search(window, cx);
-        // every session's agents, read once for the Agents view
-        let sessions = self.session_agents(cx);
         let settings = &SettingsGlobal::of(cx).settings;
-        let layout = sidebar_layout(settings.sidebar_view, settings.show_agents);
         let bar = settings.sessions_bar;
-        let (body, listed) = if layout.tree {
-            let (tree, listed) = self.tree_rows(theme, snapshot, shown_ws, active, cx);
-            let body = div()
-                .id("workspaces")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .track_scroll(&self.tree.scroll)
-                // a sideways swipe moves between places, not down the list
-                .map(|mut el| {
-                    if bar {
-                        el.style().restrict_scroll_to_axis = Some(true);
-                    }
-                    el
-                })
-                // a row dragged in the tree: its rows find where it lands, a release anywhere on it drops it
-                .on_drag_move(cx.listener(|this, e: &gpui::DragMoveEvent<tree_drag::DraggedTreeItem>, _, cx| this.tree_drag_left(e, cx)))
-                .on_drop(cx.listener(|this, d: &tree_drag::DraggedTreeItem, window, cx| this.drop_tree_item(d, window.mouse_position(), cx)))
-                .px(px(8.))
-                .flex()
-                .flex_col()
-                .gap(px(2.))
-                .children(tree);
-            (body, listed)
-        } else {
-            // every session's agents under its header, the whole height: no drags here
-            let (rows, listed) = self.agents_view_rows(theme, &sessions, shown_tab.as_deref(), cx);
-            let body = div()
-                .id("agents-view")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .track_scroll(&self.agents_view_scroll)
-                .px(px(8.))
-                .flex()
-                .flex_col()
-                .gap(px(2.))
-                .children(rows)
-                // the last row scrolls clear of the sidebar's foot
-                .child(div().flex_none().h(px(4.)));
-            (body, listed)
-        };
-        let toggle = layout.toggle.then(|| self.view_toggle(theme, layout.agents_view, self.waiting_everywhere(), cx));
-        // focus mode narrows the Workspaces tree alone: its chip shows there
-        let focus = layout.tree && SettingsGlobal::of(cx).settings.sidebar_focus && !SettingsGlobal::of(cx).settings.sessions_bar;
+        // focus mode's chip shows unless the sessions bar lists the shown session anyway
+        let focus = settings.sidebar_focus && !bar;
+        let (tree, listed) = self.tree_rows(theme, snapshot, shown_ws, active, cx);
+        let body = div()
+            .id("workspaces")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.tree.scroll)
+            // a sideways swipe moves between places, not down the list
+            .map(|mut el| {
+                if bar {
+                    el.style().restrict_scroll_to_axis = Some(true);
+                }
+                el
+            })
+            // a row dragged in the tree: its rows find where it lands, a release anywhere on it drops it
+            .on_drag_move(cx.listener(|this, e: &gpui::DragMoveEvent<tree_drag::DraggedTreeItem>, _, cx| this.tree_drag_left(e, cx)))
+            .on_drop(cx.listener(|this, d: &tree_drag::DraggedTreeItem, window, cx| this.drop_tree_item(d, window.mouse_position(), cx)))
+            .px(px(8.))
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .children(tree);
         let header = self.sidebar_header(theme, listed, focus, cx);
         let waiting = self.error.is_none() && self.connecting.is_some_and(|at| crate::ui::loader::due(at, window));
         // the sessions bar: the list goes under a swipe's fingers, then springs home, and beside it the place it goes to
@@ -660,7 +521,6 @@ impl Shell {
                 .flex()
                 .flex_col()
             .child(header.when(waiting, |el| el.child(crate::ui::loader::mini_spinner(2., theme.text_faint, window))))
-            .children(toggle)
             .children(self.web_rows(self.shown_place_key().as_deref(), true, theme, window, cx))
             .child(
                 div()
@@ -679,39 +539,9 @@ impl Shell {
     }
 
     /// The sidebar's head: the shown session's name when the tree names none (with one session, or in focus mode),
-    /// the Focus chip that turns focus mode off, and the magnifier that opens the search; while it is up, its field
-    /// in their place, Escape or × closing it. The place's spinner goes after it.
+    /// and the Focus chip that turns focus mode off. The place's spinner goes after it.
     fn sidebar_header(&self, theme: &Theme, listed: bool, focus: bool, cx: &mut Context<Self>) -> Div {
         let head = div().px(px(16.)).pt(px(8.)).pb(px(6.)).flex().items_center().gap(px(6.)).text_size(px(11.)).text_color(theme.text_faint);
-        let hover_bg = theme.hover;
-        if let Some(search) = &self.sidebar_search {
-            let field = div()
-                .flex_1()
-                .min_w_0()
-                .text_size(px(12.))
-                .text_color(theme.text)
-                .capture_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, _, cx| {
-                    if e.keystroke.key == "escape" {
-                        cx.stop_propagation();
-                        this.close_sidebar_search(cx);
-                    }
-                }))
-                .child(Input::new(&search.input));
-            let close = div()
-                .id("sidebar-search-close")
-                .size(px(18.))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(4.))
-                .cursor_pointer()
-                .hover(move |s| s.bg(hover_bg))
-                .tooltip(tip("Close the search", None))
-                .child(gpui::svg().path("icons/close.svg").size(px(11.)).text_color(theme.text_faint))
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_sidebar_search(cx)));
-            return head.child(gpui::svg().path("icons/solar/magnifier.svg").size(px(12.)).flex_none().text_color(theme.text_faint)).child(field).child(close);
-        }
         let chip = focus.then(|| {
             let accent = theme.accent;
             div()
@@ -733,18 +563,11 @@ impl Shell {
                 .child(gpui::svg().path("icons/close.svg").size(px(9.)).text_color(accent))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_focus_mode(cx)))
         });
-        let magnifier = icon_button(theme, "sidebar-search", "")
-            .size(px(18.))
-            .rounded(px(4.))
-            .tooltip(tip("Filter the sidebar", Some("FilterSidebar")))
-            .child(gpui::svg().path("icons/solar/magnifier.svg").size(px(12.)).text_color(theme.text_faint))
-            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open_sidebar_search(window, cx)));
         head
             // the tree names every session; with one, or in focus mode, its name heads the list
             .child(div().flex_1().min_w_0().truncate().when(!listed, |el| el.child(self.place_label(cx))))
             .children(chip)
             .when(is_dev_build(), |el| el.child(dev_badge(theme)))
-            .child(magnifier)
     }
 
 
@@ -975,87 +798,6 @@ impl Shell {
     }
 }
 
-/// The agents list's rows, `act` making each one do something.
-pub(super) fn agent_rows(
-    agents: Vec<sidebar_tree::AgentEntry>,
-    sort: AgentSort,
-    compact: bool,
-    shown_tab: Option<&str>,
-    theme: &Theme,
-    act: impl Fn(Stateful<Div>, &sidebar_tree::AgentEntry) -> Stateful<Div>,
-) -> Vec<gpui::AnyElement> {
-    let workspaces: Vec<(usize, String)> = agents.iter().map(|e| (e.n, e.pane.workspace_id.clone())).collect();
-    let grouped = sort == AgentSort::Grouped;
-    agents
-        .into_iter()
-        .enumerate()
-        .flat_map(|(i, entry)| {
-            let (pane, workspace, waited) = (&entry.pane, entry.workspace.clone(), entry.waited.clone());
-            // Grouped: a heading where the workspace (or its session) changes, which the rows then leave out.
-            let heading = (grouped && (i == 0 || workspaces[i - 1] != workspaces[i])).then(|| {
-                div()
-                    .flex_none()
-                    .px(px(8.))
-                    .pt(px(if i == 0 { 2. } else { 8. }))
-                    .pb(px(2.))
-                    .truncate()
-                    .text_size(px(11.))
-                    .text_color(theme.text_faint)
-                    .child(workspace.clone())
-                    .into_any_element()
-            });
-            let selected = entry.shown && shown_tab == Some(pane.tab_id.as_str());
-            let title = pane.terminal_title_stripped.clone().unwrap_or_default();
-            let mark = crate::ui::command_panel::agent_icon(pane.agent.as_deref().unwrap_or_default());
-            let mark = || gpui::svg().path(mark).size(px(14.)).flex_none().text_color(crate::ui::command_panel::icon_ink(mark, theme.text_muted));
-            let agent = row(theme, selected, SharedString::from(format!("agent-{}-{}", entry.n, pane.pane_id)))
-                .h(px(if compact { 30. } else { 44. }))
-                .child(status_dot(pane.agent_status, theme))
-                .when(compact, |el| {
-                    el.child(mark())
-                        .child(div().flex_1().min_w_0().truncate().text_size(px(11.)).text_color(theme.text_muted).child(title.clone()))
-                        .children(waited.clone().map(|w| div().flex_none().text_size(px(11.)).text_color(theme.text_faint).child(w)))
-                })
-                .when(!compact, |el| {
-                    el.child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap(px(6.))
-                                    .items_center()
-                                    .child(mark())
-                                    .when(!grouped, |el| el.child(div().min_w_0().truncate().text_color(theme.text_faint).child(workspace)))
-                                    .children(waited.map(|w| div().ml_auto().flex_none().text_size(px(11.)).text_color(theme.text_faint).child(w))),
-                            )
-                            .child(div().truncate().text_size(px(11.)).text_color(theme.text_muted).child(title)),
-                    )
-                });
-            heading.into_iter().chain([act(agent, &entry).into_any_element()])
-        })
-        .collect()
-}
-
-/// What the sidebar shows: the view toggle whenever the Agents view is on; the tree, or in the Agents view every
-/// session's agents in its place.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Layout {
-    pub toggle: bool,
-    pub tree: bool,
-    pub agents_view: bool,
-}
-
-/// The sidebar's [`Layout`] for its saved view: with the Agents view off it is Workspaces, the view saved left as it
-/// is for when the view comes back.
-pub(super) fn sidebar_layout(view: SidebarView, show_agents: bool) -> Layout {
-    let agents_view = show_agents && view == SidebarView::Agents;
-    Layout { toggle: show_agents, tree: !agents_view, agents_view }
-}
-
 /// The window's left edge brings the hidden sidebar out floating: only with it hidden all the way (not mid-fold),
 /// off a Settings page, and with the peek on in Settings.
 pub(super) fn peeks(sidebar_open: bool, sidebar_w: f32, on_page: bool, peek_on: bool) -> bool {
@@ -1067,23 +809,23 @@ pub(super) fn hover_shows(peek_on: bool, on: bool) -> bool {
     peek_on && on
 }
 
+/// Whether the keyboard stays off herdr's panes this frame: something covers them (`covered`: Settings, the
+/// command panel, a floating view, a file tab), one of the sidebar's fields is typed in (`typing`: a rename), or a
+/// dialog with fields is up (`dialog`: New session or Add SSH machine, Edit session), whichever field has the keyboard.
+pub(super) fn keyboard_elsewhere(covered: bool, typing: bool, dialog: bool) -> bool {
+    covered || typing || dialog
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Layout, hover_shows, peeks, sidebar_layout};
-    use crate::settings::SidebarView;
+    use super::{hover_shows, keyboard_elsewhere, peeks};
 
     #[test]
-    fn the_agents_view_takes_the_tree_s_place() {
-        let layout = |toggle, tree| Layout { toggle, tree, agents_view: !tree };
-        for (view, show, want) in [
-            (SidebarView::Workspaces, true, layout(true, true)),
-            (SidebarView::Workspaces, false, layout(false, true)),
-            (SidebarView::Agents, true, layout(true, false)),
-            // the view off: Workspaces, whatever was saved
-            (SidebarView::Agents, false, layout(false, true)),
-        ] {
-            assert_eq!(sidebar_layout(view, show), want, "{view:?} show_agents {show}");
-        }
+    fn a_field_typed_in_keeps_the_keyboard_from_the_panes() {
+        assert!(!keyboard_elsewhere(false, false, false), "herdr's focused pane takes it");
+        assert!(keyboard_elsewhere(false, true, false), "a rename being typed in");
+        assert!(keyboard_elsewhere(true, false, false), "Settings, the command panel, a floating view, a file tab");
+        assert!(keyboard_elsewhere(false, false, true), "New session, Add SSH machine or Edit session up");
     }
 
     #[test]

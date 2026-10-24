@@ -89,8 +89,6 @@ app_actions! {
     Agent8: "Go to agent 8",
     Agent9: "Go to agent 9",
     ToggleSidebar: "Toggle sidebar",
-    ToggleAgentsView: "Sidebar: workspaces or agents",
-    FilterSidebar: "Sidebar: filter",
     ToggleFocusMode: "Sidebar: focus mode",
     ToggleReview: "Toggle right panel",
     ShowFiles: "Files",
@@ -109,7 +107,6 @@ app_actions! {
     ChangeTheme: "Change theme",
     ToggleSecureInput: "Secure keyboard entry",
     CommandPanel: "Command panel",
-    NextNeedsYou: "Next agent that needs you",
     WorkspacesPanel: "Workspaces",
     SaveFile: "Save file",
     SaveAllFiles: "Save all files",
@@ -243,10 +240,6 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("OpenSettings", "cmd-,"),
     ("CommandPanel", "cmd-k"),
     ("CommandPanel", "cmd-shift-p"),
-    // the sidebar's Workspaces or Agents view (the Agents panel it took over from had this chord)
-    ("ToggleAgentsView", "cmd-shift-a"),
-    // fork-only: the agent that has waited longest for you, in any session, then the next
-    ("NextNeedsYou", "cmd-shift-j"),
     ("SaveFile", "cmd-s"),
     ("SaveAllFiles", "cmd-alt-s"),
     // in the editor only (`context_of`), over gpui-base's own Cmd+F; Cmd+Shift+F stays Search in Files
@@ -326,10 +319,6 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("FontSizeReset", "ctrl-0"),
     ("OpenSettings", "ctrl-,"),
     ("CommandPanel", "ctrl-shift-p"),
-    ("ToggleAgentsView", "ctrl-shift-a"),
-    // fork-only: the agent that has waited longest for you, in any session, then the next. Not Ctrl+Shift+U, IBus's
-    // Unicode entry
-    ("NextNeedsYou", "ctrl-shift-j"),
     // in the editor only (`context_of`): a pane's Ctrl+S is the terminal's
     ("SaveFile", "ctrl-s"),
     ("SaveAllFiles", "ctrl-alt-s"),
@@ -521,7 +510,6 @@ fn menus(secure_input: bool) -> Vec<gpui::Menu> {
             I::action("Go to File", QuickOpen),
             I::separator(),
             I::action("Command Panel", CommandPanel),
-            I::action("Sidebar: Workspaces or Agents", ToggleAgentsView),
             I::action("Workspaces", WorkspacesPanel),
             I::action("Keyboard Shortcuts", ShowShortcuts),
             I::separator(),
@@ -539,7 +527,6 @@ fn menus(secure_input: bool) -> Vec<gpui::Menu> {
             I::action("Next Session", NextSession),
             I::action("Switch Session…", SwitchSession),
             I::action("Fold or Unfold Session", ToggleSessionCollapsed),
-            I::action("Next Agent That Needs You", NextNeedsYou),
             I::submenu(Menu::new("Go to Workspace").items([
                 I::action("Workspace 1", Workspace1),
                 I::action("Workspace 2", Workspace2),
@@ -996,6 +983,27 @@ mod tests {
         assert_eq!(typed(&keymap, &["super-p"], &pane).0.as_deref(), Some("shepherd::HerdrOnly"));
         assert_eq!(typed(&keymap, &["z"], &pane), (None, false), "a letter herdr binds bare is typed");
         assert_eq!(typed(&keymap, &["ctrl-b"], &pane), (None, true), "the default prefix is waiting for its key");
+    }
+
+    /// herdr's `open_notification_target` runs nothing here: its chord, herdr's default or one set in the config, is
+    /// caught in a pane without a word, neither a Shepherd action nor said to be herdr's alone.
+    #[test]
+    fn the_notification_s_pane_chord_does_nothing_in_a_pane() {
+        let pane = stack(&["Workspace", "Terminal"]);
+        let silent = |keymap: &gpui::Keymap, keys: &[&str]| {
+            let typed: Vec<Keystroke> = keys.iter().map(|k| Keystroke::parse(k).unwrap()).collect();
+            let (bindings, _) = keymap.bindings_for_input(&typed, &pane);
+            let first = bindings.first().map(|b| b.action().boxed_clone());
+            first.as_ref().and_then(|a| a.as_any().downcast_ref::<crate::herdr::keys::HerdrUnbound>()).map(|u| u.chord.clone())
+        };
+        let default = herdr_keymap("");
+        assert_eq!(typed(&default, &["ctrl-b", "o"], &pane).0.as_deref(), Some("shepherd::HerdrUnbound"));
+        assert_eq!(silent(&default, &["ctrl-b", "o"]).as_deref(), Some(""), "caught without a word");
+        let custom = herdr_keymap("[keys]\nopen_notification_target = \"ctrl+alt+o\"\n");
+        assert_eq!(typed(&custom, &["ctrl-alt-o"], &pane).0.as_deref(), Some("shepherd::HerdrUnbound"));
+        assert_eq!(silent(&custom, &["ctrl-alt-o"]).as_deref(), Some(""), "a chord set in the config, the same");
+        // its old chord is a key herdr binds to nothing now: swallowed, as prefix mode does, and said
+        assert_eq!(silent(&custom, &["ctrl-b", "o"]).as_deref(), Some("ctrl-b o"));
     }
 
     #[test]
@@ -1568,9 +1576,10 @@ mod tests {
 
     #[test]
     #[cfg(not(target_os = "macos"))]
-    fn ctrl_shift_j_goes_to_the_next_agent_that_needs_you_and_ctrl_j_stays_the_shells() {
-        assert_eq!(chord(&effective(&user(&[])), "NextNeedsYou"), normalize("ctrl-shift-j").as_deref());
-        assert_eq!(fired(&from_xkb("j", true, Some("J"))), ["NextNeedsYou"]);
+    fn ctrl_shift_j_and_ctrl_shift_a_fire_nothing_and_ctrl_j_stays_the_shells() {
+        assert!(!known("NextNeedsYou"), "Next agent that needs you is gone");
+        assert!(fired(&from_xkb("j", true, Some("J"))).is_empty(), "Ctrl+Shift+J goes to the pane");
+        assert!(fired(&from_xkb("a", true, Some("A"))).is_empty(), "nor is Ctrl+Shift+A the Agents view's");
         assert!(fired(&from_xkb("j", false, None)).is_empty(), "Ctrl+J is a newline to the pane");
     }
 
@@ -1592,8 +1601,12 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn the_next_agent_that_needs_you_is_on_shift_cmd_j() {
-        assert_eq!(chord(&effective(&user(&[])), "NextNeedsYou"), normalize("cmd-shift-j").as_deref());
+    fn shift_cmd_j_and_shift_cmd_a_are_no_one_s() {
+        let eff = effective(&user(&[]));
+        for c in ["cmd-shift-j", "cmd-shift-a"] {
+            let c = normalize(c).unwrap();
+            assert!(eff.iter().all(|(_, k)| *k != c), "{c}");
+        }
     }
 
     #[test]
@@ -1661,22 +1674,22 @@ mod tests {
     }
 
     #[test]
-    fn the_sidebar_s_view_toggle_has_the_agents_chord() {
-        assert!(known("ToggleAgentsView") && !known("AgentsPanel"), "the Agents panel is gone");
-        assert_eq!(DEFAULTS.iter().filter(|(a, _)| *a == "ToggleAgentsView").count(), 1);
-        let want = if cfg!(target_os = "macos") { "cmd-shift-a" } else { "ctrl-shift-a" };
-        assert_eq!(chord(&effective(&user(&[])), "ToggleAgentsView"), normalize(want).as_deref());
-        // a settings file from before keeps its AgentsPanel chord as a name no action has: read without error, bound to nothing
-        assert!(effective(&user(&[("AgentsPanel", "cmd-9")])).iter().all(|(a, _)| a != "AgentsPanel"));
+    fn the_agents_view_its_search_and_next_agent_that_needs_you_are_gone() {
+        for gone in ["ToggleAgentsView", "FilterSidebar", "NextNeedsYou", "AgentsPanel"] {
+            assert!(!known(gone), "{gone}");
+            assert!(!DEFAULTS.iter().any(|(a, _)| *a == gone), "{gone}");
+            assert!(!ACTIONS.iter().any(|(a, _)| *a == gone), "{gone} in the command panel");
+            // a settings file from before keeps its chord as a name no action has: read without error, bound to nothing
+            let old = normalize("ctrl-alt-shift-f9").unwrap();
+            assert!(effective(&user(&[(gone, old.as_str())])).iter().all(|(a, c)| a != gone && *c != old), "{gone}");
+        }
     }
 
     #[test]
-    fn the_sidebar_s_search_and_focus_mode_have_no_default_chord() {
-        for action in ["FilterSidebar", "ToggleFocusMode"] {
-            assert!(known(action), "{action}");
-            assert!(!DEFAULTS.iter().any(|(a, _)| *a == action), "{action}");
-            assert_eq!(chord(&effective(&user(&[])), action), None, "{action}");
-        }
+    fn focus_mode_has_no_default_chord() {
+        assert!(known("ToggleFocusMode"));
+        assert!(!DEFAULTS.iter().any(|(a, _)| *a == "ToggleFocusMode"));
+        assert_eq!(chord(&effective(&user(&[])), "ToggleFocusMode"), None);
     }
 
     #[test]

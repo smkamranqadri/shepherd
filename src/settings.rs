@@ -1,5 +1,4 @@
 //! Shepherd's settings: a JSON file every field of which has a default, so old, partial or future files load.
-use crate::model::AgentSort;
 use crate::theme::{AppearanceMode, FontSettings, Theme};
 use gpui::{App, Bounds, Global, Pixels, Size, WindowAppearance, point, px, size};
 use serde::{Deserialize, Serialize};
@@ -56,12 +55,6 @@ pub struct Settings {
     /// Each workspace's folder in the right panel, by `files::roots::root_key` (its place and id); a bare path (as
     /// the first builds saved them) still reads.
     pub workspace_roots: BTreeMap<String, crate::files::roots::WorkspaceRoot>,
-    pub agent_sort: AgentSort,
-    /// The sidebar's Workspaces | Agents switch and its Agents view; General settings hide them.
-    pub show_agents: bool,
-    /// Each workspace's tabs listed under it in the left sidebar, and the tab bar along the top hidden (while the
-    /// sidebar is out). Off: the bar, as before.
-    pub tabs_in_sidebar: bool,
     /// The sidebar as upstream's Arc-style sessions bar: the session shown alone, a bar of sessions and machines under
     /// it (swipe between them, drag them into any order: `place_order`). Off: one tree of every machine and session.
     pub sessions_bar: bool,
@@ -76,14 +69,8 @@ pub struct Settings {
     pub workspace_show: WorkspaceShow,
     /// Shorter workspace rows.
     pub compact_workspaces: bool,
-    /// One-line agent rows, without the task under the name.
-    pub compact_agents: bool,
     /// How agent status is drawn: color dots, herdr's symbols, or Zeron's (a pulsing glyph while an agent works).
     pub status_icons: crate::theme::StatusIcons,
-    /// The Agents list keeps only agents waiting on you or done and not looked at yet.
-    pub attention_agents: bool,
-    /// The left sidebar's view: the workspaces tree, or every session's agents under its header.
-    pub sidebar_view: SidebarView,
     /// A modifier (or pair) tapped on its own as herdr's prefix in a pane: `super`, `ctrl-shift`. Shepherd's own: herdr's
     /// config cannot bind one, and herdr's screen keeps its prefix key. `None`: no tap prefix.
     pub prefix_tap: Option<String>,
@@ -114,8 +101,8 @@ pub struct Settings {
     /// With the sidebar hidden, the pointer at the window's left edge slides it out floating over the panes. Off,
     /// only `⌘B` brings it back; on by default, as before the switch, so an older file keeps it.
     pub sidebar_peek: bool,
-    /// Focus mode: the sidebar's Workspaces tree shows the session shown alone, without its header. The Agents
-    /// section and view, Next agent that needs you and the panels still list every session, and a search every one.
+    /// Focus mode: the sidebar's Workspaces tree shows the session shown alone, without its header. The panels still
+    /// list every session.
     pub sidebar_focus: bool,
     /// The workspaces sidebar is shown; `⌘B` hides it.
     pub sidebar_open: bool,
@@ -138,18 +125,6 @@ pub struct Settings {
     pub web_links_outside: bool,
     /// Where the window was last; `None` opens it centered.
     pub window: Option<WindowFrame>,
-}
-
-/// The left sidebar's views, the toggle at its top. An unknown (future) value reads as Workspaces.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SidebarView {
-    /// Every session's agents under its machine's and its own header, as the tree heads its workspaces.
-    Agents,
-    // last: serde's catch-all must be
-    #[default]
-    #[serde(other)]
-    Workspaces,
 }
 
 /// The right panel's tabs. An unknown (future) value reads as Files.
@@ -388,19 +363,13 @@ impl Default for Settings {
             panel_show_ignored: false,
             diff_split: false,
             workspace_roots: BTreeMap::new(),
-            agent_sort: AgentSort::default(),
-            show_agents: true,
-            tabs_in_sidebar: false,
             sessions_bar: false,
             show_status_bar: false,
             status_bar_show: StatusBarShow::default(),
             usage_agent: UsageAgent::default(),
             workspace_show: WorkspaceShow::default(),
             compact_workspaces: false,
-            compact_agents: false,
             status_icons: crate::theme::StatusIcons::Dots,
-            attention_agents: false,
-            sidebar_view: SidebarView::default(),
             prefix_tap: None,
             recent_commands: Vec::new(),
             notify_agents: true,
@@ -591,25 +560,38 @@ mod tests {
     fn a_file_from_the_bottom_agents_section_s_days_loads() {
         // the section's height and fold are gone: a file that has them reads without error, the rest as it was
         let old: Settings = serde_json::from_str(r#"{"agents_height": 180, "agents_collapsed": true, "show_agents": true, "agent_sort": "waiting", "font_size": 15}"#).unwrap();
-        assert!(old.show_agents);
-        assert_eq!((old.agent_sort, old.font_size), (AgentSort::Waiting, 15.0));
+        assert_eq!(old.font_size, 15.0);
         // and saved again, they are dropped
-        assert!(!serde_json::to_string(&old).unwrap().contains("agents_height"));
-        assert!(!serde_json::to_string(&old).unwrap().contains("agents_collapsed"));
+        let saved = serde_json::to_string(&old).unwrap();
+        for gone in ["agents_height", "agents_collapsed", "show_agents", "agent_sort"] {
+            assert!(!saved.contains(gone), "{gone}");
+        }
     }
 
+    /// The Agents view, its menu's sort and filters, the tabs in the sidebar and Next agent that needs you are gone:
+    /// a file that set them loads without error, keeps the rest, binds nothing to the old action and drops them all
+    /// when saved again.
     #[test]
-    fn the_sidebar_opens_on_its_workspaces_unless_agents_was_left() {
-        let old: Settings = serde_json::from_str(r#"{"font_size": 15}"#).unwrap();
-        assert_eq!(old.sidebar_view, SidebarView::Workspaces, "a file from before the toggle");
-        assert_eq!(Settings::default().sidebar_view, SidebarView::Workspaces);
-        let agents = Settings { sidebar_view: SidebarView::Agents, ..Settings::default() };
-        let text = serde_json::to_string(&agents).unwrap();
-        assert!(text.contains(r#""sidebar_view":"agents""#), "{text}");
-        let back: Settings = serde_json::from_str(&text).unwrap();
-        assert_eq!(back.sidebar_view, SidebarView::Agents);
-        let future: Settings = serde_json::from_str(r#"{"sidebar_view": "files"}"#).unwrap();
-        assert_eq!(future.sidebar_view, SidebarView::Workspaces);
+    fn a_file_from_the_agents_view_s_days_loads_and_drops_it() {
+        let (_d, path) = tmp();
+        let old = r#"{"sidebar_view": "agents", "show_agents": false, "tabs_in_sidebar": true, "agent_sort": "grouped", "compact_agents": true, "attention_agents": true, "font_size": 15, "sidebar_focus": true, "keys": {"NextNeedsYou": "ctrl-alt-shift-f7", "ToggleAgentsView": "ctrl-alt-shift-f8", "FilterSidebar": "ctrl-alt-shift-f9"}}"#;
+        std::fs::write(&path, old).unwrap();
+        let (s, err) = Settings::load(&path);
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!((s.font_size, s.sidebar_focus), (15.0, true));
+        let bound = crate::bindings::effective(&s.keys);
+        for gone in ["NextNeedsYou", "ToggleAgentsView", "FilterSidebar"] {
+            assert!(bound.iter().all(|(a, _)| a != gone), "{gone} bound");
+        }
+        for chord in ["ctrl-alt-shift-f7", "ctrl-alt-shift-f8", "ctrl-alt-shift-f9"] {
+            let chord = crate::bindings::normalize(chord).unwrap();
+            assert!(bound.iter().all(|(_, c)| *c != chord), "{chord} bound");
+        }
+        s.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        for gone in ["sidebar_view", "show_agents", "tabs_in_sidebar", "agent_sort", "compact_agents", "attention_agents"] {
+            assert!(!text.contains(gone), "{gone} saved again");
+        }
     }
 
     fn tmp() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -718,15 +700,6 @@ mod tests {
     }
 
     #[test]
-    fn tabs_in_the_sidebar_start_off_and_an_older_file_has_them_off() {
-        assert!(!Settings::default().tabs_in_sidebar);
-        let old: Settings = serde_json::from_str(r#"{"font_size": 15}"#).unwrap();
-        assert!(!old.tabs_in_sidebar);
-        let on: Settings = serde_json::from_str(&serde_json::to_string(&Settings { tabs_in_sidebar: true, ..Settings::default() }).unwrap()).unwrap();
-        assert!(on.tabs_in_sidebar);
-    }
-
-    #[test]
     fn font_size_steps_within_bounds() {
         assert_eq!(step_font_size(13.0, 1.0), 14.0);
         assert_eq!(step_font_size(9.0, -1.0), 9.0);
@@ -776,12 +749,12 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_agent_sort_reads_as_status() {
+    fn an_unknown_usage_agent_reads_as_claude() {
         let (_d, path) = tmp();
         std::fs::write(&path, r#"{"agent_sort": "workspace", "font_size": 15, "usage_agent": "gemini"}"#).unwrap();
         let (s, err) = Settings::load(&path);
         assert!(err.is_none());
-        assert_eq!((s.agent_sort, s.font_size, s.usage_agent), (AgentSort::Status, 15.0, UsageAgent::Claude));
+        assert_eq!((s.font_size, s.usage_agent), (15.0, UsageAgent::Claude));
     }
 
     #[test]
@@ -859,7 +832,7 @@ mod tests {
     fn the_status_bar_is_hidden_unless_turned_on() {
         let (_d, path) = tmp();
         assert!(!Settings::default().show_status_bar, "off by default");
-        std::fs::write(&path, r#"{"show_agents": true}"#).unwrap();
+        std::fs::write(&path, r#"{"font_size": 15}"#).unwrap();
         assert!(!Settings::load(&path).0.show_status_bar, "a file without the key loads it off");
         let on = Settings { show_status_bar: true, ..Default::default() };
         on.save(&path).unwrap();

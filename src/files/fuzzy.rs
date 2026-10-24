@@ -1,6 +1,5 @@
 //! Fuzzy matching without gpui: a query's letters in a text, in order and ignoring case, scored so a prefix beats a
-//! word start beats a substring beats scattered letters. The command panel, the sidebar's search and Quick Open
-//! rank with it.
+//! word start beats a substring beats scattered letters. The command panel and Quick Open rank with it.
 
 /// How well `query` matches `text`, ignoring case, and which chars of `text` it matched; None if it does not:
 /// `text` starting with it ranks first, then it starting a word, then anywhere, then its letters in order (more

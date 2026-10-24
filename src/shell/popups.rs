@@ -1,4 +1,4 @@
-//! The popups over the window: the sidebar's and agents' menus, workspace, tab and pane menus, dialogs, the
+//! The popups over the window: the sidebar's menus, workspace, tab and pane menus, dialogs, the
 //! command panel and the status bar's cards, each while it is up.
 use super::*;
 
@@ -118,50 +118,6 @@ impl Shell {
                                 .child(div().flex_1().child("Focus mode"))
                                 .child(crate::ui::switch(theme, focus, "sidebar-focus"))
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_focus_mode(cx))),
-                        ),
-                )),
-            )
-            .with_priority(1)
-        }))
-        .children(self.agents_menu.as_ref().map(|menu| {
-            let at = menu.value;
-            let sort = self.agent_sort;
-            let compact = SettingsGlobal::of(cx).settings.compact_agents;
-            let attention = SettingsGlobal::of(cx).settings.attention_agents;
-            gpui::deferred(
-                gpui::anchored().position(at).snap_to_window_with_margin(px(8.)).child(crate::ui::menu_motion(
-                    "agents-menu-in",
-                    menu,
-                    menu_card(theme, "agents-menu", 200.)
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            if let Some(m) = this.agents_menu.as_mut() { m.close() }
-                            cx.notify();
-                        }))
-                        .child(div().px(px(8.)).pt(px(4.)).pb(px(2.)).text_size(px(11.)).text_color(theme.text_faint).child("SORT"))
-                        .children(SORTS.map(|(choice, id, icon, label)| {
-                            menu_choice(theme, id, icon, label, sort == choice)
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_agent_sort(choice, cx)))
-                        }))
-                        .child(div().mx(px(-4.)).my(px(4.)).h(px(1.)).bg(theme.border))
-                        .child(
-                            row(theme, false, "compact-agents")
-                                .h(px(30.))
-                                .rounded(px(6.))
-                                .child(div().flex_1().child("Compact"))
-                                .child(crate::ui::switch(theme, compact, "compact-agents"))
-                                .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                                    save_from_sidebar(cx, |s| s.compact_agents = !s.compact_agents)
-                                })),
-                        )
-                        .child(
-                            row(theme, false, "attention-agents")
-                                .h(px(30.))
-                                .rounded(px(6.))
-                                .child(div().flex_1().child("Needs attention only"))
-                                .child(crate::ui::switch(theme, attention, "attention-agents"))
-                                .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                                    save_from_sidebar(cx, |s| s.attention_agents = !s.attention_agents)
-                                })),
                         ),
                 )),
             )

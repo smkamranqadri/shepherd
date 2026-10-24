@@ -18,6 +18,9 @@ pub enum Runs {
     /// Shepherd has nothing like it (a mode of herdr's own screen). The chord is still caught in a pane, and says
     /// so, instead of being typed into the shell.
     HerdrOnly,
+    /// Shepherd runs nothing for it, and says nothing: the chord is caught in a pane (not typed into the shell) and
+    /// is not herdr's alone either (`open_notification_target`: a notification's pane is a click away in the tree).
+    Nothing,
     /// The prefix key itself: chords that start prefix mode, bound to no action.
     Prefix,
     /// Chords herdr's screen reads in a mode of its own (navigate mode's arrows and letters) or only in its remote
@@ -50,7 +53,7 @@ pub const KNOWN: &[Known] = known! {
     "settings", "Settings", "prefix+s", Runs::App("OpenSettings");
     "detach", "Detach", "prefix+q", Runs::HerdrOnly;
     "reload_config", "Reload herdr's config", "prefix+shift+r", Runs::App("ReloadHerdrConfig");
-    "open_notification_target", "Go to the notification's pane", "prefix+o", Runs::App("NextNeedsYou");
+    "open_notification_target", "Go to the notification's pane", "prefix+o", Runs::Nothing;
     "workspace_picker", "Workspace picker", "prefix+w", Runs::App("WorkspacesPanel");
     "goto", "Go to", "prefix+g", Runs::App("CommandPanel");
     "new_workspace", "New workspace", "prefix+shift+n", Runs::App("NewWorkspace");
@@ -277,11 +280,13 @@ pub fn prefixes(actions: &[Action]) -> Vec<String> {
     out
 }
 
-/// What a chord of an action runs in a pane: Shepherd's action, or herdr's action Shepherd lacks (caught, said).
+/// What a chord of an action runs in a pane: Shepherd's action, herdr's action Shepherd lacks (caught, said), or
+/// nothing (caught, not said).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Target {
     App(&'static str),
     HerdrOnly(String),
+    Nothing,
 }
 
 /// Every chord label of the actions that is bound in a pane, with what it runs; an indexed binding is one label
@@ -295,6 +300,7 @@ pub fn targets(actions: &[Action]) -> Vec<(Target, String)> {
                 _ if !bindable(label) => {}
                 Runs::App(app) => out.push((Target::App(app), label.clone())),
                 Runs::HerdrOnly => out.push((Target::HerdrOnly(action.name.clone()), label.clone())),
+                Runs::Nothing => out.push((Target::Nothing, label.clone())),
                 Runs::Nine(apps) => {
                     if label.contains(INDEXED) {
                         for (i, app) in apps.iter().enumerate() {
@@ -430,6 +436,24 @@ mod tests {
         assert!(!t.iter().any(|(_, l)| l == "t"), "a bare key is typing");
         assert!(!t.iter().any(|(_, l)| l.contains("1..9")), "no unexpanded range");
         assert!(has(Target::App("NewWorkspace"), "prefix+shift+n"), "defaults stay");
+    }
+
+    #[test]
+    fn the_notification_s_pane_chord_is_known_and_runs_nothing() {
+        let known = KNOWN.iter().find(|k| k.name == "open_notification_target").expect("in the table");
+        assert_eq!((known.runs, known.default), (Runs::Nothing, "prefix+o"));
+        for config in [config(""), config("[keys]\nopen_notification_target = \"ctrl+alt+o\"\n")] {
+            let a = actions(&builtin_defaults(), &config);
+            let action = find(&a, "open_notification_target");
+            assert_eq!((action.runs, action.known), (Runs::Nothing, true), "not re-added as herdr's own");
+            let t = targets(&a);
+            let of: Vec<&Target> = t.iter().filter(|(_, l)| action.labels.contains(l)).map(|(t, _)| t).collect();
+            assert_eq!(of, [&Target::Nothing], "{:?}", action.labels);
+        }
+        // the real defaults list it too: a herdr asked gives the same
+        let real = actions(&parse_default_config(REAL), &config(""));
+        assert_eq!(find(&real, "open_notification_target").runs, Runs::Nothing);
+        assert_eq!(real.iter().filter(|a| a.name == "open_notification_target").count(), 1);
     }
 
     #[test]

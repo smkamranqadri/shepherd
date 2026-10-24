@@ -284,7 +284,6 @@ impl Shell {
             p.as_ref().is_some_and(|p| p.is_open())
         }
         open(&self.view_menu)
-            || open(&self.agents_menu)
             || open(&self.ws_menu)
             || open(&self.web_menu)
             || open(&self.pane_menu)

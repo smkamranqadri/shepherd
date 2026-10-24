@@ -403,8 +403,6 @@ fn file_entry_id(tab: TabId) -> String {
 pub(super) struct DraggedTab {
     tab: Shown,
     index: usize,
-    /// The workspace whose tabs it is dragged among: a drop on another workspace's tab is none.
-    workspace: String,
     theme: Theme,
     /// Where the pointer grabbed the tab, from its top-left.
     grab: gpui::Point<Pixels>,
@@ -437,11 +435,6 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
-        // the tabs are in the sidebar's rows: the bar keeps its row for the right panel's toggle alone. With the
-        // sidebar out of the way (hidden, or folding away) the tabs have no place there, and the bar shows them
-        if tabs_in_sidebar_shown(SettingsGlobal::of(cx).settings.tabs_in_sidebar, sidebar_w) {
-            return self.bar_without_tabs(theme, sidebar_w, cx);
-        }
         let now = Instant::now();
         let font = gpui::font(theme.font_ui.clone());
         let label_w = |label: &str, window: &mut Window| {
@@ -531,7 +524,6 @@ impl Shell {
         // held Ctrl (Cmd on macOS): each tab's Tab1–9 chord over its right end, numbered along the strip as
         // `go_to_tab` counts (herdr's tabs, then the file tabs)
         let hint = self.hints_of(hints::HintMode::Tabs).map(|o| (o, TAB_ACTIONS.map(|a| chord_of(cx, a))));
-        let bar_workspace = shown_ws.clone().unwrap_or_default();
         let mut strip_at = 0;
         let mut index = 0;
         let mut items = Vec::new();
@@ -672,7 +664,6 @@ impl Shell {
             let dragged = draggable.then(|| DraggedTab {
                 tab: t.clone(),
                 index: i,
-                workspace: bar_workspace.clone(),
                 theme: theme.clone(),
                 grab: gpui::Point::default(),
                 drag: self.tab_bar.drag.clone(),
@@ -704,7 +695,7 @@ impl Shell {
                 .drag_over::<DraggedTab>(move |s, d, _, _| if d.index == i { s } else { s.bg(drop_bg) })
                 // Dropped on a tab, the dragged one takes its place: herdr's slot is after it when moving right.
                 .on_drop(cx.listener(move |this, d: &DraggedTab, _, cx| {
-                    if let Some(insert_index) = drop_slot(d.index, i, true) {
+                    if let Some(insert_index) = drop_slot(d.index, i) {
                         this.send(Command::MoveTab { tab_id: d.tab.id.clone(), insert_index }, cx, |_, _, _| {});
                     }
                     cx.notify();
@@ -817,315 +808,10 @@ impl Shell {
     }
 }
 
-/// What a workspace's tab rows in the sidebar are (see [`Shell::sidebar_tab_count`]): the row's height and the gap
-/// under it.
-pub(super) const TAB_ROW_H: f32 = 26.;
-
-/// Whether the tabs are the sidebar's rows now: the setting is on and the sidebar is out. With it hidden (or folding
-/// away) the tabs have no place there, and the bar shows them.
-pub(super) fn tabs_in_sidebar_shown(setting: bool, sidebar_w: f32) -> bool {
-    setting && sidebar_w >= 1.
-}
-
-/// How many rows list a workspace under it: its tabs; and, for the shown workspace of the shown session, its file
-/// tabs and a New tab row.
-pub(super) fn rows_under(tabs: usize, files: usize, live: bool, shown_here: bool) -> usize {
-    if live && shown_here { tabs + files + 1 } else { tabs }
-}
-
 /// The slot (as `tab.move` takes it: a place in the list before the move) a tab dragged from `from` to the tab at
-/// `to` goes to; none dropped on itself or on another workspace's tab.
-pub(super) fn drop_slot(from: usize, to: usize, same_workspace: bool) -> Option<usize> {
-    (from != to && same_workspace).then(|| if from < to { to + 1 } else { to })
-}
-
-/// The height of `n` tab rows with their gaps and the 2 px above the first.
-pub(super) fn tab_block_h(n: usize) -> f32 {
-    n as f32 * (TAB_ROW_H + 2.)
-}
-
-impl Shell {
-    /// The titlebar row without tabs: the right panel's toggle at its end, as the tab bar has it.
-    fn bar_without_tabs(&self, theme: &Theme, sidebar_w: f32, cx: &mut Context<Self>) -> Div {
-        div()
-            .h(px(TITLEBAR_HEIGHT))
-            .flex_none()
-            .bg(theme.surface)
-            .flex()
-            .items_center()
-            .pr(px(TAB_TOP + if self.panel_open { 0. } else { window_controls_w(cx) }))
-            .pl(px((TITLEBAR_CLUSTER - sidebar_w).max(8.)))
-            .child(div().flex_1().min_w_0())
-            .child(
-                titlebar_button(theme, "toggle-right-panel", "icons/sidebar-minimalistic-right.svg")
-                    .flex_none()
-                    .ml(px(2.))
-                    .when(self.panel_open, |el| el.bg(theme.selected))
-                    .tooltip(tip("Toggle right panel", Some("ToggleReview")))
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        cx.stop_propagation();
-                        this.toggle_review(window, cx);
-                    })),
-            )
-    }
-
-    /// How many rows the sidebar lists under workspace `ws` while tabs are in it: its tabs, and for the shown
-    /// workspace its file tabs and a New tab row.
-    pub(super) fn sidebar_tab_count(&self, snapshot: &Snapshot, ws: &str, live: bool) -> usize {
-        let shown_here = self.shown_tab().is_some_and(|t| t.workspace_id == ws);
-        let files = self.tabs_key(ws).and_then(|k| self.file_tabs.get(&k)).map_or(0, |t| t.files.len());
-        rows_under(snapshot.tabs_of(ws).len(), files, live, shown_here)
-    }
-
-    /// Workspace `ws`'s tabs as rows under it in the sidebar (`nested`: under a worktree): each with what runs in it
-    /// and its agent's state, the shown one selected. In the shown session a click shows one, a double-click renames
-    /// it, the right button opens its menu, the middle button or the × closes it, a drag along them moves it and a
-    /// pane dropped on one moves into it; the shown workspace adds its file tabs and a New tab row. Another
-    /// session's rows go to its tab on a click.
-    pub(super) fn sidebar_tab_rows(&self, theme: &Theme, snapshot: &Snapshot, ws: &str, nested: bool, mode: &super::sidebar_tree::RowMode, idx: usize, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        let live = *mode == super::sidebar_tree::RowMode::Live;
-        let other = match mode {
-            super::sidebar_tree::RowMode::Other(key) => Some(key.clone()),
-            _ => None,
-        };
-        let shown = self.shown_tab().filter(|_| live);
-        let shown_here = shown.as_ref().is_some_and(|t| t.workspace_id == ws);
-        let file_shown = self.shown_file_tab().map(|(_, f)| f.id);
-        let indent = if nested { 46. } else { 32. };
-        let agents = snapshot.agents();
-        let hint = shown_here.then(|| self.hints_of(hints::HintMode::Tabs).map(|o| (o, TAB_ACTIONS.map(|a| chord_of(cx, a))))).flatten();
-        let drop_bg = theme.accent.opacity(0.15);
-        let mut out = Vec::new();
-        let mut strip_at = 0;
-        let tabs = snapshot.tabs_of(ws);
-        // a stale flight home from the bar's own drag is nothing here
-        if !cx.has_active_drag() {
-            self.tab_bar.drag.borrow_mut().take();
-        }
-        for (i, t) in tabs.iter().enumerate() {
-            let agent = agents.iter().find(|p| p.tab_id == t.tab_id).and_then(|p| p.agent.as_deref());
-            let zoomed = snapshot.layouts.iter().any(|l| l.tab_id == t.tab_id && l.zoomed);
-            let selected = file_shown.is_none() && shown.as_ref().is_some_and(|s| s.tab_id == t.tab_id);
-            let id = t.tab_id.clone();
-            let group = SharedString::from(format!("sbtab-{idx}-{}", t.tab_id));
-            let editing = live.then(|| self.rename_field(&RenameTarget::Tab(id.clone()), cx)).flatten();
-            let chip = hint.as_ref().and_then(|(opacity, chords)| chords.get(strip_at).cloned().flatten().map(|c| hints::chip(theme, &c, *opacity)));
-            strip_at += 1;
-            let shown_tab = Shown {
-                face: Face::Herdr,
-                id: id.clone(),
-                label: t.label.clone(),
-                status: t.agent_status,
-                icon: agent_icon(agent),
-                tint: agent_tint(agent, theme),
-                zoomed,
-                width: 160.,
-            };
-            let mut el = row(theme, selected, SharedString::from(format!("sbtab-{idx}-{}", t.tab_id)))
-                .group(group.clone())
-                .h(px(TAB_ROW_H))
-                .pl(px(indent))
-                .pr(px(6.))
-                .gap(px(6.))
-                .rounded(px(6.))
-                .relative()
-                .text_size(px(12.))
-                .text_color(if selected { theme.text } else { theme.text_muted })
-                .child(favicon(&shown_tab))
-                .map(|el| match editing {
-                    Some(field) => el.child(field),
-                    None => el.child(div().flex_1().min_w_0().truncate().child(t.label.clone())),
-                })
-                .when(zoomed, |el| el.child(zoom_mark(theme)))
-                .children(chip);
-            if live {
-                let close_id = id.clone();
-                el = el
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("sbtab-x-{idx}-{}", t.tab_id)))
-                            .tooltip(tip("Close tab", Some("CloseTab")))
-                            .size(px(SLOT))
-                            .flex_none()
-                            .relative()
-                            .rounded(px(6.))
-                            .hover(|s| s.bg(theme.hover))
-                            .child(dot_slot(theme, &shown_tab).absolute().inset_0().group_hover(group.clone(), |s| s.opacity(0.)))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .opacity(0.)
-                                    .group_hover(group.clone(), |s| s.opacity(1.))
-                                    .child(gpui::svg().path("icons/close.svg").size(px(12.)).text_color(theme.text_muted)),
-                            )
-                            // the row owns a drag: claim the press so the × closes instead of starting one
-                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                                window.prevent_default();
-                                cx.stop_propagation();
-                            })
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.send(Command::CloseTab { tab_id: close_id.clone() }, cx, |_, _, _| {});
-                            })),
-                    );
-                let (label, ws_id) = (t.label.clone(), ws.to_string());
-                let dragged = (!is_renaming(&self.renaming, &id)).then(|| DraggedTab {
-                    tab: shown_tab.clone(),
-                    index: i,
-                    workspace: ws_id.clone(),
-                    theme: theme.clone(),
-                    grab: gpui::Point::default(),
-                    drag: self.tab_bar.drag.clone(),
-                });
-                let (menu_id, mid_id, click_id, drop_ws) = (id.clone(), id.clone(), id.clone(), ws_id.clone());
-                el = el
-                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
-                        this.tab_menu = Some(crate::ui::Popup::new((menu_id.clone(), e.position)));
-                        cx.notify();
-                    }))
-                    .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                        this.send(Command::CloseTab { tab_id: mid_id.clone() }, cx, |_, _, _| {});
-                    }))
-                    .when_some(dragged, |el, dragged| {
-                        el.on_drag(dragged, |d, grab, _, cx| {
-                            let d = DraggedTab { grab, ..d.clone() };
-                            cx.new(|_| d)
-                        })
-                    })
-                    .map(|el| pane_drag::accept_pane(el, &id, drop_bg, cx))
-                    .drag_over::<DraggedTab>({
-                        let ws = ws_id.clone();
-                        move |s, d, _, _| if d.index == i || d.workspace != ws { s } else { s.bg(drop_bg) }
-                    })
-                    // dropped on a tab of the same workspace, the dragged one takes its place
-                    .on_drop(cx.listener(move |this, d: &DraggedTab, _, cx| {
-                        if let Some(insert_index) = drop_slot(d.index, i, d.workspace == drop_ws) {
-                            this.send(Command::MoveTab { tab_id: d.tab.id.clone(), insert_index }, cx, |_, _, _| {});
-                        }
-                        cx.notify();
-                    }))
-                    .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
-                        if e.click_count() == 2 {
-                            this.start_rename(RenameTarget::Tab(click_id.clone()), label.clone(), window, cx);
-                            return;
-                        }
-                        this.show_herdr_tab(Some(click_id.clone()), true, cx);
-                    }));
-            } else {
-                el = el.child(dot_slot(theme, &shown_tab));
-                if let (Some(key), Some(pane)) = (other.clone(), snapshot.panes.iter().find(|p| p.tab_id == t.tab_id)) {
-                    let goal = super::sidebar_tree::Goal::Pane { tab: t.tab_id.clone(), pane: pane.pane_id.clone() };
-                    el = el.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.go_to(key.clone(), goal.clone(), cx)));
-                }
-            }
-            out.push(el.into_any_element());
-        }
-        if shown_here {
-            let files_key = self.tabs_key(ws);
-            let files = files_key.as_ref().and_then(|k| self.file_tabs.get(k)).map(|t| t.files.clone()).unwrap_or_default();
-            let dirty = self.dirty_tabs(cx);
-            for f in files {
-                let name = f.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let face = Face::File { tab: f.id, preview: f.preview, dirty: dirty.contains(&f.id) };
-                let file_tab = Shown {
-                    face,
-                    id: file_entry_id(f.id),
-                    label: f.label(),
-                    status: AgentStatus::Idle,
-                    icon: crate::files::icons::material_icon(&name, false, false),
-                    tint: (theme.text_muted, theme.text_muted),
-                    zoomed: false,
-                    width: 160.,
-                };
-                let selected = file_shown == Some(f.id);
-                let chip = hint.as_ref().and_then(|(opacity, chords)| chords.get(strip_at).cloned().flatten().map(|c| hints::chip(theme, &c, *opacity)));
-                strip_at += 1;
-                let Some(key) = files_key.clone() else { continue };
-                let (show, pin, close_x, mid) = (key.clone(), key.clone(), key.clone(), key);
-                let group = SharedString::from(format!("sbfile-{idx}-{}", f.id.0));
-                out.push(
-                    row(theme, selected, SharedString::from(format!("sbfile-{idx}-{}", f.id.0)))
-                        .group(group.clone())
-                        .h(px(TAB_ROW_H))
-                        .pl(px(indent))
-                        .pr(px(6.))
-                        .gap(px(6.))
-                        .rounded(px(6.))
-                        .relative()
-                        .text_size(px(12.))
-                        .text_color(if selected { theme.text } else { theme.text_muted })
-                        .when(f.preview, |el| el.italic())
-                        .child(favicon(&file_tab))
-                        .child(div().flex_1().min_w_0().truncate().child(file_tab.label.clone()))
-                        .children(chip)
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("sbfile-x-{idx}-{}", f.id.0)))
-                                .tooltip(tip("Close tab", Some("CloseTab")))
-                                .size(px(SLOT))
-                                .flex_none()
-                                .relative()
-                                .rounded(px(6.))
-                                .hover(|s| s.bg(theme.hover))
-                                .child(dot_slot(theme, &file_tab).absolute().inset_0().group_hover(group.clone(), |s| s.opacity(0.)))
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .inset_0()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .opacity(0.)
-                                        .group_hover(group, |s| s.opacity(1.))
-                                        .child(gpui::svg().path("icons/close.svg").size(px(12.)).text_color(theme.text_muted)),
-                                )
-                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                                    window.prevent_default();
-                                    cx.stop_propagation();
-                                })
-                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                    cx.stop_propagation();
-                                    this.close_file_tab(&close_x, f.id, window, cx);
-                                })),
-                        )
-                        .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _: &MouseDownEvent, window, cx| this.close_file_tab(&mid, f.id, window, cx)))
-                        .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
-                            this.show_file_tab(&show, f.id, cx);
-                            if e.click_count() == 2 {
-                                this.pin_file_tab(&pin, f.id, cx);
-                            }
-                        }))
-                        .into_any_element(),
-                );
-            }
-            let ws_id = ws.to_string();
-            out.push(
-                row(theme, false, SharedString::from(format!("sbtab-new-{idx}-{ws}")))
-                    .h(px(TAB_ROW_H))
-                    .pl(px(indent))
-                    .pr(px(6.))
-                    .gap(px(6.))
-                    .rounded(px(6.))
-                    .text_size(px(12.))
-                    .text_color(theme.text_faint)
-                    .tooltip(tip("New tab", Some("NewTab")))
-                    .child(div().size(px(ICON)).flex_none().flex().items_center().justify_center().child(gpui::svg().path("icons/plus.svg").size(px(12.)).text_color(theme.text_faint)))
-                    .child("New tab")
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.new_tab(ws_id.clone(), cx)))
-                    .into_any_element(),
-            );
-        }
-        out
-    }
-}
-
-/// Whether tab `id` is being renamed (its row shows the field, and no drag starts from it).
-fn is_renaming(renaming: &Option<Rename>, id: &str) -> bool {
-    renaming.as_ref().is_some_and(|r| r.target == RenameTarget::Tab(id.to_string()))
+/// `to` goes to; none dropped on itself.
+pub(super) fn drop_slot(from: usize, to: usize) -> Option<usize> {
+    (from != to).then(|| if from < to { to + 1 } else { to })
 }
 
 #[cfg(test)]
@@ -1133,27 +819,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_tab_rows_height_follows_their_count_and_the_bar_comes_back_with_the_sidebar_out() {
-        assert_eq!((tab_block_h(0), tab_block_h(3)), (0., 84.), "a 26 px row and 2 px between, the first's 2 px above");
-        assert!(tabs_in_sidebar_shown(true, 256.));
-        assert!(!tabs_in_sidebar_shown(false, 256.), "the setting off");
-        assert!(!tabs_in_sidebar_shown(true, 0.), "the sidebar hidden: the tabs show in the bar");
-        assert!(!tabs_in_sidebar_shown(true, 0.5), "folding away");
-    }
-
-    #[test]
-    fn the_shown_workspace_lists_its_file_tabs_and_a_new_tab_row_the_others_their_tabs() {
-        assert_eq!(rows_under(3, 2, true, true), 6);
-        assert_eq!(rows_under(3, 2, true, false), 3, "not the shown workspace");
-        assert_eq!(rows_under(3, 2, false, true), 3, "another session's rows carry no file tabs or New tab");
-    }
-
-    #[test]
-    fn a_tab_dropped_on_another_takes_its_place_in_its_own_workspace_only() {
-        assert_eq!(drop_slot(0, 2, true), Some(3), "moving right: the slot is after it");
-        assert_eq!(drop_slot(3, 1, true), Some(1));
-        assert_eq!(drop_slot(2, 2, true), None, "on itself");
-        assert_eq!(drop_slot(0, 2, false), None, "on another workspace's tab");
+    fn a_tab_dropped_on_another_takes_its_place() {
+        assert_eq!(drop_slot(0, 2), Some(3), "moving right: the slot is after it");
+        assert_eq!(drop_slot(3, 1), Some(1));
+        assert_eq!(drop_slot(2, 2), None, "on itself");
     }
 
     fn tab(id: &str) -> Shown {

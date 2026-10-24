@@ -6,9 +6,9 @@ use crate::herdr::{Client, EVENT_TYPES};
 use crate::terminal::pane::{GridHold, PaneQueries};
 use crate::ui::divider::{Throttle, drag_ratio};
 use gpui_base::input::{Input, InputEvent, InputState};
-use crate::model::{AgentSort, AgentStatus, PaneFrame, Snapshot, SplitFrame, attachable};
+use crate::model::{AgentStatus, PaneFrame, Snapshot, SplitFrame, attachable};
 use crate::terminal::PaneTerminal;
-use crate::settings::{SIDEBAR_MAX, SIDEBAR_MIN, SIDEBAR_WIDTH, SettingsGlobal, SidebarView, WindowFrame};
+use crate::settings::{SIDEBAR_MAX, SIDEBAR_MIN, SIDEBAR_WIDTH, SettingsGlobal, WindowFrame};
 use crate::theme::Theme;
 use gpui::{
     linear_color_stop, linear_gradient, AnimationExt, App, Bounds, ClickEvent, Context, Div, Entity, Focusable, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
@@ -36,9 +36,8 @@ mod kept_views;
 mod session_views;
 mod sessions;
 mod sidebar;
-mod sidebar_search;
+mod sidebar_focus;
 mod sidebar_tree;
-mod needs_you;
 mod watchers;
 mod sync;
 mod file_tabs;
@@ -211,7 +210,6 @@ pub struct Shell {
     review_expanded: bool,
     /// The description's whole height at the last paint: whether it has more than its folded lines.
     review_body_h: Rc<Cell<f32>>,
-    agent_sort: AgentSort,
     /// The sidebar's `…` menu, open where it was clicked.
     view_menu: Option<crate::ui::Popup<()>>,
     /// The done agent's pane herdr was last told you looked at, so it is told once, not every frame.
@@ -222,8 +220,6 @@ pub struct Shell {
     show_submenu: bool,
     /// Where the Show submenu was painted: a press there is inside the `…` menu, though outside its card.
     show_submenu_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
-    /// The Agents section's `…` menu, open under its button.
-    agents_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
     /// Worktrees herdr is removing: their rows show a spinner until they leave the snapshot.
     removing: std::collections::HashSet<String>,
     /// Remove a worktree? The workspace, its label, and whether herdr found changes (then removal is forced).
@@ -245,8 +241,6 @@ pub struct Shell {
     usage_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
     /// The status bar's right-click menu of its labels, where it was clicked.
     statusbar_menu: Option<crate::ui::Popup<gpui::Point<Pixels>>>,
-    /// The sidebar's Agents view's scroll.
-    agents_view_scroll: gpui::ScrollHandle,
     tab_bar: tab_bar::TabBar,
     /// Holds keyboard focus when no pane can (renames ended, a tab of only Shepherd's own pane), so the app's
     /// actions still dispatch.
@@ -324,8 +318,6 @@ pub struct Shell {
     feeds: HashMap<watchers::SessionKey, (u64, gpui::Task<()>)>,
     /// The tree's goal after a switch and its machine menu.
     tree: sidebar_tree::TreeState,
-    /// The sidebar's search field, while it is up (FilterSidebar).
-    sidebar_search: Option<sidebar_search::SidebarSearch>,
     /// The New session dialog, open over the window.
     session_dialog: Option<crate::ui::Popup<sessions::SessionDialog>>,
     /// Delete a session, or forget a machine? Asked first.
@@ -657,13 +649,11 @@ impl Shell {
                     review_spring: None,
                     review_expanded: false,
                     review_body_h: Default::default(),
-                    agent_sort: SettingsGlobal::of(cx).settings.agent_sort,
                     view_menu: None,
                     focus_next: None,
                     marked_seen: None,
                     show_submenu: false,
                     show_submenu_bounds: Default::default(),
-                    agents_menu: None,
                     pane_menu: None,
                     spent_menu: None,
                     usage_menu: None,
@@ -674,7 +664,6 @@ impl Shell {
                     removing: Default::default(),
                     remove_confirm: None,
                     pending_worktrees: Vec::new(),
-                    agents_view_scroll: gpui::ScrollHandle::new(),
                     tab_bar: Default::default(),
                     focus: cx.focus_handle(),
                     confirm_focus: cx.focus_handle(),
@@ -706,7 +695,6 @@ impl Shell {
                     session_watch_settled: false,
                     feeds: HashMap::new(),
                     tree: Default::default(),
-                    sidebar_search: None,
                     session_dialog: None,
                     session_delete: None,
                     machine_label: None,
@@ -1054,7 +1042,6 @@ impl Shell {
     /// The Dock count: every agent waiting or finished, in the session shown and in every other one its watcher
     /// keeps, so a switch of session leaves it as it is. Agents in the tab in view count too: they still wait.
     fn sync_badge(&mut self, cx: &App) {
-        // ponytail: the sidebar's Agents toggle counts with the same rule (`waiting_everywhere`)
         let count = if SettingsGlobal::of(cx).settings.dock_badge { self.waiting_everywhere() } else { 0 };
         if count != self.badge {
             self.badge = count;
@@ -1468,7 +1455,6 @@ impl Render for Shell {
         // any Shepherd window in front, not this one: a window in the back renders too
         secure_input(SettingsGlobal::of(cx).settings.secure_input && cx.active_window().is_some());
         crate::ui::reap_popup(&mut self.view_menu, window);
-        crate::ui::reap_popup(&mut self.agents_menu, window);
         crate::ui::reap_popup(&mut self.ws_menu, window);
         crate::ui::reap_popup(&mut self.web_menu, window);
         crate::ui::reap_popup(&mut self.pane_menu, window);
@@ -1536,11 +1522,10 @@ impl Render for Shell {
         // a file tab shown in the grid's place keeps the keyboard from herdr's focused pane, as an overlay does
         let file_shown = self.shown_file_tab().is_some();
         let covered = self.settings.is_some() || self.command_panel.as_ref().is_some_and(|p| p.is_open()) || self.floating_open() || file_shown || self.side_panel.read(cx).focus_handle(cx).contains_focused(window, cx);
-        // a field of the sidebar's (its search, a workspace being renamed) typed in keeps the keyboard too: herdr
-        // moving its focus, or a switch, must not hand it back to a pane mid word
-        let typing = self.sidebar_search.as_ref().is_some_and(|s| s.input.read(cx).focus_handle(cx).is_focused(window))
-            || self.renaming.as_ref().is_some_and(|r| r.input.read(cx).focus_handle(cx).is_focused(window));
-        let overlaid = sidebar_search::keyboard_elsewhere(covered, typing, self.dialog_up());
+        // a field of the sidebar's (a workspace being renamed) typed in keeps the keyboard too: herdr moving its focus,
+        // or a switch, must not hand it back to a pane mid word
+        let typing = self.renaming.as_ref().is_some_and(|r| r.input.read(cx).focus_handle(cx).is_focused(window));
+        let overlaid = sidebar::keyboard_elsewhere(covered, typing, self.dialog_up());
         // a session was left: the keyboard leaves its parked panes (out of `panes`) for the window, and herdr's
         // focused pane here takes it next
         if self.views.take_refocus() && self.settings.is_none() {
@@ -1614,10 +1599,6 @@ impl Render for Shell {
             self.peek_hovered = false;
         }
         let peek = self.peek_now();
-        // the sidebar hidden (or its peek gone): a search there would take keys nobody sees, and number hidden rows
-        if self.sidebar_search.is_some() && !sidebar_search::sidebar_drawn(self.sidebar_open, peek) {
-            self.close_sidebar_search(cx);
-        }
         if sliding || self.sidebar_nudge().is_some() || self.sidebar_peek.is_some_and(|m| m.animating()) {
             window.request_animation_frame();
         }
@@ -1627,7 +1608,7 @@ impl Render for Shell {
         let web = self.shown_page(cx);
         // a page in place of the tabs: no workspace looks selected
         let sidebar_ws = if web.is_some() { None } else { shown_ws.clone() };
-        let sidebar = self.render_sidebar(&theme, &snapshot, &sidebar_ws, &shown_tab, window, cx);
+        let sidebar = self.render_sidebar(&theme, &snapshot, &sidebar_ws, window, cx);
         let (docked, peeking) = if sidebar_w > 0. { (Some(sidebar), None) } else { (None, Some(sidebar)) };
 
         let tabbar = self.render_tab_bar(&theme, shown_ws.clone(), shown_tab.clone(), sidebar_w, window, cx);
@@ -1922,8 +1903,6 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &Workspace8, _, cx| this.go_to_workspace(7, cx)))
             .on_action(cx.listener(|this, _: &Workspace9, _, cx| this.go_to_workspace(8, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
-            .on_action(cx.listener(|this, _: &ToggleAgentsView, _, cx| this.toggle_agents_view(cx)))
-            .on_action(cx.listener(|this, _: &FilterSidebar, w, cx| this.open_sidebar_search(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleFocusMode, _, cx| this.toggle_focus_mode(cx)))
             .on_action(cx.listener(|this, _: &ToggleReview, w, cx| this.toggle_review(w, cx)))
             .on_action(cx.listener(|this, _: &ShowFiles, w, cx| this.show_panel_tab(crate::settings::PanelTab::Files, w, cx)))
@@ -1939,7 +1918,6 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.toggle_settings_here(window, cx)))
             .on_action(cx.listener(|this, _: &CommandPanel, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Commands, w, cx)))
             .on_action(cx.listener(|this, _: &ChangeTheme, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Themes, w, cx)))
-            .on_action(cx.listener(|this, _: &NextNeedsYou, _, cx| this.next_needs_you(cx)))
             .on_action(cx.listener(|this, _: &WorkspacesPanel, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Workspaces, w, cx)))
             .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| this.toggle_command_panel(crate::ui::command_panel::Kind::Shortcuts, w, cx)))
             .on_action(cx.listener(|this, c: &crate::herdr::keys::HerdrCommand, w, cx| this.run_herdr_command(c, w, cx)))

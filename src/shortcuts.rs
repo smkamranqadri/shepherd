@@ -160,6 +160,7 @@ fn herdr_row(action: &Action) -> Row {
         Runs::HerdrOnly if action.known => (Some("herdr only: Shepherd has no equivalent".into()), true),
         Runs::HerdrOnly => (Some("herdr only: newer than this Shepherd".into()), true),
         Runs::Local => (Some("herdr only: a mode of its own screen".into()), true),
+        Runs::Nothing => (Some("Does nothing in Shepherd".into()), false),
         Runs::Prefix => (Some("Starts herdr's prefix mode".into()), false),
     };
     Row {

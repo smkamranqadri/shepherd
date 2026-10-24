@@ -1287,20 +1287,6 @@ impl Render for SettingsView {
                 card(&theme)
                     .child(
                         card_row(&theme, true)
-                            .child(row_text(&theme, "Agents", "A Workspaces | Agents switch at the top of the sidebar; Agents lists every agent herdr finds, under its session."))
-                            .child(toggle(&theme, "show-agents", settings.show_agents).on_click(cx.listener(
-                                |_, _: &ClickEvent, _, cx| update(cx, |s| s.show_agents = !s.show_agents),
-                            ))),
-                    )
-                    .child(
-                        card_row(&theme, false)
-                            .child(row_text(&theme, "Tabs in sidebar", "List each workspace's tabs under it in the sidebar, in place of the tab bar along the top."))
-                            .child(toggle(&theme, "tabs-in-sidebar", settings.tabs_in_sidebar).on_click(cx.listener(
-                                |_, _: &ClickEvent, _, cx| update(cx, |s| s.tabs_in_sidebar = !s.tabs_in_sidebar),
-                            ))),
-                    )
-                    .child(
-                        card_row(&theme, false)
                             .child(row_text(
                                 &theme,
                                 "Sessions bar",

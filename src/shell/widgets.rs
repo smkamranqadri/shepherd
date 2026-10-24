@@ -192,8 +192,8 @@ pub(super) fn count_badge(theme: &Theme, count: usize) -> Div {
         .child(count.to_string())
 }
 
-/// A session's agents waiting or done, as ●N in the warning colour: the tree's session rows, the Agents view's
-/// toggle and the session switcher draw the same pill, so the count reads the same everywhere.
+/// A session's agents waiting or done, as ●N in the warning colour: the tree's session rows and the session switcher
+/// draw the same pill, so the count reads the same everywhere.
 pub(crate) fn waiting_pill(theme: &Theme, n: usize) -> Div {
     div()
         .flex_none()
@@ -212,13 +212,6 @@ pub(crate) fn waiting_pill(theme: &Theme, n: usize) -> Div {
 
 /// A workspace row with its branch line under the name.
 pub(super) const WS_TWO_LINES: f32 = 46.;
-
-/// The agents list's orders: the Agents section's `…` menu.
-pub(super) const SORTS: [(AgentSort, &str, &str, &str); 3] = [
-    (AgentSort::Status, "sort-status", "icons/checklist.svg", "Status"),
-    (AgentSort::Waiting, "sort-waiting", "icons/clock-circle.svg", "Waiting longest"),
-    (AgentSort::Grouped, "sort-grouped", "icons/folder.svg", "Grouped"),
-];
 
 /// Native context menus: the right press that opened one can be held, dragged onto an item and let go there.
 /// A release where the menu opened (`at`) is the press itself ending, not a pick.
