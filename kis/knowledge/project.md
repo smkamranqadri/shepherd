@@ -3,7 +3,7 @@
 Rust/GPUI terminal-agent workspace app (herdr front end). This checkout is Kamran's fork; fork is the main line, upstream releases are merged in, only small Linux PRs go upstream (no Hyprland/Omarchy/Arch wording in upstream changes).
 
 ## Folders
-- `shepherd` (this one): the only checkout, on `dev` (the working line). `main` mirrors upstream (freethinkel/shepherd, v1.3.5 merged into dev 2026-10-24); `fork` is smkamranqadri/shepherd.
+- `shepherd` (this one): the only checkout, on `dev` (the working line). `main` mirrors upstream (`origin`, freethinkel/shepherd) and is only fast-forwarded; `fork` is smkamranqadri/shepherd. Upstream merged the Linux PRs #2 and #3, so dev's first Linux commits exist upstream under other hashes.
 - `shepherd-local`: build folder. PKGBUILD builds `branch=dev` (webkit2gtk-4.1 and gtk3 are depends); rebuild with `makepkg -f`, Kamran runs `sudo pacman -U`. Keep only the latest `.zst`.
 - Only branches: `dev` and `main`. Old feature branches were merged or superseded and deleted 2026-10-23 (`feat/right-sidebar` tip 995ad24; its packaging/arch/PKGBUILD was dropped). Git keeps their commits until gc.
 - `fork` also has `linux-port`, `up-linux-pr1`, `up-linux-pr2` (the upstream PR branches, merged).
