@@ -351,6 +351,27 @@ pub fn parse_codex_usage(json: &str) -> Option<Vec<Limit>> {
     (!limits.is_empty()).then_some(limits)
 }
 
+/// The body of Command Code's `alpha/billing/credits`, what its `/usage` reads: the 5-hour and weekly caps of the plan
+/// (`windowLimits`, `used` of `cap` credits, `resetAt` in unix milliseconds, 0 until the window has had use). A plan
+/// without caps (`limited` not true) has no window to show.
+pub fn parse_commandcode_usage(json: &str) -> Option<Vec<Limit>> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let windows = &v["windowLimits"];
+    if windows["limited"].as_bool() != Some(true) {
+        return None;
+    }
+    let limits: Vec<Limit> = [("fiveHour", "5-hour"), ("weekly", "Weekly")]
+        .into_iter()
+        .filter_map(|(key, label)| {
+            let w = &windows[key];
+            let cap = w["cap"].as_f64().filter(|c| *c > 0.)?;
+            let resets = w["resetAt"].as_f64().filter(|ms| *ms > 0.).map(|ms| (ms / 1000.) as i64);
+            Some(Limit { label: label.into(), used: (w["used"].as_f64()? / cap * 100.).clamp(0., 100.), resets })
+        })
+        .collect();
+    (!limits.is_empty()).then_some(limits)
+}
+
 /// A window's length as its name: `5-hour`, `Weekly`, `30-day`.
 pub fn window_label(secs: i64) -> String {
     match secs {
@@ -517,6 +538,17 @@ fn read_usage(key: &str) -> Option<Vec<Limit>> {
             .call()
             .ok()?;
         return parse_codex_usage(&response.body_mut().read_to_string().ok()?);
+    }
+    if key == UsageAgent::CommandCode.key() {
+        // The endpoint Command Code's own /usage reads, with its API key (its env var, else the file it writes at login).
+        // ponytail: an organization's account asks with its orgId, which this does not: it reads the personal plan
+        let from_file = || {
+            let auth: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(std::env::home_dir()?.join(".commandcode/auth.json")).ok()?).ok()?;
+            auth["apiKey"].as_str().map(str::to_string)
+        };
+        let api_key = std::env::var("COMMAND_CODE_API_KEY").ok().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).or_else(from_file)?;
+        let mut response = agent.get("https://api.commandcode.ai/alpha/billing/credits").header("Authorization", &format!("Bearer {api_key}")).call().ok()?;
+        return parse_commandcode_usage(&response.body_mut().read_to_string().ok()?);
     }
     // The endpoint Claude Code itself reads, with the token Claude Code keeps (and refreshes).
     let creds: serde_json::Value = serde_json::from_slice(&claude_credentials()?).ok()?;
@@ -1069,6 +1101,30 @@ mod tests {
         assert_eq!(parse_codex_usage(r#"{"detail":"Unauthorized"}"#), None);
     }
 
+    /// The credits response of a Command Code Pro plan as `api.commandcode.ai` sent it, nothing used yet (the account's
+    /// own numbers; the response holds no id, email or token), and the same with some use, fictional numbers.
+    const COMMANDCODE_FRESH: &str = r#"{"credits":{"belowThreshold":false,"creditThreshold":0,"monthlyCredits":33.9139117144,"purchasedCredits":0,"freeCredits":0},"windowLimits":{"limited":true,"exceeded":null,"fiveHour":{"used":0,"cap":14,"exceeded":false,"resetAt":0},"weekly":{"used":0,"cap":35,"exceeded":false,"resetAt":0}},"sandboxAccess":true,"sandboxMinutes":{"usedMinutes":0,"limitMinutes":0,"overageUsd":0,"resetAt":1793491200000}}"#;
+    const COMMANDCODE_USED: &str = r#"{"credits":{"monthlyCredits":20.5},"windowLimits":{"limited":true,"exceeded":null,"fiveHour":{"used":7,"cap":14,"exceeded":false,"resetAt":1794000000000},"weekly":{"used":42,"cap":35,"exceeded":true,"resetAt":1794400000000}}}"#;
+
+    #[test]
+    fn parses_commandcode_usage() {
+        let limit = |label: &str, used, resets| Limit { label: label.into(), used, resets };
+        assert_eq!(parse_commandcode_usage(COMMANDCODE_FRESH), Some(vec![limit("5-hour", 0., None), limit("Weekly", 0., None)]), "no use yet: resetAt 0 is no reset");
+        // used of cap as a percent, resetAt milliseconds as seconds, over the cap held at 100
+        assert_eq!(parse_commandcode_usage(COMMANDCODE_USED), Some(vec![limit("5-hour", 50., Some(1_794_000_000)), limit("Weekly", 100., Some(1_794_400_000))]));
+        // one window alone; a window with no cap has no percent
+        let weekly = r#"{"windowLimits":{"limited":true,"weekly":{"used":7,"cap":35,"resetAt":0},"fiveHour":{"used":1,"cap":0,"resetAt":0}}}"#;
+        assert_eq!(parse_commandcode_usage(weekly), Some(vec![limit("Weekly", 20., None)]));
+        // a plan without caps, an error, or something else shows nothing
+        assert_eq!(parse_commandcode_usage(r#"{"credits":{"monthlyCredits":5},"windowLimits":{"limited":false}}"#), None);
+        assert_eq!(parse_commandcode_usage(r#"{"credits":{"monthlyCredits":5}}"#), None);
+        assert_eq!(parse_commandcode_usage(r#"{"windowLimits":{"limited":false,"fiveHour":{"used":1,"cap":14,"resetAt":0}}}"#), None, "caps not enforced: not shown");
+        assert_eq!(parse_commandcode_usage(r#"{"success":false,"error":"Session expired"}"#), None);
+        assert_eq!(parse_commandcode_usage(""), None);
+        assert_eq!(UsageAgent::CommandCode.key(), "commandcode");
+        assert_eq!(UsageAgent::CommandCode.label(), "Command Code");
+    }
+
     /// The bodies of `parses_claude_usage` and `parses_codex_usage`, Claude's and a Plus plan's two windows with the
     /// agreed look's percents, a Free plan's one window as the endpoint sent it.
     fn bodies() -> (Vec<Limit>, Vec<Limit>, Vec<Limit>) {
@@ -1100,6 +1156,31 @@ mod tests {
         assert_eq!(windows(&usage_labels(&both, of(Some(Vec::new())))).len(), 1, "no window: no label");
         assert_eq!(windows(&usage_labels(&[UsageAgent::Codex], of(Some(plus)))).len(), 1, "Claude turned off: Codex alone");
         assert!(usage_labels(&[], of(None)).is_empty(), "both off: nothing");
+    }
+
+    /// Command Code is labelled as Claude and Codex are, by its own switch: its windows from its response, no label when it
+    /// has none (signed out, or its endpoint failing), and none when its switch is off.
+    #[test]
+    fn command_code_gets_a_label_like_the_others() {
+        let (claude, _, _) = bodies();
+        let command_code = parse_commandcode_usage(COMMANDCODE_USED).unwrap();
+        let of = |signed_in: bool| {
+            let (claude, command_code) = (claude.clone(), command_code.clone());
+            move |a: UsageAgent| match a {
+                UsageAgent::Claude => Some(claude.clone()),
+                UsageAgent::CommandCode => signed_in.then(|| command_code.clone()),
+                UsageAgent::Codex => None,
+            }
+        };
+        let all = crate::settings::UsageShow::default().shown();
+        assert_eq!(
+            windows(&usage_labels(&all, of(true))),
+            [("Claude", vec!["5-hour 12%".to_string(), "Weekly 40%".to_string()]), ("Command Code", vec!["5-hour 50%".to_string(), "Weekly 100%".to_string()])],
+            "Codex not signed in: no label"
+        );
+        assert_eq!(windows(&usage_labels(&all, of(false))).len(), 1, "Command Code not signed in: no label");
+        let off = crate::settings::UsageShow { commandcode: false, ..Default::default() };
+        assert_eq!(windows(&usage_labels(&off.shown(), of(true))).len(), 1, "its switch off: no label");
     }
 
     /// A click on an agent's label opens the popup over it with that agent's limits, the cache seeded as a poll

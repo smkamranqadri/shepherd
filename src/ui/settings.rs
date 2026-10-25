@@ -1579,6 +1579,7 @@ impl Render for SettingsView {
                     let (source, url) = match agent {
                         UsageAgent::Claude => ("From Claude Code's sign-in.", "https://claude.ai/settings/usage"),
                         UsageAgent::Codex => ("From Codex's ChatGPT sign-in.", "https://chatgpt.com/codex/settings/usage"),
+                        UsageAgent::CommandCode => ("From Command Code's sign-in.", "https://commandcode.ai/usage"),
                     };
                     // ponytail: no loading state; the first second after opening reads as not signed in
                     let limits = crate::ui::statusbar::usage_of(agent, cx).filter(|l| !l.is_empty());
