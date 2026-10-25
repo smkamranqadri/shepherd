@@ -1789,6 +1789,7 @@ impl Render for Shell {
         let spring_back = self.pane_spring_back(window);
         let settings_page = self.settings.as_ref().map(|(view, _)| view.clone());
         let on_page = settings_page.is_some();
+        let focus_on = SettingsGlobal::of(cx).settings.sidebar_focus;
         let panel = (self.panel_open && !on_page).then(|| self.render_right_panel(&theme, &shown, window, cx));
         // the side panel gone from view (closed, the PR tab now there, the settings page) keeps no keyboard focus
         let side_shown = self.panel_open && !on_page && self.shown_panel_tab() != crate::settings::PanelTab::Pr;
@@ -2081,15 +2082,24 @@ impl Render for Shell {
                         })),
                 )
             })
+            // The Focus chip of focus mode, before the `…`: it turns focus mode off, with the sessions bar too (it
+            // filters the shown session there).
+            .when_some(focus_on.then(|| sidebar_focus::titlebar_chip(&theme, sidebar_w)).flatten().filter(|_| !on_page), |el, chip| {
+                el.child(chip.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_focus_mode(cx);
+                })))
+            })
             // Zeron's sidebar `…`: in the titlebar at the sidebar's right edge, hidden once the sidebar is too
             // narrow to hold it beside the toggle.
-            .when(sidebar_w >= TITLEBAR_CLUSTER + 32. && !on_page, |el| {
+            .when_some(sidebar_focus::view_button_left(sidebar_w).filter(|_| !on_page), |el, left| {
                 el.child(
                     titlebar_button(&theme, "sidebar-view", "icons/more-horizontal.svg")
+                        .debug_selector(|| "sidebar-view".into())
                         .tooltip(tip("Sidebar view", None))
                         .absolute()
                         .top(px(TRAFFIC_LIGHTS_CENTER - 12.))
-                        .left(px(sidebar_w - 8. - 24.))
+                        .left(px(left))
                         .when(self.view_menu.as_ref().is_some_and(|m| m.is_open()), |el| el.bg(theme.hover))
                         // Capture, so a press on the open menu's trigger closes it instead of the menu's
                         // click-outside closing it and the click reopening it.

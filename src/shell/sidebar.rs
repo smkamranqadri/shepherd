@@ -4,6 +4,22 @@ use super::*;
 /// How long the floating sidebar stays after the pointer leaves it.
 const PEEK_LINGER: Duration = Duration::from_millis(200);
 
+/// The sidebar's head row: `name` (the place's label) filling it, then the dev build's badge.
+pub(super) fn sidebar_head(theme: &Theme, name: Option<impl IntoElement>) -> Div {
+    div()
+        .debug_selector(|| "sidebar-head".into())
+        .px(px(16.))
+        .pt(px(8.))
+        .pb(px(6.))
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .text_size(px(11.))
+        .text_color(theme.text_faint)
+        .child(div().flex_1().min_w_0().truncate().children(name))
+        .when(is_dev_build(), |el| el.child(dev_badge(theme)))
+}
+
 impl Shell {
     /// The sidebar's width this frame: mid tween, or where it rests.
     pub(super) fn sidebar_now(&self) -> f32 {
@@ -417,8 +433,6 @@ impl Shell {
         self.tidy_tree_drag(window, cx);
         let settings = &SettingsGlobal::of(cx).settings;
         let bar = settings.sessions_bar;
-        // focus mode's chip, with the sessions bar too: it filters the shown session there
-        let focus = settings.sidebar_focus;
         let (tree, listed) = self.tree_rows(theme, snapshot, shown_ws, active, cx);
         let body = div()
             .id("workspaces")
@@ -441,7 +455,7 @@ impl Shell {
             .flex_col()
             .gap(px(2.))
             .children(tree);
-        let header = self.sidebar_header(theme, listed, focus, cx);
+        let header = self.sidebar_header(theme, listed, cx);
         let waiting = self.error.is_none() && self.connecting.is_some_and(|at| crate::ui::loader::due(at, window));
         // the sessions bar: the list goes under a swipe's fingers, then springs home, and beside it the place it goes to
         // (or comes from)
@@ -486,38 +500,12 @@ impl Shell {
             .child(self.footer(theme, cx))
     }
 
-    /// The sidebar's head: the shown session's name when the tree names none (with one session, or the sessions bar),
-    /// and the Focus chip that turns focus mode off. The place's spinner goes after it.
-    fn sidebar_header(&self, theme: &Theme, listed: bool, focus: bool, cx: &mut Context<Self>) -> Div {
-        let head = div().px(px(16.)).pt(px(8.)).pb(px(6.)).flex().items_center().gap(px(6.)).text_size(px(11.)).text_color(theme.text_faint);
-        let chip = focus.then(|| {
-            let accent = theme.accent;
-            div()
-                .id("sidebar-focus-chip")
-                .flex_none()
-                .h(px(18.))
-                .px(px(6.))
-                .flex()
-                .items_center()
-                .gap(px(3.))
-                .rounded(px(9.))
-                .bg(accent.opacity(0.14))
-                .text_color(accent)
-                .cursor_pointer()
-                .hover(move |s| s.bg(accent.opacity(0.22)))
-                .tooltip(tip("Show every session again", Some("ToggleFocusMode")))
-                .child(gpui::svg().path("icons/solar/target.svg").size(px(10.)).text_color(accent))
-                .child("Focus")
-                .child(gpui::svg().path("icons/close.svg").size(px(9.)).text_color(accent))
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_focus_mode(cx)))
-        });
-        head
-            // the tree names every session; with one, or the sessions bar, its name heads the list
-            .child(div().flex_1().min_w_0().truncate().when(!listed, |el| el.child(self.place_label(cx))))
-            .children(chip)
-            .when(is_dev_build(), |el| el.child(dev_badge(theme)))
+    /// The sidebar's head: the shown session's name when the tree names none (with one session, or the sessions bar).
+    /// The place's spinner goes after it. The Focus chip is in the titlebar, beside the sidebar's ⋯.
+    fn sidebar_header(&self, theme: &Theme, listed: bool, cx: &mut Context<Self>) -> Div {
+        // the tree names every session; with one, or the sessions bar, its name heads the list
+        sidebar_head(theme, (!listed).then(|| self.place_label(cx)))
     }
-
 
     /// Arc's space bar (the sessions bar setting): a button for each herdr session and machine, in the order dragged
     /// to, the shown one lit.

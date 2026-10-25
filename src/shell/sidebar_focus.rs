@@ -72,6 +72,58 @@ pub(super) fn tree_view(places: &[Place], w: &Watchers, collapsed: &HashSet<Stri
     TreeView { rows, drags: drags_while(focus), kept, empty }
 }
 
+/// The Focus chip's width in the titlebar with its word, and as the bare icon when the sidebar is too narrow for the word.
+const CHIP_FULL: f32 = 66.;
+const CHIP_ICON: f32 = 24.;
+/// The chip's height, and the gap between it and the ⋯.
+const CHIP_H: f32 = 18.;
+const CHIP_GAP: f32 = 6.;
+
+/// Where the titlebar's Sidebar view ⋯ sits: at the sidebar's right edge, hidden once the sidebar is too narrow to
+/// hold it beside the toggle.
+pub(super) fn view_button_left(sidebar_w: f32) -> Option<f32> {
+    (sidebar_w >= TITLEBAR_CLUSTER + 32.).then_some(sidebar_w - 8. - 24.)
+}
+
+/// The Focus chip's left edge and width in the titlebar, right before the ⋯: its word and icon while they clear the
+/// toggle, the icon alone when only that does, and gone with the ⋯.
+pub(super) fn chip_box(sidebar_w: f32) -> Option<(f32, f32)> {
+    let right = view_button_left(sidebar_w)? - CHIP_GAP;
+    [CHIP_FULL, CHIP_ICON].into_iter().map(|w| (right - w, w)).find(|(left, _)| *left >= TITLEBAR_CLUSTER)
+}
+
+/// The Focus chip as the titlebar draws it, absolute at its place before the ⋯ (the caller adds its click).
+pub(super) fn titlebar_chip(theme: &Theme, sidebar_w: f32) -> Option<gpui::Stateful<Div>> {
+    let (left, width) = chip_box(sidebar_w)?;
+    let accent = theme.accent;
+    let word = width == CHIP_FULL;
+    Some(
+        div()
+            .id("sidebar-focus-chip")
+            .debug_selector(|| "sidebar-focus-chip".into())
+            .absolute()
+            .top(px(TRAFFIC_LIGHTS_CENTER - CHIP_H / 2.))
+            .left(px(left))
+            .w(px(width))
+            .h(px(CHIP_H))
+            .overflow_hidden()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(3.))
+            .rounded(px(9.))
+            .bg(accent.opacity(0.14))
+            .text_size(px(11.))
+            .text_color(accent)
+            .cursor_pointer()
+            .occlude()
+            .hover(move |s| s.bg(accent.opacity(0.22)))
+            .tooltip(tip("Show every session again", Some("ToggleFocusMode")))
+            .child(gpui::svg().path("icons/solar/target.svg").size(px(10.)).flex_none().text_color(accent))
+            .when(word, |el| el.child("Focus").child(gpui::svg().path("icons/close.svg").size(px(9.)).flex_none().text_color(accent))),
+    )
+}
+
 impl Shell {
     /// The Workspaces tree shown now (the sessions bar and focus mode applied), and the shown session's key.
     pub(super) fn shown_tree(&self, cx: &mut App) -> (TreeView, SessionKey) {
@@ -88,7 +140,7 @@ impl Shell {
         drags_while(SettingsGlobal::of(cx).settings.tree_agents_only())
     }
 
-    /// ToggleFocusMode, the header's menu and its Focus chip: the Workspaces tree keeps the workspaces with an
+    /// ToggleFocusMode, the titlebar's Focus chip and the sidebar view menu: the Workspaces tree keeps the workspaces with an
     /// agent, or shows every one again.
     pub(super) fn toggle_focus_mode(&mut self, cx: &mut Context<Self>) {
         // a drop being aimed: its rows come and go
@@ -351,5 +403,92 @@ mod tests {
         assert!(!old.sidebar_focus, "a file from before focus mode");
         let on: crate::settings::Settings = serde_json::from_str(r#"{"sidebar_focus": true}"#).unwrap();
         assert!(on.sidebar_focus && on.tree_agents_only() && !on.tree_one_session());
+    }
+
+    /// A titlebar as the shell draws the sidebar's part of it: the toggle's place, the chip when focus mode is on, the
+    /// ⋯, all at `w` of sidebar.
+    struct Bar {
+        w: f32,
+        focus: bool,
+    }
+
+    impl gpui::Render for Bar {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let theme = Theme::of(cx).clone();
+            let (w, focus) = (self.w, self.focus);
+            div()
+                .relative()
+                .w(px(w))
+                .h(px(TITLEBAR_HEIGHT))
+                .child(div().debug_selector(|| "toggle".into()).absolute().top(px(TRAFFIC_LIGHTS_CENTER - 12.)).left(px(TOGGLE_LEFT)).size(px(24.)))
+                .when_some(focus.then(|| titlebar_chip(&theme, w)).flatten(), |el, chip| el.child(chip))
+                .when_some(view_button_left(w), |el, left| {
+                    el.child(titlebar_button(&theme, "sidebar-view", "icons/more-horizontal.svg").debug_selector(|| "sidebar-view".into()).absolute().top(px(TRAFFIC_LIGHTS_CENTER - 12.)).left(px(left)))
+                })
+        }
+    }
+
+    fn bar_at(cx: &mut gpui::TestAppContext, w: f32, focus: bool) -> &'static mut gpui::VisualTestContext {
+        cx.update(|cx| cx.set_global(Theme::for_appearance(gpui::WindowAppearance::Dark)));
+        let (_, cx) = cx.add_window_view(|_, _| Bar { w, focus });
+        let cx: &'static mut gpui::VisualTestContext = Box::leak(Box::new(cx.clone()));
+        cx.run_until_parked();
+        cx
+    }
+
+    /// Focus on, the chip is in the titlebar before the ⋯: clear of the toggle and of the ⋯ at every width the ⋯ shows,
+    /// from the narrowest the sidebar goes to the widest, and where the word will not fit the icon alone.
+    #[gpui::test]
+    fn the_focus_chip_sits_in_the_titlebar_before_the_menu_button(cx: &mut gpui::TestAppContext) {
+        // the dev badge heads the sidebar's row under the titlebar, not the titlebar
+        assert!(is_dev_build(), "a test build is a dev build, with its badge");
+        for w in [crate::settings::SIDEBAR_MIN, 256., crate::settings::SIDEBAR_MAX, TITLEBAR_CLUSTER + 32., TITLEBAR_CLUSTER + 60., TITLEBAR_CLUSTER + 100., TITLEBAR_CLUSTER + 200.] {
+            let cx = bar_at(cx, w, true);
+            let toggle = cx.debug_bounds("toggle").unwrap();
+            let more = cx.debug_bounds("sidebar-view").unwrap_or_else(|| panic!("the ⋯ drawn at {w}"));
+            let chip = cx.debug_bounds("sidebar-focus-chip");
+            let Some(chip) = chip else {
+                assert!(chip_box(w).is_none(), "the chip drawn at {w} when it fits");
+                continue;
+            };
+            assert!(chip.left() >= toggle.right(), "{w}: chip {:?} over the toggle {:?}", chip, toggle);
+            assert!(chip.right() <= more.left(), "{w}: chip {:?} over the ⋯ {:?}", chip, more);
+            assert!(chip.right() <= px(w), "{w}: chip inside the sidebar");
+            assert_eq!(more.left() - chip.right(), px(6.), "{w}: the chip beside the ⋯");
+            assert!(chip.top() >= px(0.) && chip.bottom() <= px(TITLEBAR_HEIGHT), "{w}: chip inside the titlebar");
+        }
+        // wide: the word; narrow: the icon alone; where the ⋯ hides: neither
+        let wide = bar_at(cx, 256., true).debug_bounds("sidebar-focus-chip").unwrap();
+        assert_eq!(wide.size.width, px(if cfg!(target_os = "macos") { 24. } else { 66. }));
+        assert_eq!(bar_at(cx, TITLEBAR_CLUSTER + 32., true).debug_bounds("sidebar-focus-chip").map(|b| b.size.width), chip_box(TITLEBAR_CLUSTER + 32.).map(|(_, w)| px(w)));
+        let hidden = bar_at(cx, TITLEBAR_CLUSTER + 31., true);
+        assert!(hidden.debug_bounds("sidebar-view").is_none() && hidden.debug_bounds("sidebar-focus-chip").is_none(), "chip hides with the ⋯");
+    }
+
+    #[gpui::test]
+    fn focus_off_shows_no_chip(cx: &mut gpui::TestAppContext) {
+        let cx = bar_at(cx, 256., false);
+        assert!(cx.debug_bounds("sidebar-focus-chip").is_none());
+        assert!(cx.debug_bounds("sidebar-view").is_some(), "the ⋯ stays");
+    }
+
+    /// The sidebar's head row has no chip: it is the same row with focus mode on or off, as one built from the place's
+    /// label alone.
+    #[gpui::test]
+    fn the_sidebar_head_has_no_chip_row(cx: &mut gpui::TestAppContext) {
+        struct Head;
+        impl gpui::Render for Head {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = Theme::of(cx).clone();
+                div().w(px(256.)).child(super::super::sidebar::sidebar_head(&theme, Some("default".to_string())))
+            }
+        }
+        cx.update(|cx| cx.set_global(Theme::for_appearance(gpui::WindowAppearance::Dark)));
+        let (_, cx) = cx.add_window_view(|_, _| Head);
+        cx.run_until_parked();
+        let head = cx.debug_bounds("sidebar-head").expect("the head drawn");
+        assert!(cx.debug_bounds("sidebar-focus-chip").is_none(), "no chip in the head");
+        // 8 px over and 6 under the dev badge, the tallest thing in it: the same with focus mode on or off
+        assert_eq!(head.size.height, px(8. + 18. + 6.));
     }
 }
