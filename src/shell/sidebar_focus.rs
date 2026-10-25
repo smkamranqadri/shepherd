@@ -448,7 +448,7 @@ mod tests {
             let more = cx.debug_bounds("sidebar-view").unwrap_or_else(|| panic!("the ⋯ drawn at {w}"));
             let chip = cx.debug_bounds("sidebar-focus-chip");
             let Some(chip) = chip else {
-                assert!(chip_box(w).is_none(), "the chip drawn at {w} when it fits");
+                assert!(w < TITLEBAR_CLUSTER + 100., "no chip at {w}, where the icon fits");
                 continue;
             };
             assert!(chip.left() >= toggle.right(), "{w}: chip {:?} over the toggle {:?}", chip, toggle);
@@ -460,7 +460,10 @@ mod tests {
         // wide: the word; narrow: the icon alone; where the ⋯ hides: neither
         let wide = bar_at(cx, 256., true).debug_bounds("sidebar-focus-chip").unwrap();
         assert_eq!(wide.size.width, px(if cfg!(target_os = "macos") { 24. } else { 66. }));
-        assert_eq!(bar_at(cx, TITLEBAR_CLUSTER + 32., true).debug_bounds("sidebar-focus-chip").map(|b| b.size.width), chip_box(TITLEBAR_CLUSTER + 32.).map(|(_, w)| px(w)));
+        let icon = bar_at(cx, TITLEBAR_CLUSTER + 100., true).debug_bounds("sidebar-focus-chip").expect("the icon chip where only it fits");
+        assert_eq!(icon.size.width, px(24.));
+        let narrow = bar_at(cx, TITLEBAR_CLUSTER + 60., true);
+        assert!(narrow.debug_bounds("sidebar-view").is_some() && narrow.debug_bounds("sidebar-focus-chip").is_none(), "the ⋯ shows, the chip clears the toggle nowhere");
         let hidden = bar_at(cx, TITLEBAR_CLUSTER + 31., true);
         assert!(hidden.debug_bounds("sidebar-view").is_none() && hidden.debug_bounds("sidebar-focus-chip").is_none(), "chip hides with the ⋯");
     }
