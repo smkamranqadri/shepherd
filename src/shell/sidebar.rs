@@ -341,7 +341,9 @@ impl Shell {
                     if live && self.removing.contains(&w.workspace_id) {
                         el.text_color(theme.text_faint).child(spinner(theme, format!("ws-removing-{idx}-{}", w.workspace_id)))
                     } else {
-                        el.when(show.status, |el| el.child(status_dot(w.agent_status, theme)))
+                        // agents resting with shells still running in the background read as working, with their count
+                        let (status, shells) = snapshot.map_or((w.agent_status, 0), |s| self.shells.workspace(&key, s, w));
+                        el.when(show.status, |el| el.child(status_cell(status, shells, theme)))
                     }
                 })
                 // over the row's right end (its status), so nothing in it moves

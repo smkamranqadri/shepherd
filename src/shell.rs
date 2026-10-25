@@ -22,6 +22,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 mod attention;
+mod bg_shells;
 mod discover;
 mod divider;
 mod floating;
@@ -253,6 +254,8 @@ pub struct Shell {
     command_panel: Option<crate::ui::Popup<(Entity<crate::ui::command_panel::Panel>, Subscription)>>,
     /// What was told of each agent in every session, so a change is told once.
     attention: attention::Attention,
+    /// The background shells of the agents at rest in the local sessions, as the last scan found them.
+    shells: bg_shells::Shells,
     /// The count on the Dock icon now.
     badge: usize,
     /// The window's frame not saved yet, and the save it waits for: half a second after the last move, closing or quitting.
@@ -667,6 +670,7 @@ impl Shell {
                     pane_spring_back: None,
                     command_panel: None,
                     attention: Default::default(),
+                    shells: Default::default(),
                     badge: 0,
                     frame: None,
                     frame_save: gpui::Task::ready(()),

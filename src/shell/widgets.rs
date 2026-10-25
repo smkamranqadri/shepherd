@@ -15,6 +15,17 @@ pub(crate) fn status_dot(status: AgentStatus, theme: &Theme) -> Div {
     status_icon(status, theme.status_icons, theme)
 }
 
+/// A workspace row's status: its dot, and before it the count of background shells when an agent rests with some
+/// (`bg_shells`). Without any it is the dot alone.
+pub(crate) fn status_cell(status: AgentStatus, shells: usize, theme: &Theme) -> Div {
+    let dot = status_dot(status, theme);
+    if shells == 0 {
+        return dot;
+    }
+    let count = div().debug_selector(|| "ws-shells".into()).flex_none().text_size(px(11.)).text_color(theme.text_faint).child(super::bg_shells::label(shells));
+    div().flex_none().flex().items_center().gap(px(6.)).child(count).child(dot.debug_selector(|| "ws-status-dot".into()))
+}
+
 /// Collie's status dot, filled for an agent state, a faint ring when idle; `Symbols` draws herdr's
 /// `status_indicators = "symbols"` shapes instead (× ◐ ✓ ○, a dashed ring for its `·`), and `Animated` Zeron's: its
 /// 2×3 glyph spinner while the agent works, a check when done, a question mark while it asks, a small dot otherwise. Every style fills the same

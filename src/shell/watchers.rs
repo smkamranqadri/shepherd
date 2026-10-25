@@ -409,6 +409,15 @@ impl Watchers {
         self.map.values().filter(|w| !matches!(w.status, Status::Shown | Status::Unreachable)).filter_map(|w| w.snapshot.as_ref())
     }
 
+    /// The sessions not shown that answer, with their last snapshot and the socket they are asked on: those a scan
+    /// of the machine's processes starts from (`bg_shells`).
+    pub(super) fn snapshots_with_clients(&self) -> impl Iterator<Item = (&SessionKey, Kind, &Snapshot, Option<&Client>)> {
+        self.map
+            .iter()
+            .filter(|(_, w)| w.status == Status::Live)
+            .filter_map(|(key, w)| Some((key, w.kind(), w.snapshot.as_ref()?, w.client.as_ref())))
+    }
+
     /// The key's place in the tree, for element ids that tell sessions' rows apart.
     pub(super) fn index_of(&self, key: &SessionKey) -> Option<usize> {
         self.order.iter().position(|k| k == key)
@@ -624,6 +633,8 @@ impl Shell {
             self.fetch(key, client, timeout, generation, cx);
         }
         self.sync_feeds(cx);
+        // as often as a local session is asked, with no event to wait for: a background shell that ends tells herdr nothing
+        self.scan_shells(now, interval(Kind::Local, activity, 0, false, crate::power::on_battery()), cx);
     }
 
     /// One poll: `session.snapshot` on the runtime within `timeout`, parsed off the main thread, then `fetched`.

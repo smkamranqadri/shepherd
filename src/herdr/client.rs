@@ -61,6 +61,25 @@ pub fn event_is(event: &Value, kind: &str) -> bool {
     event["event"].as_str().is_some_and(|e| e == kind || e == kind.replace('.', "_"))
 }
 
+/// What herdr says of a pane's processes (`pane.process_info`): the shell the pane runs, and the foreground
+/// process group's leader, which is the agent while one runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneProcess {
+    /// The pane's shell, which leads the process session the agent runs in.
+    pub shell_pid: u32,
+    /// The foreground group's leader, when herdr lists it among the foreground processes.
+    pub leader_pid: Option<u32>,
+}
+
+/// A `pane.process_info` answer's [`PaneProcess`].
+pub fn pane_process(result: &Value) -> Option<PaneProcess> {
+    let info = &result["process_info"];
+    let pid = |v: &Value| v.as_u64().and_then(|n| u32::try_from(n).ok());
+    let leader = pid(&info["foreground_process_group_id"]);
+    let listed = info["foreground_processes"].as_array()?.iter().filter_map(|p| pid(&p["pid"])).find(|p| Some(*p) == leader);
+    Some(PaneProcess { shell_pid: pid(&info["shell_pid"])?, leader_pid: listed })
+}
+
 /// The next burst of events: waits for one, then for `window()` (made only once the first came, so a timer that
 /// starts when made counts from it), and takes every event come by then. `None` once the subscription ended
 /// (the server went away, or fell behind and said `events_lost`); events that came before the end come first.
@@ -114,6 +133,13 @@ impl Client {
         into_result(serde_json::from_str(&line)?)
     }
 
+    /// The processes of a pane of this session: what a scan of the machine's own process table starts from. The pids
+    /// are this machine's only when the session runs here.
+    pub async fn pane_process(&self, pane_id: &str) -> anyhow::Result<PaneProcess> {
+        let result = self.call("pane.process_info", json!({"pane_id": pane_id})).await?;
+        pane_process(&result).ok_or_else(|| anyhow!("herdr listed no process for pane {pane_id}"))
+    }
+
     /// `types`, and `pane.agent_status_changed` for each of `panes`.
     pub async fn subscribe(&self, types: &[&str], panes: &[String]) -> anyhow::Result<mpsc::UnboundedReceiver<Value>> {
         let statuses = panes.iter().map(|p| json!({"type": "pane.agent_status_changed", "pane_id": p}));
@@ -148,4 +174,33 @@ fn into_result(mut response: Value) -> anyhow::Result<Value> {
         return Err(ApiError { code, message }.into());
     }
     Ok(response["result"].take())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `pane.process_info` answer as herdr 0.9.5 sends it (a Claude Code pane with two MCP servers; pids, paths and
+    /// arguments changed).
+    fn answer() -> Value {
+        json!({"type": "pane_process_info", "process_info": {
+            "pane_id": "w9:p1", "shell_pid": 4100, "foreground_process_group_id": 4150,
+            "foreground_processes": [
+                {"pid": 4150, "name": "claude", "argv": ["/opt/claude/claude", "--model", "sonnet"], "cmdline": "/opt/claude/claude --model sonnet", "cwd": "/home/me/demo"},
+                {"pid": 4161, "name": "node-MainThread", "argv": ["node", "/opt/mcp/server.js"], "cmdline": "node /opt/mcp/server.js", "cwd": "/home/me/demo"},
+            ]}})
+    }
+
+    #[test]
+    fn a_pane_s_agent_is_the_foreground_group_s_leader() {
+        assert_eq!(pane_process(&answer()), Some(PaneProcess { shell_pid: 4100, leader_pid: Some(4150) }));
+        // a group whose leader is not listed (it just exited): the shell alone
+        let mut gone = answer();
+        gone["process_info"]["foreground_processes"] = json!([{"pid": 4161, "name": "node-MainThread"}]);
+        assert_eq!(pane_process(&gone), Some(PaneProcess { shell_pid: 4100, leader_pid: None }));
+        // no shell pid: nothing to check a pid against
+        let mut bare = answer();
+        bare["process_info"].as_object_mut().unwrap().remove("shell_pid");
+        assert_eq!(pane_process(&bare), None);
+    }
 }
