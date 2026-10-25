@@ -392,9 +392,48 @@ pub fn resets_in(secs: i64) -> String {
     }
 }
 
-/// The ring's color: the accent, then warning from 70 %, danger from 90 %.
+/// A usage ring's or bar segment's color: the accent, then warning from 70 %, danger from 90 %.
 fn usage_color(used: f64, theme: &Theme) -> gpui::Hsla {
     if used >= 90. { theme.danger } else if used >= 70. { theme.warning } else { theme.accent }
+}
+
+/// How many segments a usage bar has.
+const USAGE_SEGMENTS: usize = 5;
+
+/// How many of a usage bar's [`USAGE_SEGMENTS`] are filled for `used` percent: one per started fifth, so any use shows
+/// and a full bar means 80 % or more.
+pub fn usage_filled(used: f64) -> usize {
+    if used.is_nan() { 0 } else { ((used.clamp(0., 100.) / 100. * USAGE_SEGMENTS as f64).ceil() as usize).min(USAGE_SEGMENTS) }
+}
+
+/// A usage bar's segments left to right: the filled ones in [`usage_color`], the rest in the faint track.
+fn usage_segments(used: f64, theme: &Theme) -> [gpui::Hsla; USAGE_SEGMENTS] {
+    let (filled, track) = (usage_filled(used), theme.text.opacity(0.2));
+    std::array::from_fn(|i| if i < filled { usage_color(used, theme) } else { track })
+}
+
+/// A window's short name in the bar: `5-hour` is `5h`, `Weekly` is `wk`, `30-day` is `30d`.
+pub fn window_short(label: &str) -> String {
+    match label.split_once('-') {
+        Some((n, "hour")) => format!("{n}h"),
+        Some((n, "day")) => format!("{n}d"),
+        _ if label == "Weekly" => "wk".into(),
+        _ => label.to_lowercase(),
+    }
+}
+
+/// A window in the bar: its short name and a thin bar of [`USAGE_SEGMENTS`] segments, `5h ▰▱▱▱▱`.
+fn usage_window(theme: &Theme, limit: &Limit) -> gpui::Div {
+    let segments = usage_segments(limit.used, theme).into_iter().enumerate();
+    div()
+        .debug_selector(|| "usage-window".into())
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .child(div().debug_selector(|| "usage-name".into()).child(window_short(&limit.label)))
+        .child(div().flex().items_center().gap(px(1.)).children(segments.map(|(i, c)| {
+            div().debug_selector(move || format!("usage-segment-{i}")).w(px(5.)).h(px(3.)).flex_none().rounded(px(1.)).bg(c)
+        })))
 }
 
 /// `agent`'s limits as the bar polls them: cached, asked again every [`USAGE_TTL`].
@@ -949,7 +988,7 @@ pub fn bar(
                 .child(format!("{} tok", short_count(s.total())))
         }))
         .child(div().flex_1())
-        // each agent's name, then a ring and its percent per window: `Claude ◔ 12% ◑ 40%`
+        // each agent's name, then a short name and a thin bar per window: `Claude 5h ▰▱▱▱▱ wk ▰▰▱▱▱`
         .children(usage.into_iter().map(|(agent, limits)| {
             let on_usage = on_usage.clone();
             let id = SharedString::from(format!("statusbar-usage-{}", agent.key()));
@@ -957,9 +996,7 @@ pub fn bar(
                 on_usage(agent, label, window, cx)
             })
             .child(agent.label())
-            .children(limits.iter().map(|l| {
-                div().flex().items_center().gap(px(4.)).child(donut(l.used, theme.text.opacity(0.2), usage_color(l.used, theme))).child(format!("{}%", l.used.round()))
-            }))
+            .children(limits.iter().map(|l| usage_window(theme, l)))
         }))
         .into_any_element()
 }
@@ -1067,6 +1104,62 @@ mod tests {
 
     /// A click on an agent's label opens the popup over it with that agent's limits, the cache seeded as a poll
     /// leaves it; only that label is lit.
+    #[test]
+    fn a_usage_bar_fills_a_segment_per_started_fifth() {
+        for (used, segments) in [(0., 0), (1., 1), (20., 1), (20.5, 2), (50., 3), (80., 4), (99., 5), (100., 5), (140., 5), (-3., 0), (f64::NAN, 0)] {
+            assert_eq!(usage_filled(used), segments, "{used} %");
+        }
+    }
+
+    #[test]
+    fn a_usage_bar_colors_its_filled_segments_by_how_much_is_used() {
+        let theme = Theme::for_appearance(gpui::WindowAppearance::Dark);
+        let track = theme.text.opacity(0.2);
+        assert_eq!(usage_segments(0., &theme), [track; 5], "nothing used: all track");
+        assert_eq!(usage_segments(50., &theme), [theme.accent, theme.accent, theme.accent, track, track], "3 of 5 in the accent");
+        for (used, color) in [(69., theme.accent), (70., theme.warning), (89., theme.warning), (90., theme.danger), (100., theme.danger)] {
+            let bar = usage_segments(used, &theme);
+            assert!(bar.iter().take(usage_filled(used)).all(|c| *c == color), "{used} %: filled segments in the {used} % color");
+        }
+        assert_eq!(usage_segments(70., &theme), [theme.warning, theme.warning, theme.warning, theme.warning, track], "70 % fills four");
+    }
+
+    #[test]
+    fn a_window_has_a_short_name_in_the_bar() {
+        assert_eq!(["5-hour", "Weekly", "30-day"].map(window_short), ["5h", "wk", "30d"]);
+        let (claude, plus, free) = bodies();
+        let names = |limits: &[Limit]| limits.iter().map(|l| window_short(&l.label)).collect::<Vec<_>>().join(" ");
+        assert_eq!([names(&claude), names(&plus), names(&free)], ["5h wk", "5h wk", "30d"]);
+    }
+
+    /// A window in the bar is its name then five thin segments, nothing before the name (no ring) and nothing after the
+    /// bar (no percent), in the colors of its percent.
+    #[gpui::test]
+    fn a_window_in_the_bar_is_a_name_and_five_thin_segments(cx: &mut gpui::TestAppContext) {
+        struct Window1(Limit);
+        impl gpui::Render for Window1 {
+            fn render(&mut self, _: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+                let theme = Theme::of(cx).clone();
+                div().flex().child(usage_window(&theme, &self.0))
+            }
+        }
+        cx.update(|cx| cx.set_global(Theme::for_appearance(gpui::WindowAppearance::Dark)));
+        for (label, used) in [("5-hour", 12.0), ("Weekly", 40.0), ("30-day", 100.0)] {
+            let (_, cx) = cx.add_window_view(|_, _| Window1(Limit { label: label.into(), used, resets: None }));
+            cx.run_until_parked();
+            let window = cx.debug_bounds("usage-window").expect("the window drawn");
+            let name = cx.debug_bounds("usage-name").unwrap();
+            let ids = ["usage-segment-0", "usage-segment-1", "usage-segment-2", "usage-segment-3", "usage-segment-4"];
+            let segments: Vec<_> = ids.into_iter().map(|id| cx.debug_bounds(id).unwrap_or_else(|| panic!("{label}: {id}"))).collect();
+            assert!(cx.debug_bounds("usage-segment-5").is_none(), "{label}: five segments, no more");
+            assert_eq!(name.left(), window.left(), "{label}: the name first, no ring before it");
+            assert_eq!(segments[4].right(), window.right(), "{label}: the bar last, no percent after it");
+            assert!(segments.iter().all(|s| s.size == gpui::size(px(5.), px(3.))), "{label}: thin segments");
+            assert!(segments.windows(2).all(|w| w[1].left() - w[0].right() == px(1.)), "{label}: a pixel between segments");
+            assert_eq!(segments[0].left() - name.right(), px(4.), "{label}: the bar beside the name");
+        }
+    }
+
     #[gpui::test]
     fn the_popup_opens_the_clicked_agent_s_limits(cx: &mut gpui::TestAppContext) {
         let (claude, plus, _) = bodies();
