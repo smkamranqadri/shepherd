@@ -33,8 +33,11 @@ Kamran's list. Items 1–9 are done (`plan-sidebar-statusbar.md`, merged 2026-10
 11. Port upstream's drag look (lift, placeholder, spring) onto the tree's drag (`tree_drag.rs`).
 12. Earlier open items: `[[keys.command]]` add/remove, lone-prefix flush, Agents picker.
 
+23. Command Code usage label: on the installed build (Kamran, 2026-10-25) its numbers do not show; find why (API answer, caps, parse) against his real usage. Name it `cmd` in the bar.
+24. Focus mode: the chip moved into the titlebar, but a big gap stays between the titlebar and the list (the sidebar's head row, place label and DEV badge, is still drawn); close it.
+
 ## Open after the bundle (2026-10-25)
-- 17: the usage segments are 5×3 px; Kamran to judge at a glance whether that reads, or wants them taller.
+- 17: settled 2026-10-25: Kamran finds the thin bars good.
 - 16: images are left-aligned (`<p align="center">` not honored).
 - 10: a Command Code plan without caps shows no label (the CLI shows monthly credits there); an organization account reads the personal plan.
 - 20: Monitor and Codex background work not covered (Codex keeps its background terminals on pipes/ptys); the waiting pill, tab bar, status bar and command panel dots still use herdr's status.
