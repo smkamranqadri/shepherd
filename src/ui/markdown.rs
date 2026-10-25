@@ -834,7 +834,7 @@ mod tests {
     impl gpui::Render for Page {
         fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
             let theme = Theme::of(cx).clone();
-            crate::ui::viewer::markdown_preview("page", &self.0, &Links::web(), &self.1, &theme)
+            crate::ui::viewer::markdown_preview_with("page", &self.0, &Links::web(), &self.1, &theme, &Look::default())
         }
     }
 

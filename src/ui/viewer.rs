@@ -44,12 +44,12 @@ const MAX_DRAWN: usize = 2048;
 /// How long a fetched image stays fresh in the cache: a badge keeps its address while its picture changes.
 const IMAGE_FRESH: Duration = Duration::from_secs(24 * 60 * 60);
 /// The most images fetched at once.
-const FETCHES: usize = 4;
+pub(crate) const FETCHES: usize = 4;
 /// What the image cache names a picture's type, the extensions `content::load` takes for an image.
 const IMAGE_TYPES: [&str; 5] = ["png", "jpg", "gif", "webp", "svg"];
 
 /// A remote image's bytes: `None` when it is not there, is not served over https or is over `content::MAX_IMAGE`.
-type Fetch = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
+pub(crate) type Fetch = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
 
 pub enum ViewerEvent {
     /// "Open in editor", at a line when the viewer has one to give: the Shell shows the terminals (the editor's pane
@@ -248,11 +248,8 @@ pub struct FileViewer {
     painted: Rc<RefCell<Vec<(usize, TextLayout)>>>,
     /// A PDF's pages, which have the keyboard while they show.
     pdf: Option<Entity<PdfView>>,
-    /// The preview's images that are in (by their source in the file), each a file within the viewer's limits.
-    images: Arc<HashMap<String, PathBuf>>,
-    /// How a remote image is fetched, and where they are kept.
-    fetch: Fetch,
-    image_cache: PathBuf,
+    /// The preview's images.
+    images: PreviewImages,
 }
 
 impl EventEmitter<ViewerEvent> for FileViewer {}
@@ -292,9 +289,7 @@ impl FileViewer {
             dragging: false,
             painted: Rc::default(),
             pdf: None,
-            images: Arc::default(),
-            fetch: Arc::new(fetch_https),
-            image_cache: crate::settings::cache_dir().join("images"),
+            images: PreviewImages::new(),
         }
     }
 
@@ -316,7 +311,7 @@ impl FileViewer {
         self.cancel = Arc::default();
         (self.path, self.root, self.shown) = (path.clone(), root.clone(), Shown::Loading);
         (self.real_root, self.goto_fragment) = (None, None);
-        self.images = Arc::default();
+        self.images.reset();
         (self.text, self.highlights, self.blocks, self.columns) = (Arc::default(), Highlights::default(), None, 0);
         self.drawn.clear();
         (self.sel, self.dragging, self.preview) = (None, false, true);
@@ -366,9 +361,7 @@ impl FileViewer {
     /// pages and its worker: when the viewer goes out of sight, not only when it goes.
     pub fn evict_image(&mut self, mut window: Option<&mut Window>, cx: &mut App) {
         // the preview's pictures too
-        for path in self.images.values() {
-            gpui::ImageSource::from(path.clone()).evict(window.as_deref_mut(), cx);
-        }
+        self.images.evict(window.as_deref_mut(), cx);
         if let Some(pdf) = &self.pdf {
             pdf.update(cx, |p, _| p.hide(window));
         } else if matches!(self.shown, Shown::Other(Content::Image(..) | Content::Svg(..))) {
@@ -407,42 +400,10 @@ impl FileViewer {
         if let Some(fragment) = self.goto_fragment.take() {
             self.go_to_fragment(&fragment, cx);
         }
-        self.load_images(window, cx);
-        cx.notify();
-    }
-
-    /// Brings the preview's images in once its text is: a local one is the file beside the document, a remote https
-    /// one is fetched once (a day's worth is kept on disk), each within the viewer's limits. Off the UI thread, a few
-    /// remote ones at a time, each drawn as it lands; until then (and for one that never does) its alt text stands.
-    fn load_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(blocks) = self.blocks.as_deref() else { return };
-        let (document, root, generation) = (self.path.clone(), self.real_root.clone(), self.generation);
-        let slots = Arc::new(tokio::sync::Semaphore::new(FETCHES));
-        for source in crate::ui::markdown::image_sources(blocks) {
-            let (document, root, fetch, cache, slots, name) = (document.clone(), root.clone(), self.fetch.clone(), self.image_cache.clone(), slots.clone(), source.clone());
-            let job = self.rt.spawn(async move {
-                let _slot = slots.acquire().await.ok()?;
-                tokio::task::spawn_blocking(move || image_file(&name, &document, root.as_deref(), &cache, fetch.as_ref())).await.ok()?
-            });
-            cx.spawn_in(window, async move |this, cx| {
-                let Ok(Some((file, content))) = job.await else { return };
-                let _ = this.update_in(cx, |v, window, cx| {
-                    if v.generation != generation {
-                        return;
-                    }
-                    // a bitmap's pixels are device pixels, an SVG's CSS pixels: the size it shows at
-                    let scale = window.scale_factor();
-                    match content {
-                        Content::Image(w, h) => crate::ui::markdown::note_image_size(&file, w as f32 / scale, h as f32 / scale),
-                        Content::Svg(w, h) => crate::ui::markdown::note_image_size(&file, w as f32, h as f32),
-                        _ => {}
-                    }
-                    Arc::make_mut(&mut v.images).insert(source, file);
-                    cx.notify();
-                });
-            })
-            .detach();
+        if let Some(blocks) = self.blocks.as_deref() {
+            self.images.load(blocks, &self.path, self.real_root.as_deref(), &self.rt, window, cx, |v| &mut v.images);
         }
+        cx.notify();
     }
 
     /// Goes to `fragment` (a heading's anchor, or a line as `L12`) once the text is in: a markdown link's, after
@@ -856,9 +817,7 @@ impl FileViewer {
             // no root: a relative link has nowhere it may lead
             None => Links::web(),
         };
-        let images = self.images.clone();
-        let look = Look { document: false, image: Some(Rc::new(move |source: &str| images.get(source).cloned())) };
-        markdown_preview_with("viewer-md", blocks, &links, &self.preview_scroll, theme, &look)
+        markdown_preview_with("viewer-md", blocks, &links, &self.preview_scroll, theme, &self.images.look())
     }
 
     /// The text as a list of rows, a gutter of line numbers and the line, no wrapping: wider lines scroll across.
@@ -988,11 +947,114 @@ pub(crate) fn shown_path(path: &Path, root: Option<&Path>) -> String {
     }
 }
 
+/// A Markdown preview's images, shared by the viewer's and the editor's: the ones that are in, by their source in the
+/// file, each a file within the viewer's limits, and how a remote one is fetched and where they are kept.
+pub(crate) struct PreviewImages {
+    files: Arc<HashMap<String, PathBuf>>,
+    /// Bumped by every [`reset`](Self::reset): an image whose fetch began before it is dropped when it lands.
+    generation: u64,
+    fetch: Fetch,
+    cache: PathBuf,
+}
+
+impl PreviewImages {
+    pub(crate) fn new() -> PreviewImages {
+        PreviewImages { files: Arc::default(), generation: 0, fetch: Arc::new(fetch_https), cache: crate::settings::cache_dir().join("images") }
+    }
+
+    /// Fetching through `fetch` into `cache`, for the tests.
+    #[cfg(test)]
+    pub(crate) fn serving(fetch: Fetch, cache: PathBuf) -> PreviewImages {
+        PreviewImages { files: Arc::default(), generation: 0, fetch, cache }
+    }
+
+    /// Forgets the images (another file is opened): those still on their way are dropped when they land.
+    pub(crate) fn reset(&mut self) {
+        self.generation += 1;
+        self.files = Arc::default();
+    }
+
+    /// How many are in.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// The sources that are in, sorted.
+    #[cfg(test)]
+    pub(crate) fn sources(&self) -> Vec<&str> {
+        let mut sources: Vec<&str> = self.files.keys().map(String::as_str).collect();
+        sources.sort();
+        sources
+    }
+
+    /// How a preview draws them: its document look, with the images that are in.
+    pub(crate) fn look(&self) -> Look {
+        let files = self.files.clone();
+        Look { document: false, image: Some(Rc::new(move |source: &str| files.get(source).cloned())) }
+    }
+
+    /// Drops the pictures from gpui's cache (one shown again is read afresh).
+    pub(crate) fn evict(&self, mut window: Option<&mut Window>, cx: &mut App) {
+        for path in self.files.values() {
+            gpui::ImageSource::from(path.clone()).evict(window.as_deref_mut(), cx);
+        }
+    }
+
+    /// Brings the images of `blocks` (the text of `document`, under `root`) in: a local one is the file beside the
+    /// document, a remote https one is fetched once (a day's worth is kept on disk), each within the viewer's limits.
+    /// Off the UI thread, a few remote ones at a time, each drawn as it lands (`images` finds these in the view);
+    /// until then (and for one that never does) its alt text stands.
+    pub(crate) fn load<T: 'static>(
+        &self,
+        blocks: &[Block],
+        document: &Path,
+        root: Option<&Path>,
+        rt: &Handle,
+        window: &mut Window,
+        cx: &mut Context<T>,
+        images: fn(&mut T) -> &mut PreviewImages,
+    ) {
+        let (document, root, generation) = (document.to_path_buf(), root.map(Path::to_path_buf), self.generation);
+        let slots = Arc::new(tokio::sync::Semaphore::new(FETCHES));
+        for source in crate::ui::markdown::image_sources(blocks) {
+            let (document, root, fetch, cache, slots, name) = (document.clone(), root.clone(), self.fetch.clone(), self.cache.clone(), slots.clone(), source.clone());
+            let job = rt.spawn(async move {
+                let _slot = slots.acquire().await.ok()?;
+                tokio::task::spawn_blocking(move || image_file(&name, &document, root.as_deref(), &cache, fetch.as_ref())).await.ok()?
+            });
+            cx.spawn_in(window, async move |this, cx| {
+                let Ok(Some((file, content))) = job.await else { return };
+                let _ = this.update_in(cx, |v, window, cx| {
+                    let images = images(v);
+                    if images.generation != generation {
+                        return;
+                    }
+                    note_size(&file, &content, window.scale_factor());
+                    Arc::make_mut(&mut images.files).insert(source, file);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+}
+
+/// Tells the Markdown view the size the picture `file` (what [`content::load`] made `content` of) is drawn at when
+/// nothing says otherwise: a bitmap's pixels are device pixels, an SVG's CSS pixels.
+pub(crate) fn note_size(file: &Path, content: &Content, scale: f32) {
+    match *content {
+        Content::Image(w, h) => crate::ui::markdown::note_image_size(file, w as f32 / scale, h as f32 / scale),
+        Content::Svg(w, h) => crate::ui::markdown::note_image_size(file, w as f32, h as f32),
+        _ => {}
+    }
+}
+
 /// The file the preview draws the image `source` from, with what [`content::load`] made of it: a bitmap or an SVG
 /// within the viewer's limits (bytes, pixels, frames), anything else none. A relative path is the document's folder's
 /// (a leading `/` the root's); an `https` address is fetched through `fetch` into `cache` unless a copy a day old at
 /// most is there; any other scheme, `http` included, is not fetched at all.
-fn image_file(source: &str, document: &Path, root: Option<&Path>, cache: &Path, fetch: &dyn Fn(&str) -> Option<Vec<u8>>) -> Option<(PathBuf, Content)> {
+pub(crate) fn image_file(source: &str, document: &Path, root: Option<&Path>, cache: &Path, fetch: &dyn Fn(&str) -> Option<Vec<u8>>) -> Option<(PathBuf, Content)> {
     let source = source.trim();
     let (file, remote) = match crate::ui::markdown::scheme(source).as_deref() {
         Some("https") => (remote_image(source, cache, fetch)?, true),
@@ -1065,7 +1127,7 @@ fn image_type(bytes: &[u8]) -> Option<&'static str> {
 
 /// A remote image over https, no bigger than the viewer takes of an image file and a few seconds in coming (a
 /// redirect to plain http fails); the fetch the reader makes.
-fn fetch_https(url: &str) -> Option<Vec<u8>> {
+pub(crate) fn fetch_https(url: &str) -> Option<Vec<u8>> {
     let agent: ureq::Agent = ureq::Agent::config_builder().https_only(true).timeout_global(Some(Duration::from_secs(15))).build().into();
     agent.get(url).call().ok()?.body_mut().with_config().limit(content::MAX_IMAGE).read_to_vec().ok()
 }
@@ -1076,11 +1138,6 @@ fn fetch_https(url: &str) -> Option<Vec<u8>> {
 /// The scrolled element lays its children out as blocks, not as a flex column: a flex item's height is worked out at
 /// the container's width, before `max_w` narrows it, so a paragraph that wraps to more lines in the page's column
 /// than across the window got the shorter box and the next block drew over its last lines.
-pub(crate) fn markdown_preview(id: &'static str, blocks: &[Block], links: &Links, scroll: &ScrollHandle, theme: &Theme) -> AnyElement {
-    markdown_preview_with(id, blocks, links, scroll, theme, &Look::default())
-}
-
-/// [`markdown_preview`] drawn the `look` way (the reader's, with its images).
 pub(crate) fn markdown_preview_with(id: &'static str, blocks: &[Block], links: &Links, scroll: &ScrollHandle, theme: &Theme, look: &Look) -> AnyElement {
     // 12 px between the blocks, 20 px above the first and below the last
     let space = |height: f32| div().h(px(height)).into_any_element();
@@ -1135,8 +1192,50 @@ impl Render for FileViewer {
     }
 }
 
+/// What the tests of the views that show Markdown images share.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// A PNG of `w` × `h` pixels.
+    pub(crate) fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(w, h).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    pub(crate) type Calls = Arc<std::sync::Mutex<Vec<String>>>;
+
+    pub(crate) fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    /// Runs the window's tasks and the runtime's until `done` holds (at most a few seconds).
+    pub(crate) fn settle(rt: &tokio::runtime::Runtime, cx: &mut gpui::VisualTestContext, mut done: impl FnMut(&mut gpui::VisualTestContext) -> bool) {
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            rt.block_on(async { tokio::time::sleep(Duration::from_millis(5)).await });
+        }
+        panic!("never settled");
+    }
+
+    /// A fetch that notes each address and answers `bytes` for the badge once the test sends on `gate`'s other end;
+    /// any other address is not there.
+    pub(crate) fn waiting_for(gate: std::sync::mpsc::Receiver<()>, bytes: Vec<u8>, noted: Calls) -> Fetch {
+        let gate = std::sync::Mutex::new(gate);
+        Arc::new(move |url: &str| {
+            noted.lock().unwrap().push(url.to_string());
+            url.ends_with("badge.png").then(|| gate.lock().unwrap().recv().ok().map(|_| bytes.clone())).flatten()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::{Calls, png, runtime, settle, waiting_for};
     use super::*;
     use crate::files::highlight::Span;
 
@@ -1207,15 +1306,6 @@ mod tests {
         assert_eq!(d.segments(Some(3..3)).len(), 5);
         assert!(Drawn::new("", &[]).segments(None).is_empty());
     }
-
-    /// A PNG of `w` × `h` pixels.
-    fn png(w: u32, h: u32) -> Vec<u8> {
-        let mut bytes = std::io::Cursor::new(Vec::new());
-        image::RgbaImage::new(w, h).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
-        bytes.into_inner()
-    }
-
-    type Calls = Arc<std::sync::Mutex<Vec<String>>>;
 
     /// A fetch that answers `bytes` for an address ending `.png` and `None` for any other, noting each address asked.
     fn fetching(bytes: Vec<u8>) -> (Fetch, Calls) {
@@ -1312,32 +1402,6 @@ mod tests {
         assert_eq!((image_type(b"<html></html>"), image_type(b""), image_type(b"MZ\x90\0")), (None, None, None));
     }
 
-    fn runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
-    }
-
-    /// Runs the window's tasks and the runtime's until `done` holds (at most a few seconds).
-    fn settle(rt: &tokio::runtime::Runtime, cx: &mut gpui::VisualTestContext, mut done: impl FnMut(&mut gpui::VisualTestContext) -> bool) {
-        for _ in 0..500 {
-            cx.run_until_parked();
-            if done(cx) {
-                return;
-            }
-            rt.block_on(async { tokio::time::sleep(Duration::from_millis(5)).await });
-        }
-        panic!("never settled");
-    }
-
-    /// A fetch that notes each address and answers `bytes` for the badge once the test sends on `gate`'s other end;
-    /// any other address is not there.
-    fn waiting_for(gate: std::sync::mpsc::Receiver<()>, bytes: Vec<u8>, noted: Calls) -> Fetch {
-        let gate = std::sync::Mutex::new(gate);
-        Arc::new(move |url: &str| {
-            noted.lock().unwrap().push(url.to_string());
-            url.ends_with("badge.png").then(|| gate.lock().unwrap().recv().ok().map(|_| bytes.clone())).flatten()
-        })
-    }
-
     /// A window with a viewer fetching through `fetch` into `cache`, wide enough for the preview's whole column.
     fn viewer_window(cx: &mut gpui::TestAppContext, rt: &tokio::runtime::Runtime, fetch: Fetch, cache: PathBuf) -> (Entity<FileViewer>, &'static mut gpui::VisualTestContext) {
         cx.update(|cx| {
@@ -1348,7 +1412,7 @@ mod tests {
         let (viewer, cx) = cx.add_window_view(|_, cx| FileViewer::new(handle, cx));
         let cx: &'static mut gpui::VisualTestContext = Box::leak(Box::new(cx.clone()));
         cx.simulate_resize(gpui::size(px(1000.), px(800.)));
-        viewer.update(cx, |v, _| (v.fetch, v.image_cache) = (fetch, cache));
+        viewer.update(cx, |v, _| v.images = PreviewImages::serving(fetch, cache));
         (viewer, cx)
     }
 
@@ -1428,6 +1492,6 @@ mod tests {
             rounds += 1;
             rounds > 20
         });
-        viewer.read_with(cx, |v, _| assert_eq!(v.images.keys().collect::<Vec<_>>(), ["dot.png"]));
+        viewer.read_with(cx, |v, _| assert_eq!(v.images.sources(), ["dot.png"]));
     }
 }
