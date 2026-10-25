@@ -27,6 +27,23 @@ pub(super) fn sidebar_head(theme: &Theme, listed: bool, label: impl FnOnce() -> 
     )
 }
 
+/// The sidebar's column, `width` wide with the border at its right edge left out: the titlebar's 38 px at its top, a
+/// 1 px line at their foot as the status bar has at its head, and the rows the caller adds under it. Docked or in the
+/// floating card the line is the column's, so it folds and resizes with it.
+pub(super) fn sidebar_column(theme: &Theme, width: f32) -> Div {
+    div().debug_selector(|| "sidebar-column".into()).w(px(width - 1.)).h_full().flex_none().flex().flex_col().child(
+        div()
+            .debug_selector(|| "sidebar-titlebar".into())
+            .w_full()
+            .h(px(TITLEBAR_HEIGHT))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .child(div().flex_1())
+            .child(div().debug_selector(|| "sidebar-titlebar-line".into()).w_full().h(px(1.)).flex_none().bg(theme.border)),
+    )
+}
+
 impl Shell {
     /// The sidebar's width this frame: mid tween, or where it rests.
     pub(super) fn sidebar_now(&self) -> f32 {
@@ -474,14 +491,8 @@ impl Shell {
             div().absolute().top_0().bottom_0().w(px(self.sidebar_width - 1.)).left(px(at)).child(self.place_preview(&place, theme, window, cx))
         });
         // Laid out at full width and clipped by its tweened box, so rows never reflow mid slide.
-        div()
+        sidebar_column(theme, self.sidebar_width)
             .when(bar, |el| el.on_scroll_wheel(cx.listener(|this, e: &gpui::ScrollWheelEvent, _, cx| this.sidebar_scroll(e, cx))))
-            .w(px(self.sidebar_width - 1.))
-            .h_full()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .pt(px(TITLEBAR_HEIGHT))
             .child(
                 div().relative().flex_1().min_h_0().overflow_hidden().children(beside).child(
             div()

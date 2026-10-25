@@ -590,4 +590,33 @@ mod tests {
             assert_eq!(cx.debug_bounds("head-spinner").is_some(), spinner, "{case}: the spinner");
         }
     }
+
+    /// The sidebar's column as the shell draws it, with nothing under the titlebar part.
+    struct Column(f32);
+
+    impl gpui::Render for Column {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let theme = Theme::of(cx).clone();
+            div().w(px(self.0)).h(px(300.)).child(super::super::sidebar::sidebar_column(&theme, self.0))
+        }
+    }
+
+    /// The column's titlebar part is 38 px high at its top and as wide as the column, which meets the right border, with a
+    /// 1 px line at its foot, at any width.
+    #[gpui::test]
+    fn the_sidebar_column_has_the_titlebar_box_with_its_line(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::for_appearance(gpui::WindowAppearance::Dark)));
+        for w in [crate::settings::SIDEBAR_MIN, 300.] {
+            let (_, cx) = cx.add_window_view(|_, _| Column(w));
+            cx.run_until_parked();
+            let column = cx.debug_bounds("sidebar-column").unwrap();
+            let bar = cx.debug_bounds("sidebar-titlebar").unwrap_or_else(|| panic!("{w}: the titlebar box drawn"));
+            let line = cx.debug_bounds("sidebar-titlebar-line").unwrap_or_else(|| panic!("{w}: the line drawn"));
+            assert_eq!(column.size.width, px(w - 1.), "{w}: the column leaves the right border its pixel");
+            assert_eq!(bar.size, gpui::size(column.size.width, px(TITLEBAR_HEIGHT)), "{w}: the box is as wide as the column and 38 high");
+            assert_eq!(bar.origin, column.origin, "{w}: at the column's top");
+            assert_eq!(line.size, gpui::size(bar.size.width, px(1.)), "{w}: a 1 px line across the box");
+            assert_eq!(line.bottom(), bar.bottom(), "{w}: at the box's foot");
+        }
+    }
 }
