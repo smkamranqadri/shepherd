@@ -4,20 +4,28 @@ use super::*;
 /// How long the floating sidebar stays after the pointer leaves it.
 const PEEK_LINGER: Duration = Duration::from_millis(200);
 
-/// The sidebar's head row: `name` (the place's label) filling it, then the dev build's badge.
-pub(super) fn sidebar_head(theme: &Theme, name: Option<impl IntoElement>) -> Div {
-    div()
-        .debug_selector(|| "sidebar-head".into())
-        .px(px(16.))
-        .pt(px(8.))
-        .pb(px(6.))
-        .flex()
-        .items_center()
-        .gap(px(6.))
-        .text_size(px(11.))
-        .text_color(theme.text_faint)
-        .child(div().flex_1().min_w_0().truncate().children(name))
-        .when(is_dev_build(), |el| el.child(dev_badge(theme)))
+/// The sidebar's head row, drawn only when something is in it: the place's label (`label`, asked for when the tree names
+/// no session, `listed` false) filling it, then the dev build's badge, then the place's `spinner` while it connects.
+pub(super) fn sidebar_head(theme: &Theme, listed: bool, label: impl FnOnce() -> String, spinner: Option<impl IntoElement>) -> Option<Div> {
+    let name = (!listed).then(label);
+    if name.is_none() && spinner.is_none() {
+        return None;
+    }
+    Some(
+        div()
+            .debug_selector(|| "sidebar-head".into())
+            .px(px(16.))
+            .pt(px(8.))
+            .pb(px(6.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .text_size(px(11.))
+            .text_color(theme.text_faint)
+            .child(div().flex_1().min_w_0().truncate().children(name.map(|n| div().debug_selector(|| "sidebar-head-label".into()).child(n))))
+            .when(is_dev_build(), |el| el.child(dev_badge(theme)))
+            .children(spinner),
+    )
 }
 
 impl Shell {
@@ -457,8 +465,8 @@ impl Shell {
             .flex_col()
             .gap(px(2.))
             .children(tree);
-        let header = self.sidebar_header(theme, listed, cx);
         let waiting = self.error.is_none() && self.connecting.is_some_and(|at| crate::ui::loader::due(at, window));
+        let header = self.sidebar_header(theme, listed, waiting.then(|| crate::ui::loader::mini_spinner(2., theme.text_faint, window)), cx);
         // the sessions bar: the list goes under a swipe's fingers, then springs home, and beside it the place it goes to
         // (or comes from)
         let (list_offset, beside) = if bar { self.list_offset(window, cx) } else { (0., None) };
@@ -484,7 +492,7 @@ impl Shell {
                 .size_full()
                 .flex()
                 .flex_col()
-            .child(header.when(waiting, |el| el.child(crate::ui::loader::mini_spinner(2., theme.text_faint, window))))
+            .children(header)
             .children(self.web_rows(self.shown_place_key().as_deref(), true, theme, window, cx))
             .child(
                 div()
@@ -502,11 +510,12 @@ impl Shell {
             .child(self.footer(theme, cx))
     }
 
-    /// The sidebar's head: the shown session's name when the tree names none (with one session, or the sessions bar).
-    /// The place's spinner goes after it. The Focus chip is in the titlebar, beside the sidebar's ⋯.
-    fn sidebar_header(&self, theme: &Theme, listed: bool, cx: &mut Context<Self>) -> Div {
+    /// The sidebar's head: the shown session's name when the tree names none (with one session, or the sessions bar),
+    /// and the place's spinner after it while it connects; none when neither is there. The Focus chip is in the
+    /// titlebar, beside the sidebar's ⋯.
+    fn sidebar_header(&self, theme: &Theme, listed: bool, spinner: Option<Div>, cx: &mut Context<Self>) -> Option<Div> {
         // the tree names every session; with one, or the sessions bar, its name heads the list
-        sidebar_head(theme, (!listed).then(|| self.place_label(cx)))
+        sidebar_head(theme, listed, || self.place_label(cx), spinner)
     }
 
     /// Arc's space bar (the sessions bar setting): a button for each herdr session and machine, in the order dragged

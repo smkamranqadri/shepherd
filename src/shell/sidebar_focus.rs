@@ -479,19 +479,46 @@ mod tests {
     /// label alone.
     #[gpui::test]
     fn the_sidebar_head_has_no_chip_row(cx: &mut gpui::TestAppContext) {
-        struct Head;
-        impl gpui::Render for Head {
-            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-                let theme = Theme::of(cx).clone();
-                div().w(px(256.)).child(super::super::sidebar::sidebar_head(&theme, Some("default".to_string())))
-            }
-        }
-        cx.update(|cx| cx.set_global(Theme::for_appearance(gpui::WindowAppearance::Dark)));
-        let (_, cx) = cx.add_window_view(|_, _| Head);
-        cx.run_until_parked();
+        let cx = head_with(cx, false, false);
         let head = cx.debug_bounds("sidebar-head").expect("the head drawn");
         assert!(cx.debug_bounds("sidebar-focus-chip").is_none(), "no chip in the head");
         // 8 px over and 6 under the dev badge, the tallest thing in it: the same with focus mode on or off
         assert_eq!(head.size.height, px(8. + 18. + 6.));
+    }
+
+    /// The head as `sidebar_head` draws it for a tree that names its sessions (`listed`) or not, with a spinner or not.
+    struct Head {
+        listed: bool,
+        spinning: bool,
+    }
+
+    impl gpui::Render for Head {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let theme = Theme::of(cx).clone();
+            let spinner = self.spinning.then(|| div().debug_selector(|| "head-spinner".into()).size(px(6.)));
+            div().w(px(256.)).children(super::super::sidebar::sidebar_head(&theme, self.listed, || "default".to_string(), spinner))
+        }
+    }
+
+    fn head_with(cx: &mut gpui::TestAppContext, listed: bool, spinning: bool) -> &'static mut gpui::VisualTestContext {
+        cx.update(|cx| cx.set_global(Theme::for_appearance(gpui::WindowAppearance::Dark)));
+        let (_, cx) = cx.add_window_view(|_, _| Head { listed, spinning });
+        let cx: &'static mut gpui::VisualTestContext = Box::leak(Box::new(cx.clone()));
+        cx.run_until_parked();
+        cx
+    }
+
+    /// The head row is drawn only with the place's label (the tree names no session) or the connecting spinner in it;
+    /// with neither it takes no room under the titlebar.
+    #[gpui::test]
+    fn the_sidebar_head_is_drawn_only_with_a_label_or_the_spinner(cx: &mut gpui::TestAppContext) {
+        // (the tree names its sessions, spinner): label only, spinner only, both, neither
+        for (listed, spinning, label, spinner) in [(false, false, true, false), (true, true, false, true), (false, true, true, true), (true, false, false, false)] {
+            let cx = head_with(cx, listed, spinning);
+            let case = format!("listed {listed}, spinning {spinning}");
+            assert_eq!(cx.debug_bounds("sidebar-head").is_some(), label || spinner, "{case}: the row");
+            assert_eq!(cx.debug_bounds("sidebar-head-label").is_some(), label, "{case}: the label");
+            assert_eq!(cx.debug_bounds("head-spinner").is_some(), spinner, "{case}: the spinner");
+        }
     }
 }
