@@ -1,6 +1,6 @@
 # Backlog (recorded 2026-10-24)
 
-Kamran's list. Items 1–9 are done (`plan-sidebar-statusbar.md`, merged 2026-10-24); 10–12 are not planned.
+Kamran's list. Items 1–9 are done (`plan-sidebar-statusbar.md`, merged 2026-10-24); 10, 13–17, 19–21 are done (`plan-bundle-2026-10-25.md`, merged 2026-10-25); 11, 12, 18, 22 are open.
 
 ## Remove
 1. Sidebar search: the header magnifier, its search bar, and FilterSidebar.
@@ -32,6 +32,12 @@ Kamran's list. Items 1–9 are done (`plan-sidebar-statusbar.md`, merged 2026-10
 10. Agent usage for Command Code, as for Claude and Codex.
 11. Port upstream's drag look (lift, placeholder, spring) onto the tree's drag (`tree_drag.rs`).
 12. Earlier open items: `[[keys.command]]` add/remove, lone-prefix flush, Agents picker.
+
+## Open after the bundle (2026-10-25)
+- 17: the usage segments are 5×3 px; Kamran to judge at a glance whether that reads, or wants them taller.
+- 16: images are left-aligned (`<p align="center">` not honored).
+- 10: a Command Code plan without caps shows no label (the CLI shows monthly credits there); an organization account reads the personal plan.
+- 20: Monitor and Codex background work not covered (Codex keeps its background terminals on pipes/ptys); the waiting pill, tab bar, status bar and command panel dots still use herdr's status.
 
 ## Open questions
 - (Settled 2026-10-25: a narrow bar truncating the folder path to its icon beside both usage labels is accepted.)
