@@ -1579,6 +1579,7 @@ impl Render for SettingsView {
                     let (source, url) = match agent {
                         UsageAgent::Claude => ("From Claude Code's sign-in.", "https://claude.ai/settings/usage"),
                         UsageAgent::Codex => ("From Codex's ChatGPT sign-in.", "https://chatgpt.com/codex/settings/usage"),
+                        UsageAgent::CommandCode => ("From Command Code's sign-in.", "https://commandcode.ai/usage"),
                     };
                     // ponytail: no loading state; the first second after opening reads as not signed in
                     let limits = crate::ui::statusbar::usage_of(agent, cx).filter(|l| !l.is_empty());
@@ -1595,11 +1596,11 @@ impl Render for SettingsView {
                 });
                 div()
                     .child(page_header(&theme, "Usage", "Your agents' plan limits, and whose the status bar shows."))
-                    // a switch per agent: its name and rings at the bar's right end, and their pop-up
+                    // a switch per agent: its name and bars at the bar's right end, and their pop-up
                     .child(card(&theme).children(UsageAgent::ALL.into_iter().enumerate().map(|(i, agent)| {
                         let on = settings.usage_show.shows(agent);
                         card_row(&theme, i == 0)
-                            .child(row_text(&theme, agent.label(), "In the status bar: a ring and its percent for each of its windows."))
+                            .child(row_text(&theme, agent.label(), "In the status bar: a short name and a thin bar for each of its windows."))
                             .child(toggle(&theme, SharedString::from(format!("usage-show-{}", agent.key())), on).on_click(move |_: &ClickEvent, _, cx| {
                                 update(cx, |s| {
                                     let shown = s.usage_show.of(agent);

@@ -124,6 +124,8 @@ pub(super) struct ChangeList {
     rows: Vec<ChangeRow>,
     /// The run out; a tick while it is waits for it rather than pile up behind a slow repository.
     job: Option<AbortHandle>,
+    /// Which run is the latest asked (`job`'s): the answer of an earlier one, stopped for an op or replaced, is no one's.
+    run: u64,
     /// The next poll may not start before this (`poll_delay`); `None`: at the next chance.
     pub(super) next_at: Option<Instant>,
     /// When the last run ended and how long it took: a run for a change heard waits `watch_delay` after it.
@@ -166,6 +168,7 @@ impl ChangeList {
             result: None,
             rows: Vec::new(),
             job: None,
+            run: 0,
             next_at: None,
             ran: None,
             wanted: false,
@@ -390,11 +393,16 @@ impl SidePanel {
         }
     }
 
-    /// After a stage, discard or commit: git asked at once, past the pace, the floor and a halt (one more after the
-    /// run out, when one is). Its answer refreshes the shown diff and the gutters (`ChangesPolled`).
+    /// After a stage, discard or commit: git asked at once, past the pace, the floor and a halt. A run out was asked
+    /// before the op landed, so what it will answer is the index as it was: it is stopped (the runner kills its git),
+    /// not waited for, which a slow repository would make seconds of the old rows. The answer asked for now refreshes the
+    /// shown diff and the gutters (`ChangesPolled`).
     pub(super) fn refresh_changes_now(&mut self, cx: &mut Context<Self>) {
         if let Some(list) = self.changes.as_mut() {
             list.ops += 1;
+            if let Some(job) = list.job.take() {
+                job.abort();
+            }
             list.next_at = None;
             list.ran = None;
             list.halted = false;
@@ -434,21 +442,27 @@ impl SidePanel {
             return;
         }
         list.wanted = false;
-        let (id, ops, root) = (list.id, list.ops, list.root.clone());
+        list.run += 1;
+        let (id, run, ops, root) = (list.id, list.run, list.ops, list.root.clone());
         let task = self.rt.spawn(read_status(root));
         list.job = Some(task.abort_handle());
         cx.spawn(async move |this, cx| {
             // an aborted run (its list replaced) answers nothing
             let answer = task.await.ok();
-            let _ = this.update(cx, |this, cx| this.take_status(id, ops, now, answer, cx));
+            let _ = this.update(cx, |this, cx| this.take_status(id, run, ops, now, answer, cx));
         })
         .detach();
     }
 
-    fn take_status(&mut self, id: u64, ops: u64, started: Instant, answer: Option<Result<Answer, GitError>>, cx: &mut Context<Self>) {
+    fn take_status(&mut self, id: u64, run: u64, ops: u64, started: Instant, answer: Option<Result<Answer, GitError>>, cx: &mut Context<Self>) {
         let Some(list) = self.changes.as_mut().filter(|l| l.id == id) else { return };
+        if list.run != run {
+            // a run stopped for an op, or already replaced by the one asked since: that one is out, and is `job`
+            return;
+        }
         if list.ops != ops {
-            // asked before an op landed: its rows may be the index's before it; the one asked for since goes out now
+            // asked before an op landed and not stopped (the panel was not live then): its rows may be the index's
+            // before it; the one asked for since goes out now
             list.job = None;
             list.wanted = true;
             self.poll_changes(cx);
@@ -1383,6 +1397,51 @@ mod tests {
         assert_eq!(listing(&repo).await, rows(&[(Group::Staged, "f.txt", 'M')]));
     }
 
+    /// An op landing with a run out stops it and has the next run out at once, not once the stopped one has been heard.
+    #[gpui::test]
+    fn an_op_landing_stops_the_run_out_and_asks_again_at_once(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // the run asked for answers from the runtime's threads
+        cx.executor().allow_parking();
+        cx.update(|cx| cx.set_global(Theme::for_appearance(gpui::WindowAppearance::Dark)));
+        let panel = cx.new(|cx| SidePanel::new(rt.handle().clone(), crate::settings::PanelTab::Changes, cx));
+        panel.update(cx, |p, cx| {
+            p.changes = Some(ChangeList::new("/tmp/fictional-repo".into()));
+            p.changes_live = true;
+            let out = rt.spawn(std::future::pending::<()>());
+            p.changes.as_mut().unwrap().job = Some(out.abort_handle());
+            p.refresh_changes_now(cx);
+            let list = p.changes.as_ref().unwrap();
+            assert_eq!((list.run, list.job.is_some(), list.ops), (1, true, 1), "the run asked after the op is out already");
+            assert!(rt.block_on(out).unwrap_err().is_cancelled(), "the run that was out is stopped");
+        });
+    }
+
+    /// The answer of a run stopped for an op, or replaced by a later one, is no one's: it neither lands nor frees the
+    /// `job` of the run out now.
+    #[gpui::test]
+    fn the_answer_of_a_replaced_run_is_dropped(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        cx.update(|cx| cx.set_global(Theme::for_appearance(gpui::WindowAppearance::Dark)));
+        let panel = cx.new(|cx| SidePanel::new(rt.handle().clone(), crate::settings::PanelTab::Changes, cx));
+        let answer = Answer { status: Status { changes: vec![change(Group::Changes, "a.txt")], ..Default::default() }, prefix: String::new(), repo: RepoState::default() };
+        panel.update(cx, |p, cx| {
+            p.changes = Some(ChangeList::new("/tmp/fictional-repo".into()));
+            let list = p.changes.as_mut().unwrap();
+            let id = list.id;
+            // the third run is the one out
+            list.run = 3;
+            list.job = Some(rt.spawn(std::future::pending::<()>()).abort_handle());
+            p.take_status(id, 2, 0, Instant::now(), Some(Ok(answer.clone())), cx);
+            p.take_status(id, 2, 0, Instant::now(), None, cx);
+            let list = p.changes.as_ref().unwrap();
+            assert_eq!((list.result.is_none(), list.job.is_some(), list.wanted), (true, true, false), "an earlier run's answer changes nothing");
+            p.take_status(id, 3, 0, Instant::now(), Some(Ok(answer)), cx);
+            let list = p.changes.as_ref().unwrap();
+            assert_eq!((list.result.is_some(), list.job.is_none()), (true, true), "the run out lands");
+        });
+    }
+
     /// A status asked before a stage landed is dropped, not shown: the rows would be the index's before it.
     #[gpui::test]
     fn a_status_asked_before_an_op_landed_is_dropped(cx: &mut gpui::TestAppContext) {
@@ -1395,12 +1454,98 @@ mod tests {
             let id = p.changes.as_ref().unwrap().id;
             // the panel not live: nothing runs git here
             p.refresh_changes_now(cx);
-            p.take_status(id, 0, Instant::now(), Some(Ok(answer.clone())), cx);
+            p.take_status(id, 0, 0, Instant::now(), Some(Ok(answer.clone())), cx);
             let list = p.changes.as_ref().unwrap();
             assert_eq!((list.result.is_none(), list.wanted, list.job.is_none()), (true, true, true));
-            p.take_status(id, 1, Instant::now(), Some(Ok(answer.clone())), cx);
+            p.take_status(id, 0, 1, Instant::now(), Some(Ok(answer.clone())), cx);
             assert_eq!(p.changes_count(), Some(1));
         });
+    }
+
+    /// A status run is out (the watch heard the index change, say), and a stage, unstage or discard lands: the rows show
+    /// the new state as soon as the run asked after it answers, not once the run already out has also run out. The run
+    /// out is held in git's clean filter on a file that is never staged and edited to its committed size (6 s, while its
+    /// flag is up).
+    #[cfg(unix)]
+    #[gpui::test]
+    fn the_rows_follow_an_op_without_waiting_for_a_status_run_already_out(cx: &mut gpui::TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+        if !has_git() {
+            return;
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // git's answers come from the runtime's threads, the real clock's time
+        cx.executor().allow_parking();
+        cx.update(|cx| cx.set_global(Theme::for_appearance(gpui::WindowAppearance::Dark)));
+        let (dir, repo) = our_repo(&["a.txt", "slow.txt"]);
+        let (hold, started) = (dir.path().join("hold"), dir.path().join("started"));
+        let filter = dir.path().join("hold-slow.sh");
+        std::fs::write(&filter, format!("#!/bin/sh\nif [ -e '{}' ]; then touch '{}'; sleep 6; fi\ncat\n", hold.display(), started.display())).unwrap();
+        std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        sh(&repo, &["config", "filter.slow.clean", filter.to_str().unwrap()]);
+        write(&repo, ".gitattributes", "slow.txt filter=slow\n");
+        sh(&repo, &["add", ".gitattributes"]);
+        sh(&repo, &["commit", "-qm", "attributes"]);
+        write(&repo, "a.txt", "edited\n");
+        // the same size as committed, so git compares the content, through the filter, rather than see the size differ
+        write(&repo, "slow.txt", "slow.txt\nline two\nline thref\n");
+        let (panel, cx) = cx.add_window_view(|_, cx| SidePanel::new(rt.handle().clone(), crate::settings::PanelTab::Changes, cx));
+        panel.update(cx, |p, cx| {
+            p.context.root = Some(repo.to_string_lossy().into());
+            p.context.workspace_id = Some("w1".into());
+            p.changes = Some(ChangeList::new(repo.clone()));
+            p.changes_live = true;
+            p.poll_changes(cx);
+        });
+        // Waits (pumping the window) until `done` holds, as long as `limit`; how long it took.
+        let wait = |cx: &mut gpui::VisualTestContext, limit: Duration, done: &dyn Fn(&SidePanel) -> bool| {
+            let began = Instant::now();
+            while began.elapsed() < limit {
+                cx.run_until_parked();
+                if panel.read_with(cx, |p, _| done(p)) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            began.elapsed()
+        };
+        let listing = |p: &SidePanel| p.changes_answer().map(|a| listed(a).into_iter().map(|(g, path, _)| (g, path.to_string())).collect::<Vec<_>>());
+        let rows = |rows: &[(Group, &str)]| Some(rows.iter().map(|&(g, p)| (g, p.to_string())).collect::<Vec<_>>());
+        wait(cx, Duration::from_secs(20), &|p| p.changes_count() == Some(2));
+        let slow = (Group::Changes, "slow.txt");
+        let steps = [
+            ("stage", Op::Stage(change(Group::Changes, "a.txt")), rows(&[(Group::Staged, "a.txt"), slow])),
+            ("unstage", Op::Unstage(change(Group::Staged, "a.txt")), rows(&[(Group::Changes, "a.txt"), slow])),
+            (
+                "discard",
+                git_ops::confirm_discard(&change(Group::Changes, "a.txt"), "a.txt", false).unwrap().answered(0).unwrap(),
+                rows(&[slow]),
+            ),
+        ];
+        for (name, op, expected) in steps {
+            let runs = panel.read_with(cx, |p, _| p.changes.as_ref().unwrap().run);
+            // the run out, held inside the filter; the flag comes down so the op and the run asked after it are not
+            std::fs::write(&hold, "").unwrap();
+            let _ = std::fs::remove_file(&started);
+            panel.update(cx, |p, cx| {
+                let list = p.changes.as_mut().unwrap();
+                list.next_at = None;
+                list.ran = None;
+                p.poll_changes(cx);
+            });
+            wait(cx, Duration::from_secs(10), &|_| started.exists());
+            assert!(started.exists(), "{name}: the run out never reached the filter");
+            std::fs::remove_file(&hold).unwrap();
+            panel.update_in(cx, |p, window, cx| p.run_git_op(op.clone(), window, cx));
+            let took = wait(cx, Duration::from_secs(15), &|p| listing(p) == expected);
+            assert_eq!(panel.read_with(cx, |p, _| listing(p)), expected, "{name}: the rows after {took:?}");
+            assert!(took < Duration::from_secs(3), "{name}: the new rows took {took:?}, the run out held 6 s");
+            // the next step starts from a settled panel: no run out, none wanted, and no run but the held one and the one
+            // asked for after the op was ever made (the held one's stopping starts nothing)
+            wait(cx, Duration::from_secs(10), &|p| p.changes.as_ref().is_some_and(|l| l.job.is_none() && !l.wanted));
+            wait(cx, Duration::from_millis(300), &|_| false);
+            assert_eq!(panel.read_with(cx, |p, _| p.changes.as_ref().map(|l| (l.run - runs, l.job.is_none(), l.wanted))), Some((2, true, false)), "{name}: runs made, none out, none wanted");
+        }
     }
 
     /// A row under the pointer shows its actions, and they go when it leaves. A group hover showing them came too late
@@ -1416,7 +1561,7 @@ mod tests {
             p.context.workspace_id = Some("w1".into());
             p.changes = Some(ChangeList::new("/tmp/fictional-repo".into()));
             let id = p.changes.as_ref().unwrap().id;
-            p.take_status(id, 0, Instant::now(), Some(Ok(answer)), cx);
+            p.take_status(id, 0, 0, Instant::now(), Some(Ok(answer)), cx);
             assert_eq!(p.changes.as_ref().unwrap().rows, [ChangeRow::Header { group: Group::Changes, count: 1, folded: false }, ChangeRow::Change(0)]);
         });
         cx.run_until_parked();
@@ -1448,7 +1593,7 @@ mod tests {
             p.context.workspace_id = Some("w1".into());
             p.changes = Some(ChangeList::new("/tmp/fictional-repo".into()));
             let id = p.changes.as_ref().unwrap().id;
-            p.take_status(id, 0, Instant::now(), Some(Ok(before)), cx);
+            p.take_status(id, 0, 0, Instant::now(), Some(Ok(before)), cx);
             assert_eq!(p.changes.as_ref().unwrap().rows[2], ChangeRow::Change(1));
             id
         });
@@ -1461,7 +1606,7 @@ mod tests {
         // draft.txt gone (staged elsewhere, say): the Untracked header lands under the pointer, which has not moved
         let after = answer(vec![change(Group::Changes, "notes.txt"), change(Group::Untracked, "sketch.txt")]);
         panel.update(cx, |p, cx| {
-            p.take_status(id, 0, Instant::now(), Some(Ok(after)), cx);
+            p.take_status(id, 0, 0, Instant::now(), Some(Ok(after)), cx);
             assert_eq!(p.changes.as_ref().unwrap().rows[2], ChangeRow::Header { group: Group::Untracked, count: 1, folded: false });
         });
         cx.run_until_parked();

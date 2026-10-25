@@ -177,19 +177,21 @@ impl PanelTab {
 #[serde(rename_all = "lowercase")]
 pub enum UsageAgent {
     Codex,
+    CommandCode,
     #[default]
     #[serde(other)]
     Claude,
 }
 
 impl UsageAgent {
-    pub const ALL: [UsageAgent; 2] = [UsageAgent::Claude, UsageAgent::Codex];
+    pub const ALL: [UsageAgent; 3] = [UsageAgent::Claude, UsageAgent::Codex, UsageAgent::CommandCode];
 
     /// Its key in the usage cache, and in the settings file.
     pub fn key(self) -> &'static str {
         match self {
             UsageAgent::Claude => "claude",
             UsageAgent::Codex => "codex",
+            UsageAgent::CommandCode => "commandcode",
         }
     }
 
@@ -197,21 +199,24 @@ impl UsageAgent {
         match self {
             UsageAgent::Claude => "Claude",
             UsageAgent::Codex => "Codex",
+            UsageAgent::CommandCode => "Command Code",
         }
     }
 }
 
-/// The agents whose plan limits the status bar shows, each by its own switch; both by default.
+/// The agents whose plan limits the status bar shows, each by its own switch; all on by default (a settings file from
+/// before an agent's switch existed loads with it on).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UsageShow {
     pub claude: bool,
     pub codex: bool,
+    pub commandcode: bool,
 }
 
 impl Default for UsageShow {
     fn default() -> Self {
-        UsageShow { claude: true, codex: true }
+        UsageShow { claude: true, codex: true, commandcode: true }
     }
 }
 
@@ -221,6 +226,7 @@ impl UsageShow {
         match agent {
             UsageAgent::Claude => &mut self.claude,
             UsageAgent::Codex => &mut self.codex,
+            UsageAgent::CommandCode => &mut self.commandcode,
         }
     }
 
@@ -786,9 +792,9 @@ mod tests {
     }
 
     #[test]
-    fn the_status_bar_shows_both_agents_limits_unless_one_is_turned_off() {
-        assert_eq!(Settings::default().usage_show, UsageShow { claude: true, codex: true });
-        assert_eq!(Settings::default().usage_show.shown(), [UsageAgent::Claude, UsageAgent::Codex]);
+    fn the_status_bar_shows_every_agents_limits_unless_one_is_turned_off() {
+        assert_eq!(Settings::default().usage_show, UsageShow { claude: true, codex: true, commandcode: true });
+        assert_eq!(Settings::default().usage_show.shown(), [UsageAgent::Claude, UsageAgent::Codex, UsageAgent::CommandCode]);
         let (_d, path) = tmp();
         // a file from the one-agent choice, whichever it picked (a future one too), loads with both on
         for old in ["codex", "claude", "gemini"] {
@@ -807,14 +813,19 @@ mod tests {
             let back = Settings::load(&path).0;
             assert_eq!(back.usage_show, s.usage_show, "{agent:?}");
             assert!(!back.usage_show.shows(agent), "{agent:?} off");
-            assert_eq!(back.usage_show.shown().len(), 1, "the other stays on");
+            assert_eq!(back.usage_show.shown().len(), 2, "the others stay on");
         }
-        let none = Settings { usage_show: UsageShow { claude: false, codex: false }, ..Default::default() };
+        let none = Settings { usage_show: UsageShow { claude: false, codex: false, commandcode: false }, ..Default::default() };
         none.save(&path).unwrap();
         assert!(Settings::load(&path).0.usage_show.shown().is_empty());
-        // a file with only one of the two keys keeps the other on
+        // a file with only some of the keys keeps the others on
         std::fs::write(&path, r#"{"usage_show": {"codex": false}}"#).unwrap();
-        assert_eq!(Settings::load(&path).0.usage_show, UsageShow { claude: true, codex: false });
+        assert_eq!(Settings::load(&path).0.usage_show, UsageShow { claude: true, codex: false, commandcode: true });
+        // a file from before Command Code had its switch (both of the others set) loads with it on
+        std::fs::write(&path, r#"{"usage_show": {"claude": false, "codex": true}}"#).unwrap();
+        assert_eq!(Settings::load(&path).0.usage_show, UsageShow { claude: false, codex: true, commandcode: true });
+        std::fs::write(&path, r#"{"usage_show": {"commandcode": false}}"#).unwrap();
+        assert_eq!(Settings::load(&path).0.usage_show.shown(), [UsageAgent::Claude, UsageAgent::Codex]);
     }
 
     #[test]
