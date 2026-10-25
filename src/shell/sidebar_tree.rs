@@ -141,6 +141,37 @@ pub(super) struct TreeState {
     pub(super) machines_known: bool,
 }
 
+/// A row's dot in a box as wide as a workspace row's status, so the dots of machine, session and workspace rows, all
+/// at their row's right padding, make one column.
+fn status_column(color: Hsla, selector: &'static str) -> Div {
+    div().debug_selector(move || selector.into()).size(px(12.)).flex_none().flex().items_center().justify_center().child(div().size(px(6.)).rounded_full().bg(color))
+}
+
+/// A machine's header as drawn, before its clicks, drag and menu: the chevron (a machine turned off has none), its
+/// icon, its name in small caps (OFF when disabled), the ●N `badge` when folded, then the status dot.
+fn machine_header(theme: &Theme, id: &str, label: &str, enabled: bool, dot: Hsla, chevron: Option<gpui::AnyElement>, badge: Option<gpui::AnyElement>) -> Stateful<Div> {
+    let ink = if enabled { theme.text_muted } else { theme.text_faint.opacity(0.6) };
+    let icon = if id == LOCAL { "icons/monitor.svg" } else { "icons/remote-server.svg" };
+    div()
+        .id(SharedString::from(format!("tree-machine-{id}")))
+        .h(px(26.))
+        .pl(px(if chevron.is_some() { 2. } else { 8. }))
+        .pr(px(8.))
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(6.))
+        .rounded(px(6.))
+        .text_size(px(10.5))
+        .font_weight(gpui::FontWeight::BOLD)
+        .text_color(ink)
+        .children(chevron)
+        .child(gpui::svg().path(icon).size(px(13.)).flex_none().text_color(ink))
+        .child(div().flex_1().min_w_0().truncate().child(if enabled { label.to_uppercase() } else { format!("{} · OFF", label.to_uppercase()) }))
+        .children(badge)
+        .child(status_column(dot, "tree-machine-dot"))
+}
+
 impl TreeState {
     /// A switch to `key`: a goal waiting for another session is dropped, so it never lands after you moved on.
     pub(super) fn switching_to(&mut self, key: &SessionKey) {
@@ -720,22 +751,18 @@ impl Shell {
         (out, listed)
     }
 
-    /// A machine's header: a chevron, its icon, its name in small caps, folded its ●N, a dot for whether it answers,
-    /// and ⋯ on hover; a click anywhere folds its sessions. `drags`: it is dragged and dropped on.
+    /// A machine's header: a chevron, its icon, its name in small caps, folded its ●N, a dot for whether it answers;
+    /// a click anywhere folds its sessions, a right-click opens its menu. `drags`: it is dragged and dropped on.
     #[allow(clippy::too_many_arguments)]
     fn machine_row(&self, theme: &Theme, id: String, label: String, status: Status, enabled: bool, collapsed: bool, waiting: usize, drags: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         let hover_bg = theme.hover;
         let menu_id = id.clone();
-        let group = SharedString::from(format!("tree-machine-group-{id}"));
-        let open = self.tree.machine_menu.as_ref().is_some_and(|m| m.is_open() && m.value.0 == id);
-        let ink = if enabled { theme.text_muted } else { theme.text_faint.opacity(0.6) };
         let dot = match status {
             _ if !enabled => theme.text_faint.opacity(0.4),
             Status::Unreachable => theme.danger,
             Status::Stopped => theme.text_faint.opacity(0.6),
             _ => theme.success,
         };
-        let icon = if id == LOCAL { "icons/monitor.svg" } else { "icons/remote-server.svg" };
         // an SSH machine's group moves among the others; this computer's stays first
         let mut targets: Vec<&str> = self.places.iter().map(machine_of).filter(|m| *m != LOCAL).collect();
         targets.dedup();
@@ -744,7 +771,7 @@ impl Shell {
         let over = id.clone();
         // a machine turned off lists no sessions to fold
         let folds = enabled.then(|| id.clone());
-        let chevron = folds.is_some().then(|| fold_chevron(theme, &format!("machine-{id}"), !collapsed, 1., None));
+        let chevron = folds.is_some().then(|| fold_chevron(theme, &format!("machine-{id}"), !collapsed, 1., None).into_any_element());
         // folded: its sessions' agents waiting or done; a click goes to the one that has waited longest
         let badge = (waiting > 0).then(|| {
             let target = id.clone();
@@ -757,49 +784,18 @@ impl Shell {
                     cx.stop_propagation();
                     this.go_to_longest_waiting_on(&target, cx);
                 }))
+                .into_any_element()
         });
-        div()
-            .id(SharedString::from(format!("tree-machine-{id}")))
-            .group(group.clone())
-            .h(px(26.))
-            .pl(px(if chevron.is_some() { 2. } else { 8. }))
-            .pr(px(8.))
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(6.))
-            .rounded(px(6.))
-            .text_size(px(10.5))
-            .font_weight(gpui::FontWeight::BOLD)
-            .text_color(ink)
-            .children(chevron)
-            .child(gpui::svg().path(icon).size(px(13.)).flex_none().text_color(ink))
-            .child(div().flex_1().min_w_0().truncate().child(if enabled { label.to_uppercase() } else { format!("{} · OFF", label.to_uppercase()) }))
-            .children(badge)
+        machine_header(theme, &id, &label, enabled, dot, chevron, badge)
             .when_some(folds, |el, id| {
                 el.cursor_pointer().hover(move |s| s.bg(hover_bg)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_machine_fold(&id, cx)))
             })
             .when(movable, |el| el.on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone())))
             .when(drags, |el| el.on_drag_move(cx.listener(move |this, e: &DragMoveEvent<DraggedTreeItem>, _, cx| this.tree_drag_over(Over::Machine(over.clone()), e, cx))))
-            .child(div().size(px(6.)).flex_none().rounded_full().bg(dot))
-            .child(
-                div()
-                    .id(SharedString::from(format!("tree-machine-menu-{id}")))
-                    .size(px(18.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(hover_bg))
-                    .when(!open, |el| el.opacity(0.).group_hover(group, |s| s.opacity(1.)))
-                    .child(gpui::svg().path("icons/more-horizontal.svg").size(px(12.)).text_color(theme.text_faint))
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                        this.tree.machine_menu = Some(crate::ui::Popup::new((menu_id.clone(), e.position)));
-                        cx.notify();
-                    })),
-            )
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                this.tree.machine_menu = Some(crate::ui::Popup::new((menu_id.clone(), e.position)));
+                cx.notify();
+            }))
             .into_any_element()
     }
 
@@ -865,7 +861,7 @@ impl Shell {
         let over = key.clone();
         let chevron = fold_chevron(theme, &format!("session-{idx}"), !collapsed, 1., None);
         // the dot in a box as wide as a workspace row's status, at the row's right padding as theirs are: one column
-        let dot = div().size(px(12.)).flex_none().flex().items_center().justify_center().child(div().size(px(6.)).rounded_full().bg(dot));
+        let dot = status_column(dot, "tree-session-dot");
         // a header: the chevron, the session's icon and its name in bold; a click anywhere folds its workspaces, a
         // right-click opens its menu
         row(theme, false, ("tree-session", idx))
@@ -1705,5 +1701,28 @@ mod tests {
         assert_eq!(longest_waiting_among([(a.clone(), &s, &none), (c.clone(), &s, &early)]).map(|f| f.0), Some(c), "a known wait before an unknown one");
         assert_eq!(longest_waiting_among([(a.clone(), &s, &none)]).map(|f| f.0), Some(a), "else the first that waits");
         assert_eq!(longest_waiting_among(std::iter::empty()), None);
+    }
+
+    /// A machine's row ends in its status dot and nothing after it (no hover ⋯), and the dot sits where a session
+    /// row's does: one column down the tree.
+    #[gpui::test]
+    fn a_machine_row_ends_in_its_dot_in_the_session_rows_column(cx: &mut gpui::TestAppContext) {
+        struct Rows;
+        impl gpui::Render for Rows {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = Theme::of(cx).clone();
+                let machine = machine_header(&theme, "you@box", "box", true, theme.success, None, None);
+                // a session row as `session_row` builds it, to its dot
+                let session = row(&theme, false, ("tree-session", 0usize)).h(px(28.)).pl(px(2.)).child(div().flex_1()).child(status_column(theme.success, "tree-session-dot"));
+                div().w(px(256.)).px(px(8.)).flex().flex_col().child(machine.debug_selector(|| "machine-row".into())).child(session.debug_selector(|| "session-row".into()))
+            }
+        }
+        cx.update(|cx| cx.set_global(Theme::for_appearance(gpui::WindowAppearance::Dark)));
+        let (_, cx) = cx.add_window_view(|_, _| Rows);
+        cx.run_until_parked();
+        let (machine, dot) = (cx.debug_bounds("machine-row").unwrap(), cx.debug_bounds("tree-machine-dot").unwrap());
+        let session_dot = cx.debug_bounds("tree-session-dot").unwrap();
+        assert_eq!(dot.right(), machine.right() - px(8.), "the dot is last, at the row's padding");
+        assert_eq!((dot.left(), dot.size.width), (session_dot.left(), session_dot.size.width), "the session row's column");
     }
 }
