@@ -202,6 +202,14 @@ impl UsageAgent {
             UsageAgent::CommandCode => "Command Code",
         }
     }
+
+    /// Its name in the status bar, where the room is short: Settings keeps [`label`](Self::label).
+    pub fn bar_name(self) -> &'static str {
+        match self {
+            UsageAgent::CommandCode => "cmd",
+            other => other.label(),
+        }
+    }
 }
 
 /// The agents whose plan limits the status bar shows, each by its own switch; all on by default (a settings file from

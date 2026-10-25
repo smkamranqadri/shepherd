@@ -1027,7 +1027,7 @@ pub fn bar(
             on_click_at(link(div().id(id).flex_none().flex().items_center().gap(px(5.)).px(px(8.)), theme, usage_lit(open, agent)), move |label, window, cx| {
                 on_usage(agent, label, window, cx)
             })
-            .child(agent.label())
+            .child(div().debug_selector(move || format!("usage-agent-{}", agent.bar_name())).child(agent.bar_name()))
             .children(limits.iter().map(|l| usage_window(theme, l)))
         }))
         .into_any_element()
@@ -1122,7 +1122,49 @@ mod tests {
         assert_eq!(parse_commandcode_usage(r#"{"success":false,"error":"Session expired"}"#), None);
         assert_eq!(parse_commandcode_usage(""), None);
         assert_eq!(UsageAgent::CommandCode.key(), "commandcode");
-        assert_eq!(UsageAgent::CommandCode.label(), "Command Code");
+        assert_eq!(UsageAgent::CommandCode.label(), "Command Code", "Settings keeps the full name");
+    }
+
+    /// The production bar names Command Code `cmd` and Claude and Codex in full, each by the name it draws.
+    #[gpui::test]
+    fn the_bar_names_command_code_cmd(cx: &mut gpui::TestAppContext) {
+        struct Bar1;
+        impl gpui::Render for Bar1 {
+            fn render(&mut self, window: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+                let theme = Theme::of(cx).clone();
+                div().w(px(900.)).child(bar(
+                    crate::settings::StatusBarShow::default(),
+                    None,
+                    None,
+                    None,
+                    &theme,
+                    None,
+                    false,
+                    |_, _, _| {},
+                    |_, _, _| {},
+                    |_, _, _, _| {},
+                    |_, _, _| {},
+                    window,
+                    cx,
+                ))
+            }
+        }
+        let (claude, plus, _) = bodies();
+        let command_code = parse_commandcode_usage(COMMANDCODE_USED).unwrap();
+        cx.update(|cx| {
+            cx.set_global(Theme::for_appearance(gpui::WindowAppearance::Dark));
+            cx.set_global(crate::settings::SettingsGlobal { settings: Default::default(), error: None, path: Default::default() });
+            let cache = &mut cx.default_global::<Cache<Vec<Limit>>>().0;
+            for (agent, limits) in [(UsageAgent::Claude, claude), (UsageAgent::Codex, plus), (UsageAgent::CommandCode, command_code)] {
+                cache.insert(agent.key().into(), Entry { value: Some(limits), fetched: Some(Instant::now()), busy: false });
+            }
+        });
+        let (_, cx) = cx.add_window_view(|_, _| Bar1);
+        cx.run_until_parked();
+        for (name, id) in [("cmd", "usage-agent-cmd"), ("Claude", "usage-agent-Claude"), ("Codex", "usage-agent-Codex")] {
+            assert!(cx.debug_bounds(id).is_some(), "{name} drawn in the bar");
+        }
+        assert!(cx.debug_bounds("usage-agent-Command Code").is_none(), "the bar does not spell Command Code out");
     }
 
     /// The bodies of `parses_claude_usage` and `parses_codex_usage`, Claude's and a Plus plan's two windows with the
