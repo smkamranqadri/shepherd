@@ -1,5 +1,5 @@
 # State (2026-10-25)
-Stamp: dev 9598ae1 3ad56790d216
+Stamp: dev d986591 743b4006ea03
 
 Branch: `dev` at 9598ae1 (bundle 2026-10-25 merged; local, not pushed; fork/dev at b65eb3f) (upstream v1.3.5 merged at 7ba0a71). Local and fork `main` at 28ae8bf, 5 behind origin/main v1.3.5; installed shepherd-local 1.3.5.r412.g9209847 (the bundle is not packaged yet).
 Task: none active. Done 2026-10-25: bundle per `kis/intent/plan-bundle-2026-10-25.md` (backlog 10, 13–17, 19–21), four Sonnet builders plus B2 (images in the editor and Quick Look), all closed, worktrees and branches removed, reports in /tmp/claude-1000/herdr-orch/bundle-2026-10-25/reports/. Also: hover crash fix 9209847 (Kamran checked in r412); `notify-send` hook removed from `~/.claude/settings.json` by Kamran.
