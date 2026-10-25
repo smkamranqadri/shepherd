@@ -96,13 +96,14 @@ pub(super) fn badge<'a>(snapshots: impl IntoIterator<Item = &'a Snapshot>) -> us
     snapshots.into_iter().map(sidebar_tree::waiting).sum()
 }
 
-/// A notification's title and body: "claude · api — menqal" (the session named when it is not the one shown), and
-/// what the agent does, with its terminal's title.
-pub(super) fn message(pane: &Pane, snapshot: &Snapshot, session: Option<&str>) -> (String, String) {
+/// A notification's title and body: "claude · api — menqal" (the session always named, the shown one too, so two
+/// sessions' notifications read apart; an unnamed one, with no name to give, goes without), and what the agent does,
+/// with its terminal's title.
+pub(super) fn message(pane: &Pane, snapshot: &Snapshot, session: &str) -> (String, String) {
     let agent = pane.agent.as_deref().unwrap_or("Agent");
     let workspace = snapshot.workspaces.iter().find(|w| w.workspace_id == pane.workspace_id).map(|w| w.label.as_str());
     let mut title = workspace.map_or_else(|| agent.to_string(), |w| format!("{agent} · {w}"));
-    if let Some(session) = session {
+    if !session.is_empty() {
         title = format!("{title} — {session}");
     }
     // a finish herdr reports as idle reads as done
@@ -112,6 +113,15 @@ pub(super) fn message(pane: &Pane, snapshot: &Snapshot, session: Option<&str>) -
         None => status.to_string(),
     };
     (title, body)
+}
+
+/// The notifications for the session shown, named `session`: the agents of `next` that started waiting or finished
+/// since `old`, but for those in the tab `in_view`, each with the alert's `worked` and its title and body.
+pub(super) fn told_here(old: &Snapshot, next: &Snapshot, in_view: Option<&str>, session: &str) -> Vec<(Pane, bool, (String, String))> {
+    alerts(old, next)
+        .filter(|(p, _)| in_view != Some(p.tab_id.as_str()))
+        .map(|(p, worked)| (p.clone(), worked, message(p, next, session)))
+        .collect()
 }
 
 /// The pane a notification names, and the agent's state (herdr's seq, the pane's terminal) as it was posted.
@@ -190,11 +200,11 @@ impl Shell {
     /// The alerts a watcher's answer brought: told as from a session not shown.
     pub(super) fn tell_elsewhere(&mut self, key: &SessionKey, alerts: &[Alert], cx: &mut Context<Self>) {
         let Some(snapshot) = self.watchers.snapshot(key) else { return };
-        let session = self.places.iter().find(|p| SessionKey::of(p) == *key).map(|p| p.look(cx).0);
+        let session = self.places.iter().find(|p| SessionKey::of(p) == *key).map(|p| p.look(cx).0).unwrap_or_default();
         let told: Vec<_> = alerts
             .iter()
             .filter_map(|a| Some((snapshot.panes.iter().find(|p| p.pane_id == a.pane)?, a.worked)))
-            .map(|(p, worked)| (p.clone(), worked, message(p, snapshot, session.as_deref())))
+            .map(|(p, worked)| (p.clone(), worked, message(p, snapshot, &session)))
             .collect();
         for (pane, worked, message) in told {
             self.tell(Some(key), &pane, worked, message, cx);
@@ -416,10 +426,20 @@ mod tests {
     }
 
     #[test]
-    fn the_title_names_the_session_only_when_asked() {
+    fn the_title_names_the_session_always_the_shown_one_too() {
         let s = snapshot(&[("p1", "blocked", 1, None), ("p2", "idle", 2, Some(2))]);
-        assert_eq!(message(&s.panes[0], &s, None), ("claude · api".into(), "Waiting for you".into()));
-        assert_eq!(message(&s.panes[1], &s, Some("menqal")), ("claude · api — menqal".into(), "Done".into()));
+        assert_eq!(message(&s.panes[0], &s, "default"), ("claude · api — default".into(), "Waiting for you".into()), "the session shown");
+        assert_eq!(message(&s.panes[1], &s, "menqal"), ("claude · api — menqal".into(), "Done".into()), "another session");
+        assert_eq!(message(&s.panes[0], &s, "").0, "claude · api", "no name to give");
+    }
+
+    #[test]
+    fn the_session_shown_tells_its_name_and_not_the_tab_in_view() {
+        let old = snapshot(&[("p1", "working", 1, None), ("p2", "working", 1, None)]);
+        let new = snapshot(&[("p1", "blocked", 2, None), ("p2", "idle", 2, Some(2))]);
+        let titles = |in_view: Option<&str>| told_here(&old, &new, in_view, "default").into_iter().map(|(p, _, (title, _))| (p.pane_id, title)).collect::<Vec<_>>();
+        assert_eq!(titles(None), [("p1".to_string(), "claude · api — default".to_string()), ("p2".to_string(), "claude · api — default".to_string())]);
+        assert_eq!(titles(Some("t-p1")), [("p2".to_string(), "claude · api — default".to_string())], "the agent in view is not told");
     }
 
     #[test]

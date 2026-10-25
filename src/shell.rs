@@ -1028,10 +1028,8 @@ impl Shell {
     fn agents_changed(&mut self, next: &Snapshot, cx: &mut Context<Self>) {
         let in_view = self.tab_in_view(cx.active_window().is_some());
         let Some(old) = self.snapshot.as_ref() else { return };
-        let told: Vec<_> = attention::alerts(old, next)
-            .filter(|(p, _)| in_view.as_deref() != Some(p.tab_id.as_str()))
-            .map(|(p, worked)| (p.clone(), worked, attention::message(p, next, None)))
-            .collect();
+        let session = self.place_label(cx);
+        let told = attention::told_here(old, next, in_view.as_deref(), &session);
         let key = self.shown_key();
         for (pane, worked, message) in told {
             self.tell(key.as_ref(), &pane, worked, message, cx);
