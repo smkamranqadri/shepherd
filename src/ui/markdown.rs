@@ -825,6 +825,44 @@ fn rects(layout: &TextLayout, range: &Range<usize>) -> Vec<Bounds<Pixels>> {
     out
 }
 
+/// The pairs of paragraphs painted last frame whose drawn lines run into each other, and the paragraphs whose
+/// box is shorter than their lines: what a reader sees as one block drawn over the next.
+#[cfg(test)]
+pub(crate) fn overlaps() -> Vec<String> {
+    let lines: Vec<(Bounds<Pixels>, Pixels, SharedString)> = PAINTED.with(|p| {
+        p.borrow()
+            .iter()
+            .map(|e| {
+                let line = e.layout.line_height();
+                let drawn = e.layout.position_for_index(e.text.len()).map_or(px(0.), |p| p.y + line);
+                (e.layout.bounds(), drawn, e.text.clone())
+            })
+            .collect()
+    });
+    let slack = px(0.5);
+    let head = |text: &SharedString| text.chars().take(30).collect::<String>();
+    let rect = |(b, drawn, _): &(Bounds<Pixels>, Pixels, SharedString)| (b.left(), b.top(), b.right(), (*drawn).max(b.bottom()));
+    let mut found = Vec::new();
+    for (i, a) in lines.iter().enumerate() {
+        if a.1 > a.0.bottom() + slack {
+            found.push(format!("{:?} is drawn to {:?}, past its box's {:?}", head(&a.2), a.1, a.0.bottom()));
+        }
+        for b in &lines[i + 1..] {
+            let (a_rect, b_rect) = (rect(a), rect(b));
+            if a_rect.0 < b_rect.2 - slack && b_rect.0 < a_rect.2 - slack && a_rect.1 < b_rect.3 - slack && b_rect.1 < a_rect.3 - slack {
+                found.push(format!("{:?} ({:?}..{:?}) runs into {:?} ({:?}..{:?})", head(&a.2), a_rect.1, a_rect.3, head(&b.2), b_rect.1, b_rect.3));
+            }
+        }
+    }
+    found
+}
+
+/// How many paragraphs were painted last frame.
+#[cfg(test)]
+pub(crate) fn painted_count() -> usize {
+    PAINTED.with(|p| p.borrow().len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,37 +874,6 @@ mod tests {
             let theme = Theme::of(cx).clone();
             crate::ui::viewer::markdown_preview_with("page", &self.0, &Links::web(), &self.1, &theme, &Look::default())
         }
-    }
-
-    /// The pairs of paragraphs painted last frame whose drawn lines run into each other, and the paragraphs whose
-    /// box is shorter than their lines: what a reader sees as one block drawn over the next.
-    fn overlaps() -> Vec<String> {
-        let lines: Vec<(Bounds<Pixels>, Pixels, SharedString)> = PAINTED.with(|p| {
-            p.borrow()
-                .iter()
-                .map(|e| {
-                    let line = e.layout.line_height();
-                    let drawn = e.layout.position_for_index(e.text.len()).map_or(px(0.), |p| p.y + line);
-                    (e.layout.bounds(), drawn, e.text.clone())
-                })
-                .collect()
-        });
-        let slack = px(0.5);
-        let head = |text: &SharedString| text.chars().take(30).collect::<String>();
-        let rect = |(b, drawn, _): &(Bounds<Pixels>, Pixels, SharedString)| (b.left(), b.top(), b.right(), (*drawn).max(b.bottom()));
-        let mut found = Vec::new();
-        for (i, a) in lines.iter().enumerate() {
-            if a.1 > a.0.bottom() + slack {
-                found.push(format!("{:?} is drawn to {:?}, past its box's {:?}", head(&a.2), a.1, a.0.bottom()));
-            }
-            for b in &lines[i + 1..] {
-                let (a_rect, b_rect) = (rect(a), rect(b));
-                if a_rect.0 < b_rect.2 - slack && b_rect.0 < a_rect.2 - slack && a_rect.1 < b_rect.3 - slack && b_rect.1 < a_rect.3 - slack {
-                    found.push(format!("{:?} ({:?}..{:?}) runs into {:?} ({:?}..{:?})", head(&a.2), a_rect.1, a_rect.3, head(&b.2), b_rect.1, b_rect.3));
-                }
-            }
-        }
-        found
     }
 
     /// Shepherd's own README at the widths a window has, laid out by the reader's preview: no paragraph drawn over
@@ -883,7 +890,7 @@ mod tests {
             PAINTED.with(|p| p.borrow_mut().clear());
             cx.update(|window, _| window.refresh());
             cx.run_until_parked();
-            let painted = PAINTED.with(|p| p.borrow().len());
+            let painted = painted_count();
             assert!(painted > 100, "at {width} px only {painted} paragraphs were painted");
             let found = overlaps();
             assert!(found.is_empty(), "at {width} px: {found:#?}");

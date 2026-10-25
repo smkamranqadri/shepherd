@@ -2347,6 +2347,41 @@ mod tests {
         assert_eq!((asked_of("badge.png"), asked_of("plain.png")), (1, 0));
     }
 
+    /// Shepherd's own README in the Quick Look reader at the widths a window has: no paragraph drawn over another. The
+    /// reader's column is a flex column whose own width `max_w` clamps (unlike the file preview's, whose items were
+    /// clamped one by one under a window-wide container), so its paragraphs are sized at the column's width: this
+    /// holds as it is, and fails if the paragraphs go back under a window-wide flex container.
+    #[gpui::test]
+    fn the_readers_column_paints_no_block_over_another(cx: &mut gpui::TestAppContext) {
+        unsafe {
+            std::env::set_var("SHEPHERD_HERDR", "/nonexistent/herdr");
+            std::env::set_var("HERDR_CLIENT_SOCKET_PATH", "/nonexistent/herdr-client.sock");
+        }
+        cx.update(|cx| cx.set_global(crate::settings::Settings::default().theme(gpui::WindowAppearance::Dark)));
+        let (pane, cx) = cx.add_window_view(|_, cx| {
+            let mut pane = PaneTerminal::new("w1:p1".into(), cx);
+            // parked: its first measure does not attach, and herdr's missing binary does not end the pane
+            pane.park(cx);
+            pane
+        });
+        let text = include_str!("../../README.md");
+        let file = File { path: PathBuf::from("/nonexistent/README.md"), dir: false, machine: None };
+        let blocks = crate::ui::review::markdown_document(text);
+        pane.update(cx, |p, cx| p.show_reader(file, "/nonexistent".into(), text.to_string(), blocks, cx));
+        // the card has grown into place
+        std::thread::sleep(PREVIEW_IN + std::time::Duration::from_millis(50));
+        for width in [1400., 900., 600., 400.] {
+            cx.simulate_resize(gpui::size(px(width), px(900.)));
+            pane.update(cx, |_, cx| cx.notify());
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            let painted = crate::ui::markdown::painted_count();
+            assert!(painted > 100, "at {width} px only {painted} paragraphs were painted");
+            let found = crate::ui::markdown::overlaps();
+            assert!(found.is_empty(), "at {width} px: {found:#?}");
+        }
+    }
+
     /// A Markdown file opened for the reader is read as a document: its HTML images are image runs.
     #[test]
     fn a_markdown_file_opens_in_the_reader_with_its_html_images() {
