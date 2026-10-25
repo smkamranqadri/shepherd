@@ -868,9 +868,7 @@ impl PaneTerminal {
                 return file.local_copy().await.map(Opened::Image);
             }
             if !file.dir && is_markdown(&file.path) {
-                let text = String::from_utf8_lossy(&file.bytes().await?).into_owned();
-                let blocks = crate::ui::review::markdown_document(&text);
-                return Some(Opened::Markdown { file, cwd, text, blocks });
+                return open_markdown(file, cwd).await;
             }
             open_at(&client, editor, &file, line, col, Some((&pane_id, &cwd))).await.err().map(Opened::Failed)
         });
@@ -1528,6 +1526,13 @@ async fn cache_copy(name: &str, bytes: Vec<u8>) -> Option<PathBuf> {
     let copy = dir.join(name);
     tokio::fs::write(&copy, bytes).await.ok()?;
     Some(copy)
+}
+
+/// A Markdown file for the reader: its text, and its blocks read as a document (an HTML `<img>` is an image there).
+async fn open_markdown(file: File, cwd: String) -> Option<Opened> {
+    let text = String::from_utf8_lossy(&file.bytes().await?).into_owned();
+    let blocks = crate::ui::review::markdown_document(&text);
+    Some(Opened::Markdown { file, cwd, text, blocks })
 }
 
 /// What a Cmd+click opens over the pane.
@@ -2286,8 +2291,10 @@ mod tests {
         let rt = &runtime();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("README.md");
-        let text = "![dot](dot.png)\n\n<img src=\"dot.png\" width=\"40\" alt=\"narrow\">\n\n<img src=\"big.png\" alt=\"big\">\n\n<p><a href=\"LICENSE\"><img src=\"https://img.example.net/badge.png\" alt=\"badge\"></a></p>\n\n<img src=\"http://img.example.net/plain.png\" alt=\"plain\">\n\n<p align=\"center\">\n  <img src=\"hero.svg\" alt=\"hero\" width=\"860\">\n</p>\n\n<h1 align=\"center\"><img src=\"icon.svg\" width=\"48\" alt=\"\"> Acme</h1>\n";
+        let text = "![dot](dot.png)\n\n<img src=\"dot.png\" width=\"40\" alt=\"narrow\">\n\n<img src=\"big.png\" alt=\"big\">\n\n<p><a href=\"LICENSE\"><img src=\"https://img.example.net/badge.png\" alt=\"badge\"></a></p>\n\n<img src=\"http://img.example.net/plain.png\" alt=\"plain\">\n\n<p align=\"center\">\n  <img src=\"hero.svg\" alt=\"hero\" width=\"860\">\n</p>\n\n<h1 align=\"center\"><img src=\"icon.svg\" width=\"48\" alt=\"\"> Acme</h1>\n\n<img src=\"logo.svg\" alt=\"logo\">\n\n![bad](notes.txt)\n";
         std::fs::write(&path, text).unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "not a picture").unwrap();
+        std::fs::write(dir.path().join("logo.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"120\" height=\"60\" viewBox=\"0 0 120 60\"></svg>").unwrap();
         std::fs::write(dir.path().join("dot.png"), png(100, 50)).unwrap();
         std::fs::write(dir.path().join("big.png"), png(2000, 1000)).unwrap();
         std::fs::write(dir.path().join("hero.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1200\" height=\"600\" viewBox=\"0 0 1200 600\"></svg>").unwrap();
@@ -2313,7 +2320,7 @@ mod tests {
         let blocks = crate::ui::review::markdown_document(text);
         pane.update(cx, |p, cx| p.show_reader(file, dir.path().to_string_lossy().into_owned(), text.to_string(), blocks, cx));
         // the local ones come in; the badge is still being fetched: its alt text, not its picture
-        settle(rt, cx, |cx| pane.read_with(cx, |p, _| p.reader.as_ref().is_some_and(|r| r.value.images.len() == 4)));
+        settle(rt, cx, |cx| pane.read_with(cx, |p, _| p.reader.as_ref().is_some_and(|r| r.value.images.len() == 5)));
         // the card has grown into place
         std::thread::sleep(PREVIEW_IN + std::time::Duration::from_millis(50));
         pane.update(cx, |_, cx| cx.notify());
@@ -2326,16 +2333,31 @@ mod tests {
         assert_eq!(bounds(cx, "reader-md-5-image-0-picture"), Some((752., 376.)), "an SVG asked for 860 wide in a 752 column");
         assert_eq!(bounds(cx, "reader-md-6-image-0-picture"), Some((48., 48.)), "an image with an empty alt draws, beside the heading's text");
         assert!(cx.debug_bounds("reader-md-6-image-0-alt").is_none());
+        assert_eq!(bounds(cx, "reader-md-7-image-0-picture"), Some((120., 60.)), "an SVG with no width of its own at its own size");
+        assert!(cx.debug_bounds("reader-md-8-image-0-alt").is_some() && bounds(cx, "reader-md-8-image-0-picture").is_none(), "a file that is no picture keeps its alt text");
         assert!(bounds(cx, "reader-md-3-image-0-picture").is_none() && cx.debug_bounds("reader-md-3-image-0-alt").is_some(), "the badge's alt text until it is in");
         assert!(cx.debug_bounds("reader-md-4-image-0-alt").is_some(), "plain http is never fetched: its alt text stays");
         // the badge lands: its picture replaces its alt text
         release.send(()).unwrap();
-        settle(rt, cx, |cx| pane.read_with(cx, |p, _| p.reader.as_ref().is_some_and(|r| r.value.images.len() == 5)));
+        settle(rt, cx, |cx| pane.read_with(cx, |p, _| p.reader.as_ref().is_some_and(|r| r.value.images.len() == 6)));
         cx.run_until_parked();
         assert_eq!(bounds(cx, "reader-md-3-image-0-picture"), Some((60. / scale, 30. / scale)));
         assert!(cx.debug_bounds("reader-md-3-image-0-alt").is_none());
         let asked_of = |url: &str| noted.lock().unwrap().iter().filter(|u| u.ends_with(url)).count();
         assert_eq!((asked_of("badge.png"), asked_of("plain.png")), (1, 0));
+    }
+
+    /// A Markdown file opened for the reader is read as a document: its HTML images are image runs.
+    #[test]
+    fn a_markdown_file_opens_in_the_reader_with_its_html_images() {
+        let rt = crate::ui::viewer::test_support::runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("README.md");
+        std::fs::write(&path, "<p align=\"center\"><img src=\"hero.svg\" alt=\"hero\"></p>\n\n![dot](dot.png)\n").unwrap();
+        let file = File { path, dir: false, machine: None };
+        let Some(Opened::Markdown { blocks, text, .. }) = rt.block_on(open_markdown(file, dir.path().to_string_lossy().into_owned())) else { panic!("not a Markdown file") };
+        assert_eq!(crate::ui::markdown::image_sources(&blocks), ["hero.svg", "dot.png"]);
+        assert!(text.contains("<img"), "the text is the file's, for the copy button");
     }
 
     #[gpui::test]

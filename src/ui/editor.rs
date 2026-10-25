@@ -2489,9 +2489,10 @@ mod tests {
         let path = dir.path().join("README.md");
         std::fs::write(
             &path,
-            "![dot](dot.png)\n\n<img src=\"dot.png\" width=\"40\" alt=\"narrow\">\n\n<img src=\"big.png\" alt=\"big\">\n\n<p><a href=\"LICENSE\"><img src=\"https://img.example.net/badge.png\" alt=\"badge\"></a></p>\n\n<img src=\"http://img.example.net/plain.png\" alt=\"plain\">\n\n<p align=\"center\">\n  <img src=\"hero.svg\" alt=\"hero\" width=\"860\">\n</p>\n\n<h1 align=\"center\"><img src=\"icon.svg\" width=\"48\" alt=\"\"> Acme</h1>\n",
+            "![dot](dot.png)\n\n<img src=\"dot.png\" width=\"40\" alt=\"narrow\">\n\n<img src=\"big.png\" alt=\"big\">\n\n<p><a href=\"LICENSE\"><img src=\"https://img.example.net/badge.png\" alt=\"badge\"></a></p>\n\n<img src=\"http://img.example.net/plain.png\" alt=\"plain\">\n\n<p align=\"center\">\n  <img src=\"hero.svg\" alt=\"hero\" width=\"860\">\n</p>\n\n<h1 align=\"center\"><img src=\"icon.svg\" width=\"48\" alt=\"\"> Acme</h1>\n\n<img src=\"logo.svg\" alt=\"logo\">\n",
         )
         .unwrap();
+        std::fs::write(dir.path().join("logo.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"120\" height=\"60\" viewBox=\"0 0 120 60\"></svg>").unwrap();
         std::fs::write(dir.path().join("dot.png"), png(100, 50)).unwrap();
         std::fs::write(dir.path().join("big.png"), png(2000, 1000)).unwrap();
         std::fs::write(dir.path().join("hero.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1200\" height=\"600\" viewBox=\"0 0 1200 600\"></svg>").unwrap();
@@ -2500,7 +2501,7 @@ mod tests {
         let noted = Calls::default();
         let (editor, cx) = image_editor(cx, rt, dir.path(), &path, waiting_for(gate, png(60, 30), noted.clone()), dir.path().join("cache"));
         // the local ones come in; the badge is still being fetched: its alt text, not its picture
-        settle(rt, cx, |cx| editor.read_with(cx, |e, _| e.images.len() == 4));
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| e.images.len() == 5));
         cx.run_until_parked();
         let scale = cx.update(|window, _| window.scale_factor());
         let bounds = |cx: &mut gpui::VisualTestContext, key: &'static str| cx.debug_bounds(key).map(|b| (f32::from(b.size.width), f32::from(b.size.height)));
@@ -2512,11 +2513,12 @@ mod tests {
         assert_eq!(bounds(cx, "editor-md-5-image-0-picture"), Some((772., 386.)), "an SVG asked for 860 wide in a 772 column");
         assert_eq!(bounds(cx, "editor-md-6-image-0-picture"), Some((48., 48.)), "an image with an empty alt draws, beside the heading's text");
         assert!(cx.debug_bounds("editor-md-6-image-0-alt").is_none());
+        assert_eq!(bounds(cx, "editor-md-7-image-0-picture"), Some((120., 60.)), "an SVG with no width of its own at its own size");
         assert!(bounds(cx, "editor-md-3-image-0-picture").is_none() && cx.debug_bounds("editor-md-3-image-0-alt").is_some(), "the badge's alt text until it is in");
         assert!(cx.debug_bounds("editor-md-4-image-0-alt").is_some(), "plain http is never fetched: its alt text stays");
         // the badge lands: its picture replaces its alt text
         release.send(()).unwrap();
-        settle(rt, cx, |cx| editor.read_with(cx, |e, _| e.images.len() == 5));
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| e.images.len() == 6));
         cx.run_until_parked();
         assert_eq!(bounds(cx, "editor-md-3-image-0-picture"), Some((60. / scale, 30. / scale)));
         assert!(cx.debug_bounds("editor-md-3-image-0-alt").is_none());
