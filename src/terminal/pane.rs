@@ -266,6 +266,9 @@ pub struct PaneTerminal {
     parked: bool,
     /// Resumed with a grid measured before: the next measure attaches, as a new pane's first one does.
     attach_on_measure: bool,
+    /// How the reader's web images are fetched, and where they are kept.
+    image_fetch: crate::ui::viewer::Fetch,
+    image_cache: PathBuf,
     /// Attaches begun, for the tests.
     #[cfg(test)]
     attaches: usize,
@@ -326,6 +329,8 @@ impl PaneTerminal {
             images: Vec::new(),
             parked: false,
             attach_on_measure: false,
+            image_fetch: std::sync::Arc::new(crate::ui::viewer::fetch_https),
+            image_cache: crate::settings::cache_dir().join("images"),
             #[cfg(test)]
             attaches: 0,
         }
@@ -863,9 +868,7 @@ impl PaneTerminal {
                 return file.local_copy().await.map(Opened::Image);
             }
             if !file.dir && is_markdown(&file.path) {
-                let text = String::from_utf8_lossy(&file.bytes().await?).into_owned();
-                let blocks = crate::ui::review::markdown(&text);
-                return Some(Opened::Markdown { file, cwd, text, blocks });
+                return open_markdown(file, cwd).await;
             }
             open_at(&client, editor, &file, line, col, Some((&pane_id, &cwd))).await.err().map(Opened::Failed)
         });
@@ -887,40 +890,31 @@ impl PaneTerminal {
         cx.notify();
     }
 
-    /// Fetches the reader's images into files here, a machine's over SSH and a web one over HTTPS, and shows each
-    /// set as it arrives; until then their alt text stands in.
+    /// Brings the reader's images in as files here (see [`reader_image`]), a few at a time, each shown as it lands;
+    /// until then (and for one that never does) its alt text stands in.
     fn load_images(&mut self, cx: &mut Context<Self>) {
         let Some(r) = self.reader.as_ref().map(|r| &r.value) else { return };
-        let mut sources = Vec::new();
-        image_sources(&r.blocks, &mut sources);
+        let sources = crate::ui::markdown::image_sources(&r.blocks);
         let Some(PaneQueries(_, rt)) = cx.try_global::<PaneQueries>().filter(|_| !sources.is_empty()) else { return };
-        let (dir, machine, opened) = (r.file.path.parent().map(Path::to_path_buf).unwrap_or_default(), r.file.machine.clone(), r.opened);
-        // ponytail: one image after another; in parallel if a page with many over SSH ever loads slowly
-        let loaded = rt.spawn(async move {
-            let mut images = std::collections::HashMap::new();
-            for source in sources {
-                let path = if source.starts_with("https://") || source.starts_with("http://") {
-                    download(&source).await
-                } else {
-                    let path = dir.join(percent_encoding::percent_decode_str(&source).decode_utf8_lossy().as_ref());
-                    File { path, dir: false, machine: machine.clone() }.local_copy().await
-                };
-                if let Some(path) = path {
-                    images.insert(source, path);
-                }
-            }
-            images
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(images) = loaded.await else { return };
-            let _ = this.update(cx, |pane, cx| {
-                if let Some(reader) = pane.reader.as_mut().filter(|r| r.value.opened == opened) {
-                    reader.value.images = std::sync::Arc::new(images);
-                    cx.notify();
-                }
+        let (document, machine, opened) = (r.file.path.clone(), r.file.machine.clone(), r.opened);
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(crate::ui::viewer::FETCHES));
+        for source in sources {
+            let (name, document, machine, fetch, cache, slots) = (source.clone(), document.clone(), machine.clone(), self.image_fetch.clone(), self.image_cache.clone(), slots.clone());
+            let job = rt.spawn(async move {
+                let _slot = slots.acquire().await.ok()?;
+                reader_image(&name, document, machine, fetch, cache).await
             });
-        })
-        .detach();
+            cx.spawn(async move |this, cx| {
+                let Ok(Some(found)) = job.await else { return };
+                let _ = this.update(cx, |pane, cx| {
+                    if let Some(reader) = pane.reader.as_mut().filter(|r| r.value.opened == opened) {
+                        std::sync::Arc::make_mut(&mut reader.value.images).insert(source, found);
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
     }
 
     /// A link clicked in the reader (the web's open in the browser, in `ui::markdown`): a file, from the document's
@@ -1118,7 +1112,11 @@ impl PaneTerminal {
         let frame = PreviewFrame::of(window, grown(reader, r.opened, window));
         let name = r.file.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let (images, pane) = (r.images.clone(), cx.entity().downgrade());
-        let look = crate::ui::markdown::Look { document: true, image: Some(std::rc::Rc::new(move |source: &str| images.get(source).cloned())) };
+        // a picture keeps its proportions in a column narrower than it: its size is told before it is drawn
+        for (file, content) in images.values() {
+            crate::ui::viewer::note_size(file, content, window.scale_factor());
+        }
+        let look = crate::ui::markdown::Look { document: true, image: Some(std::rc::Rc::new(move |source: &str| images.get(source).map(|(file, _)| file.clone()))) };
         // links resolve from the file's folder, inside the pane's folder when the file is in it
         let dir = r.file.path.parent().map(Path::to_path_buf).unwrap_or_default();
         let root = if r.file.path.starts_with(&r.cwd) { PathBuf::from(&r.cwd) } else { dir };
@@ -1481,48 +1479,36 @@ pub struct Reader {
     /// The file's Markdown, for the copy button.
     text: String,
     blocks: Vec<crate::ui::review::Block>,
-    /// The images fetched so far, by their source in the file.
-    images: std::sync::Arc<std::collections::HashMap<String, PathBuf>>,
+    /// The images that are in so far, by their source in the file: each a file here, with what the viewer's limits made of it.
+    images: std::sync::Arc<std::collections::HashMap<String, (PathBuf, crate::files::content::Content)>>,
     scroll: gpui::ScrollHandle,
     opened: std::time::Instant,
     /// The copy button shows a check for a moment after a copy.
     copied: bool,
 }
 
-/// The images' sources in `blocks`, each once, in document order.
-fn image_sources(blocks: &[crate::ui::review::Block], out: &mut Vec<String>) {
-    use crate::ui::review::Block;
-    let runs = |runs: &[crate::ui::review::InlineRun], out: &mut Vec<String>| {
-        for image in runs.iter().filter_map(|r| r.style.image.as_ref()) {
-            if !out.contains(&image.source) {
-                out.push(image.source.clone());
-            }
+/// The reader's image `source` as a file here, within the viewer's limits (`content::load`): a web one only over
+/// https, through the viewer's fetch and cache (`fetch` into `cache`); a relative one is the file beside `document`, a
+/// machine's copied over SSH first. `None` when it is not there, or is no picture within the limits.
+async fn reader_image(source: &str, document: PathBuf, machine: Option<String>, fetch: crate::ui::viewer::Fetch, cache: PathBuf) -> Option<(PathBuf, crate::files::content::Content)> {
+    use crate::files::content::{self, Content};
+    match crate::ui::markdown::scheme(source.trim()).as_deref() {
+        Some("https") => {
+            let name = source.to_string();
+            tokio::task::spawn_blocking(move || crate::ui::viewer::image_file(&name, &document, None, &cache, fetch.as_ref())).await.ok()?
         }
-    };
-    for block in blocks {
-        match block {
-            Block::Paragraph { runs: r } | Block::Heading { runs: r, .. } => runs(r, out),
-            Block::BlockQuote { children } => image_sources(children, out),
-            Block::List { items, .. } => items.iter().for_each(|item| image_sources(item, out)),
-            Block::Table { header, rows, .. } => header.iter().chain(rows.iter().flatten()).for_each(|cell| runs(cell, out)),
-            _ => {}
+        Some(_) => None,
+        None => {
+            let path = document.parent()?.join(percent_encoding::percent_decode_str(source).decode_utf8_lossy().as_ref());
+            let path = File { path, dir: false, machine }.local_copy().await?;
+            tokio::task::spawn_blocking(move || match content::load(&path) {
+                content @ (Content::Image(..) | Content::Svg(..)) => Some((path, content)),
+                _ => None,
+            })
+            .await
+            .ok()?
         }
     }
-}
-
-/// A web image, downloaded into the cache under the extension its type has (a badge's URL often has none).
-async fn download(url: &str) -> Option<PathBuf> {
-    let url = url.to_string();
-    let fetched = tokio::task::spawn_blocking(move || {
-        let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(15))).build().into();
-        let mut response = agent.get(&url).call().ok()?;
-        let kind = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
-        let bytes = response.body_mut().with_config().limit(32 << 20).read_to_vec().ok()?;
-        let ext = ["svg", "png", "gif", "webp", "jpeg"].into_iter().find(|e| kind.contains(e)).unwrap_or("png");
-        Some((bytes, format!("image.{ext}")))
-    });
-    let (bytes, name) = fetched.await.ok()??;
-    cache_copy(&name, bytes).await
 }
 
 /// `bytes` as a file named `name` in the cache, under their hash: gpui keeps an image by its path, so a changed file
@@ -1540,6 +1526,13 @@ async fn cache_copy(name: &str, bytes: Vec<u8>) -> Option<PathBuf> {
     let copy = dir.join(name);
     tokio::fs::write(&copy, bytes).await.ok()?;
     Some(copy)
+}
+
+/// A Markdown file for the reader: its text, and its blocks read as a document (an HTML `<img>` is an image there).
+async fn open_markdown(file: File, cwd: String) -> Option<Opened> {
+    let text = String::from_utf8_lossy(&file.bytes().await?).into_owned();
+    let blocks = crate::ui::review::markdown_document(&text);
+    Some(Opened::Markdown { file, cwd, text, blocks })
 }
 
 /// What a Cmd+click opens over the pane.
@@ -2283,6 +2276,123 @@ mod tests {
         });
         pane.update(cx, |p, cx| p.on_grid_metrics(geometry(110, 40), cx));
         pane.read_with(cx, |p, _| assert_eq!(p.attaches, 2, "one attach"));
+    }
+
+    /// The Quick Look reader draws a README's images as the file viewer's preview does: a markdown one and HTML ones
+    /// (alone, in a `<p><a>`, in a heading with an empty alt), local and remote, the remote one its alt text until it
+    /// lands; each no wider than the column and at its `width` when it has one.
+    #[gpui::test]
+    fn the_reader_shows_alt_text_then_the_image_and_keeps_its_proportions(cx: &mut gpui::TestAppContext) {
+        use crate::ui::viewer::test_support::{Calls, png, runtime, settle, waiting_for};
+        unsafe {
+            std::env::set_var("SHEPHERD_HERDR", "/nonexistent/herdr");
+            std::env::set_var("HERDR_CLIENT_SOCKET_PATH", "/nonexistent/herdr-client.sock");
+        }
+        let rt = &runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("README.md");
+        let text = "![dot](dot.png)\n\n<img src=\"dot.png\" width=\"40\" alt=\"narrow\">\n\n<img src=\"big.png\" alt=\"big\">\n\n<p><a href=\"LICENSE\"><img src=\"https://img.example.net/badge.png\" alt=\"badge\"></a></p>\n\n<img src=\"http://img.example.net/plain.png\" alt=\"plain\">\n\n<p align=\"center\">\n  <img src=\"hero.svg\" alt=\"hero\" width=\"860\">\n</p>\n\n<h1 align=\"center\"><img src=\"icon.svg\" width=\"48\" alt=\"\"> Acme</h1>\n\n<img src=\"logo.svg\" alt=\"logo\">\n\n![bad](notes.txt)\n";
+        std::fs::write(&path, text).unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "not a picture").unwrap();
+        std::fs::write(dir.path().join("logo.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"120\" height=\"60\" viewBox=\"0 0 120 60\"></svg>").unwrap();
+        std::fs::write(dir.path().join("dot.png"), png(100, 50)).unwrap();
+        std::fs::write(dir.path().join("big.png"), png(2000, 1000)).unwrap();
+        std::fs::write(dir.path().join("hero.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1200\" height=\"600\" viewBox=\"0 0 1200 600\"></svg>").unwrap();
+        std::fs::write(dir.path().join("icon.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\" viewBox=\"0 0 64 64\"></svg>").unwrap();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let noted = Calls::default();
+        let fetch = waiting_for(gate, png(60, 30), noted.clone());
+        cx.update(|cx| {
+            cx.set_global(crate::settings::Settings::default().theme(gpui::WindowAppearance::Dark));
+            cx.set_global(PaneQueries(Client::at(dir.path().join("herdr.sock")), rt.handle().clone()));
+        });
+        let (pane, cx) = cx.add_window_view(|_, cx| {
+            let mut pane = PaneTerminal::new("w1:p1".into(), cx);
+            // parked: its first measure does not attach, and herdr's missing binary does not end the pane (which would show that instead)
+            pane.park(cx);
+            pane
+        });
+        let cx: &'static mut gpui::VisualTestContext = Box::leak(Box::new(cx.clone()));
+        // a window wide enough that the card (85%) holds the reader's whole column: 800, less 24 a side
+        cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+        pane.update(cx, |p, _| (p.image_fetch, p.image_cache) = (fetch, dir.path().join("cache")));
+        let file = File { path: path.clone(), dir: false, machine: None };
+        let blocks = crate::ui::review::markdown_document(text);
+        pane.update(cx, |p, cx| p.show_reader(file, dir.path().to_string_lossy().into_owned(), text.to_string(), blocks, cx));
+        // the local ones come in; the badge is still being fetched: its alt text, not its picture
+        settle(rt, cx, |cx| pane.read_with(cx, |p, _| p.reader.as_ref().is_some_and(|r| r.value.images.len() == 5)));
+        // the card has grown into place
+        std::thread::sleep(PREVIEW_IN + std::time::Duration::from_millis(50));
+        pane.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        let scale = cx.update(|window, _| window.scale_factor());
+        let bounds = |cx: &mut gpui::VisualTestContext, key: &'static str| cx.debug_bounds(key).map(|b| (f32::from(b.size.width), f32::from(b.size.height)));
+        assert_eq!(bounds(cx, "reader-md-0-image-0-picture"), Some((100. / scale, 50. / scale)), "a markdown image at its own size");
+        assert_eq!(bounds(cx, "reader-md-1-image-0-picture"), Some((40., 20.)), "an HTML width caps it, its proportions kept");
+        assert_eq!(bounds(cx, "reader-md-2-image-0-picture"), Some((752., 376.)), "wider than the column: the column's width, its proportions kept");
+        assert_eq!(bounds(cx, "reader-md-5-image-0-picture"), Some((752., 376.)), "an SVG asked for 860 wide in a 752 column");
+        assert_eq!(bounds(cx, "reader-md-6-image-0-picture"), Some((48., 48.)), "an image with an empty alt draws, beside the heading's text");
+        assert!(cx.debug_bounds("reader-md-6-image-0-alt").is_none());
+        assert_eq!(bounds(cx, "reader-md-7-image-0-picture"), Some((120., 60.)), "an SVG with no width of its own at its own size");
+        assert!(cx.debug_bounds("reader-md-8-image-0-alt").is_some() && bounds(cx, "reader-md-8-image-0-picture").is_none(), "a file that is no picture keeps its alt text");
+        assert!(bounds(cx, "reader-md-3-image-0-picture").is_none() && cx.debug_bounds("reader-md-3-image-0-alt").is_some(), "the badge's alt text until it is in");
+        assert!(cx.debug_bounds("reader-md-4-image-0-alt").is_some(), "plain http is never fetched: its alt text stays");
+        // the badge lands: its picture replaces its alt text
+        release.send(()).unwrap();
+        settle(rt, cx, |cx| pane.read_with(cx, |p, _| p.reader.as_ref().is_some_and(|r| r.value.images.len() == 6)));
+        cx.run_until_parked();
+        assert_eq!(bounds(cx, "reader-md-3-image-0-picture"), Some((60. / scale, 30. / scale)));
+        assert!(cx.debug_bounds("reader-md-3-image-0-alt").is_none());
+        let asked_of = |url: &str| noted.lock().unwrap().iter().filter(|u| u.ends_with(url)).count();
+        assert_eq!((asked_of("badge.png"), asked_of("plain.png")), (1, 0));
+    }
+
+    /// Shepherd's own README in the Quick Look reader at the widths a window has: no paragraph drawn over another. The
+    /// reader's column is a flex column whose own width `max_w` clamps (unlike the file preview's, whose items were
+    /// clamped one by one under a window-wide container), so its paragraphs are sized at the column's width: this
+    /// holds as it is, and fails if the paragraphs go back under a window-wide flex container.
+    #[gpui::test]
+    fn the_readers_column_paints_no_block_over_another(cx: &mut gpui::TestAppContext) {
+        unsafe {
+            std::env::set_var("SHEPHERD_HERDR", "/nonexistent/herdr");
+            std::env::set_var("HERDR_CLIENT_SOCKET_PATH", "/nonexistent/herdr-client.sock");
+        }
+        cx.update(|cx| cx.set_global(crate::settings::Settings::default().theme(gpui::WindowAppearance::Dark)));
+        let (pane, cx) = cx.add_window_view(|_, cx| {
+            let mut pane = PaneTerminal::new("w1:p1".into(), cx);
+            // parked: its first measure does not attach, and herdr's missing binary does not end the pane
+            pane.park(cx);
+            pane
+        });
+        let text = include_str!("../../README.md");
+        let file = File { path: PathBuf::from("/nonexistent/README.md"), dir: false, machine: None };
+        let blocks = crate::ui::review::markdown_document(text);
+        pane.update(cx, |p, cx| p.show_reader(file, "/nonexistent".into(), text.to_string(), blocks, cx));
+        // the card has grown into place
+        std::thread::sleep(PREVIEW_IN + std::time::Duration::from_millis(50));
+        for width in [1400., 900., 600., 400.] {
+            cx.simulate_resize(gpui::size(px(width), px(900.)));
+            pane.update(cx, |_, cx| cx.notify());
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            let painted = crate::ui::markdown::painted_count();
+            assert!(painted > 100, "at {width} px only {painted} paragraphs were painted");
+            let found = crate::ui::markdown::overlaps();
+            assert!(found.is_empty(), "at {width} px: {found:#?}");
+        }
+    }
+
+    /// A Markdown file opened for the reader is read as a document: its HTML images are image runs.
+    #[test]
+    fn a_markdown_file_opens_in_the_reader_with_its_html_images() {
+        let rt = crate::ui::viewer::test_support::runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("README.md");
+        std::fs::write(&path, "<p align=\"center\"><img src=\"hero.svg\" alt=\"hero\"></p>\n\n![dot](dot.png)\n").unwrap();
+        let file = File { path, dir: false, machine: None };
+        let Some(Opened::Markdown { blocks, text, .. }) = rt.block_on(open_markdown(file, dir.path().to_string_lossy().into_owned())) else { panic!("not a Markdown file") };
+        assert_eq!(crate::ui::markdown::image_sources(&blocks), ["hero.svg", "dot.png"]);
+        assert!(text.contains("<img"), "the text is the file's, for the copy button");
     }
 
     #[gpui::test]

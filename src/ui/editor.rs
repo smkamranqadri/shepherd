@@ -40,7 +40,7 @@ use crate::ui::diff_view::DiffView;
 use crate::ui::editor_highlight::{SyntectHighlighter, editor_style};
 use crate::ui::markdown::{Link, Links};
 use crate::ui::review::Block;
-use crate::ui::viewer::{FileViewer, ViewerEvent};
+use crate::ui::viewer::{FileViewer, PreviewImages, ViewerEvent};
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
     ParentElement, PromptLevel, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, canvas, div, point,
@@ -269,7 +269,7 @@ fn read_for_edit(path: &Path, root: Option<&Path>, force: bool) -> Loaded {
         // its contexts load on first use: here, not on the main thread when the editor makes its highlighter
         let _ = highlight::start(syntax);
     }
-    let blocks = (kind == FileKind::Markdown && text.text.len() <= crate::ui::viewer::MAX_PREVIEW).then(|| crate::ui::review::markdown(&text.text));
+    let blocks = (kind == FileKind::Markdown && text.text.len() <= crate::ui::viewer::MAX_PREVIEW).then(|| crate::ui::review::markdown_document(&text.text));
     let real_root = blocks.as_ref().and(root).and_then(|r| r.canonicalize().ok());
     let sample = || text.lines().take(2000);
     let hard_tabs = sample().filter(|l| l.starts_with('\t')).count() > sample().filter(|l| l.starts_with("  ")).count();
@@ -493,6 +493,8 @@ pub struct FileEditor {
     /// Markdown shows as its preview, not its source.
     preview: bool,
     preview_scroll: ScrollHandle,
+    /// The preview's images.
+    images: PreviewImages,
     goto: Option<Goto>,
     restore: Option<Place>,
     banner: Option<Banner>,
@@ -595,6 +597,7 @@ impl FileEditor {
             body: Body::Loading,
             preview: true,
             preview_scroll: ScrollHandle::new(),
+            images: PreviewImages::new(),
             goto: None,
             restore: None,
             banner: None,
@@ -796,6 +799,7 @@ impl FileEditor {
         (self.goto, self.restore, self.banner) = (goto, restore, None);
         (self.saving, self.queued) = (None, None);
         (self.preview, self.preview_scroll) = (true, ScrollHandle::new());
+        self.images.reset();
         (self.gutter, self.blobs, self.gutter_stale) = (Arc::default(), Blobs::default(), false);
         (self.kept, self.explicit, self.ask_on_look) = (None, false, false);
         (self.draft, self.draft_wait) = (None, None);
@@ -873,6 +877,7 @@ impl FileEditor {
         let markdown = blocks.is_some();
         let tracker = Tracker::new(saved);
         self.body = Body::Edit(Box::new(Edit { state: state.clone(), baseline, tracker, readonly, blocks, real_root, _events: events, _activation: activation }));
+        self.load_images(window, cx);
         self.watch_disk(window, cx);
         self.draft = self.drafts.clone().map(|dir| drafts::Slot::new(dir, self.path.clone()));
         let mut restored = false;
@@ -936,7 +941,8 @@ impl FileEditor {
     }
 
     /// Lets go of what it holds outside itself: the viewer's image and highlight, the gutter's git and diff.
-    pub fn release(&mut self, window: Option<&mut Window>, cx: &mut App) {
+    pub fn release(&mut self, mut window: Option<&mut Window>, cx: &mut App) {
+        self.images.evict(window.as_deref_mut(), cx);
         if let Body::View { viewer, .. } = &self.body {
             viewer.update(cx, |v, cx| v.release(window, cx));
         }
@@ -948,8 +954,9 @@ impl FileEditor {
     }
 
     /// Out of sight: the viewer's image leaves gpui's cache, and unsaved changes are kept as a draft now.
-    pub fn hide(&mut self, window: Option<&mut Window>, cx: &mut App) {
+    pub fn hide(&mut self, mut window: Option<&mut Window>, cx: &mut App) {
         self.write_draft(cx);
+        self.images.evict(window.as_deref_mut(), cx);
         if let Body::View { viewer, .. } = &self.body {
             viewer.update(cx, |v, cx| v.evict_image(window, cx));
         }
@@ -1460,6 +1467,10 @@ impl FileEditor {
         rebase(&mut e.tracker, &mut e.baseline, &file);
         let Editable { text, readonly, blocks, real_root, .. } = file;
         (e.readonly, e.blocks, e.real_root) = (readonly, blocks, real_root);
+        // the files may have changed with the text: the pictures are read afresh
+        self.images.evict(Some(&mut *window), cx);
+        self.load_images(window, cx);
+        let Body::Edit(e) = &mut self.body else { return };
         e.state.update(cx, |s, cx| {
             s.set_readonly(readonly.is_some(), cx);
             s.replace_all(text, window, cx);
@@ -2102,6 +2113,14 @@ impl FileEditor {
         }
     }
 
+    /// Brings the open markdown file's images in (see [`PreviewImages::load`]).
+    fn load_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Body::Edit(e) = &self.body else { return };
+        if let Some(blocks) = e.blocks.as_deref() {
+            self.images.load(blocks, &self.path, e.real_root.as_deref(), &self.rt, window, cx, |e| &mut e.images);
+        }
+    }
+
     fn preview_body(&self, e: &Edit, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let blocks = e.blocks.as_deref().unwrap_or_default();
         let links = match &e.real_root {
@@ -2113,7 +2132,7 @@ impl FileEditor {
             }
             None => Links::web(),
         };
-        crate::ui::viewer::markdown_preview("editor-md", blocks, &links, &self.preview_scroll, theme)
+        crate::ui::viewer::markdown_preview_with("editor-md", blocks, &links, &self.preview_scroll, theme, &self.images.look())
     }
 }
 
@@ -2434,6 +2453,108 @@ mod tests {
             k += 1;
             k > n
         });
+    }
+
+    /// A window with an editor that fetches images through `fetch` into `cache`, wide enough for the preview's whole
+    /// column, on `path` (in `root`) once its text is in.
+    fn image_editor(
+        cx: &mut gpui::TestAppContext,
+        rt: &tokio::runtime::Runtime,
+        root: &Path,
+        path: &Path,
+        fetch: crate::ui::viewer::Fetch,
+        cache: PathBuf,
+    ) -> (Entity<FileEditor>, &'static mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(crate::settings::Settings::default().theme(gpui::WindowAppearance::Dark));
+        });
+        let handle = rt.handle().clone();
+        let (editor, cx) = cx.add_window_view(|_, cx| FileEditor::new(handle, cx));
+        let cx: &'static mut gpui::VisualTestContext = Box::leak(Box::new(cx.clone()));
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        editor.update(cx, |e, _| e.images = PreviewImages::serving(fetch, cache));
+        open_again(&editor, cx, rt, root, path, None);
+        (editor, cx)
+    }
+
+    /// A Markdown file opened from the Files tab opens in the editor: its preview draws images as the viewer's does, a
+    /// markdown one and HTML ones (alone, in a `<p><a>`, in a heading with an empty alt), local and remote, the remote
+    /// one its alt text until it lands, each no wider than the column and at its `width` when it has one.
+    #[gpui::test]
+    fn the_editors_preview_shows_alt_text_then_the_image_and_keeps_its_proportions(cx: &mut gpui::TestAppContext) {
+        use crate::ui::viewer::test_support::{Calls, png, waiting_for};
+        let rt = &runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("README.md");
+        std::fs::write(
+            &path,
+            "![dot](dot.png)\n\n<img src=\"dot.png\" width=\"40\" alt=\"narrow\">\n\n<img src=\"big.png\" alt=\"big\">\n\n<p><a href=\"LICENSE\"><img src=\"https://img.example.net/badge.png\" alt=\"badge\"></a></p>\n\n<img src=\"http://img.example.net/plain.png\" alt=\"plain\">\n\n<p align=\"center\">\n  <img src=\"hero.svg\" alt=\"hero\" width=\"860\">\n</p>\n\n<h1 align=\"center\"><img src=\"icon.svg\" width=\"48\" alt=\"\"> Acme</h1>\n\n<img src=\"logo.svg\" alt=\"logo\">\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("logo.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"120\" height=\"60\" viewBox=\"0 0 120 60\"></svg>").unwrap();
+        std::fs::write(dir.path().join("dot.png"), png(100, 50)).unwrap();
+        std::fs::write(dir.path().join("big.png"), png(2000, 1000)).unwrap();
+        std::fs::write(dir.path().join("hero.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1200\" height=\"600\" viewBox=\"0 0 1200 600\"></svg>").unwrap();
+        std::fs::write(dir.path().join("icon.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\" viewBox=\"0 0 64 64\"></svg>").unwrap();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let noted = Calls::default();
+        let (editor, cx) = image_editor(cx, rt, dir.path(), &path, waiting_for(gate, png(60, 30), noted.clone()), dir.path().join("cache"));
+        // the local ones come in; the badge is still being fetched: its alt text, not its picture
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| e.images.len() == 5));
+        cx.run_until_parked();
+        let scale = cx.update(|window, _| window.scale_factor());
+        let bounds = |cx: &mut gpui::VisualTestContext, key: &'static str| cx.debug_bounds(key).map(|b| (f32::from(b.size.width), f32::from(b.size.height)));
+        assert!(editor.read_with(cx, |e, _| e.preview_shown()), "the preview is what shows");
+        assert_eq!(bounds(cx, "editor-md-0-image-0-picture"), Some((100. / scale, 50. / scale)), "a markdown image at its own size");
+        assert_eq!(bounds(cx, "editor-md-1-image-0-picture"), Some((40., 20.)), "an HTML width caps it, its proportions kept");
+        // the column is 820 wide with 24 each side: 772
+        assert_eq!(bounds(cx, "editor-md-2-image-0-picture"), Some((772., 386.)), "wider than the column: the column's width, its proportions kept");
+        assert_eq!(bounds(cx, "editor-md-5-image-0-picture"), Some((772., 386.)), "an SVG asked for 860 wide in a 772 column");
+        assert_eq!(bounds(cx, "editor-md-6-image-0-picture"), Some((48., 48.)), "an image with an empty alt draws, beside the heading's text");
+        assert!(cx.debug_bounds("editor-md-6-image-0-alt").is_none());
+        assert_eq!(bounds(cx, "editor-md-7-image-0-picture"), Some((120., 60.)), "an SVG with no width of its own at its own size");
+        assert!(bounds(cx, "editor-md-3-image-0-picture").is_none() && cx.debug_bounds("editor-md-3-image-0-alt").is_some(), "the badge's alt text until it is in");
+        assert!(cx.debug_bounds("editor-md-4-image-0-alt").is_some(), "plain http is never fetched: its alt text stays");
+        // the badge lands: its picture replaces its alt text
+        release.send(()).unwrap();
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| e.images.len() == 6));
+        cx.run_until_parked();
+        assert_eq!(bounds(cx, "editor-md-3-image-0-picture"), Some((60. / scale, 30. / scale)));
+        assert!(cx.debug_bounds("editor-md-3-image-0-alt").is_none());
+        let asked_of = |url: &str| noted.lock().unwrap().iter().filter(|u| u.ends_with(url)).count();
+        assert_eq!((asked_of("badge.png"), asked_of("plain.png")), (1, 0));
+        // the file changed on disk: the preview follows with the new file's pictures
+        std::fs::write(&path, "![new](new.png)\n").unwrap();
+        std::fs::write(dir.path().join("new.png"), png(30, 10)).unwrap();
+        editor.update_in(cx, |e, window, cx| e.check_disk(false, window, cx));
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| e.images.sources().contains(&"new.png")));
+        cx.run_until_parked();
+        assert_eq!(bounds(cx, "editor-md-0-image-0-picture"), Some((30. / scale, 10. / scale)), "an image of the reloaded text");
+    }
+
+    /// An image whose fetch ends after another file was opened is not shown with it.
+    #[gpui::test]
+    fn an_image_landing_in_the_editor_after_another_file_opened_is_dropped(cx: &mut gpui::TestAppContext) {
+        use crate::ui::viewer::test_support::{Calls, png, waiting_for};
+        let rt = &runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("a.md"), dir.path().join("b.md"));
+        std::fs::write(&first, "<img src=\"https://img.example.net/badge.png\" alt=\"badge\">\n").unwrap();
+        std::fs::write(&second, "![dot](dot.png)\n").unwrap();
+        std::fs::write(dir.path().join("dot.png"), png(4, 4)).unwrap();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let noted = Calls::default();
+        let cache = dir.path().join("cache");
+        let (editor, cx) = image_editor(cx, rt, dir.path(), &first, waiting_for(gate, png(6, 3), noted.clone()), cache.clone());
+        settle(rt, cx, |_| !noted.lock().unwrap().is_empty());
+        open_again(&editor, cx, rt, dir.path(), &second, None);
+        settle(rt, cx, |cx| editor.read_with(cx, |e, _| e.images.len() == 1));
+        // the first file's fetch now ends: it is in the cache, not on the second file's page
+        release.send(()).unwrap();
+        settle(rt, cx, |_| std::fs::read_dir(&cache).is_ok_and(|d| d.count() == 1));
+        rounds(rt, cx, 20);
+        editor.read_with(cx, |e, _| assert_eq!(e.images.sources(), ["dot.png"]));
     }
 
     #[gpui::test]
