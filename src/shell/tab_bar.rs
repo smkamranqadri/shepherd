@@ -724,7 +724,7 @@ impl Shell {
             // the top and bottom, and clear of the window's buttons while no right panel sits under them
             .pr(px(TAB_TOP + if self.panel_open { 0. } else { window_controls_w(cx) }))
             // clear the traffic lights and the sidebar toggle once the sidebar no longer sits under them
-            .pl(px((TITLEBAR_CLUSTER - sidebar_w).max(8.)))
+            .pl(px(titlebar_clear(sidebar_w, is_dev_build())))
             .child(
                 div()
                     // off macOS the `+` follows the last tab, apart from the window's buttons at the right end

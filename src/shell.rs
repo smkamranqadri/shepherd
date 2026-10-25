@@ -73,8 +73,21 @@ fn window_controls_w(cx: &App) -> f32 {
 }
 /// Centre line of the traffic lights (placed at y 14), measured on a 2x screen; the toggle centres on it, not on the titlebar.
 const TRAFFIC_LIGHTS_CENTER: f32 = 21.25;
-/// The Agents list's least height when dragged: one agent row and a bit.
-const TITLEBAR_CLUSTER: f32 = TOGGLE_LEFT + 24.0 + 8.0;
+/// The dev build's badge in the titlebar, right after the sidebar toggle: a fixed size and gap, so the cluster is as
+/// wide as the badge is drawn.
+const DEV_BADGE_W: f32 = 30.0;
+const DEV_BADGE_H: f32 = 16.0;
+const DEV_BADGE_GAP: f32 = 6.0;
+/// The titlebar's left cluster, to where the tabs and the sidebar's buttons may begin: the traffic lights, the toggle,
+/// the dev build's badge (`badge`), and 8 px.
+fn titlebar_cluster(badge: bool) -> f32 {
+    TOGGLE_LEFT + 24.0 + if badge { DEV_BADGE_GAP + DEV_BADGE_W } else { 0. } + 8.0
+}
+
+/// The tab bar's left padding: clear of the cluster once the sidebar (`sidebar_w` wide) no longer sits under it.
+fn titlebar_clear(sidebar_w: f32, badge: bool) -> f32 {
+    (titlebar_cluster(badge) - sidebar_w).max(8.)
+}
 
 pub struct Shell {
     snapshot: Option<Snapshot>,
@@ -1792,6 +1805,7 @@ impl Render for Shell {
         let settings_page = self.settings.as_ref().map(|(view, _)| view.clone());
         let on_page = settings_page.is_some();
         let focus_on = SettingsGlobal::of(cx).settings.sidebar_focus;
+        let titlebar = sidebar_focus::titlebar_parts(&theme, sidebar_w, is_dev_build(), focus_on);
         let panel = (self.panel_open && !on_page).then(|| self.render_right_panel(&theme, &shown, window, cx));
         // the side panel gone from view (closed, the PR tab now there, the settings page) keeps no keyboard focus
         let side_shown = self.panel_open && !on_page && self.shown_panel_tab() != crate::settings::PanelTab::Pr;
@@ -2084,9 +2098,11 @@ impl Render for Shell {
                         })),
                 )
             })
+            // The dev build's badge, after the toggle (and hidden with it).
+            .when_some(titlebar.badge.filter(|_| !on_page), |el, badge| el.child(badge))
             // The Focus chip of focus mode, before the `…`: it turns focus mode off, with the sessions bar too (it
             // filters the shown session there).
-            .when_some(focus_on.then(|| sidebar_focus::titlebar_chip(&theme, sidebar_w)).flatten().filter(|_| !on_page), |el, chip| {
+            .when_some(titlebar.chip.filter(|_| !on_page), |el, chip| {
                 el.child(chip.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     cx.stop_propagation();
                     this.toggle_focus_mode(cx);
@@ -2094,14 +2110,10 @@ impl Render for Shell {
             })
             // Zeron's sidebar `…`: in the titlebar at the sidebar's right edge, hidden once the sidebar is too
             // narrow to hold it beside the toggle.
-            .when_some(sidebar_focus::view_button_left(sidebar_w).filter(|_| !on_page), |el, left| {
+            .when_some(titlebar.more.filter(|_| !on_page), |el, more| {
                 el.child(
-                    titlebar_button(&theme, "sidebar-view", "icons/more-horizontal.svg")
-                        .debug_selector(|| "sidebar-view".into())
+                    more
                         .tooltip(tip("Sidebar view", None))
-                        .absolute()
-                        .top(px(TRAFFIC_LIGHTS_CENTER - 12.))
-                        .left(px(left))
                         .when(self.view_menu.as_ref().is_some_and(|m| m.is_open()), |el| el.bg(theme.hover))
                         // Capture, so a press on the open menu's trigger closes it instead of the menu's
                         // click-outside closing it and the click reopening it.

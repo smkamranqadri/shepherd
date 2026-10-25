@@ -81,20 +81,20 @@ const CHIP_GAP: f32 = 6.;
 
 /// Where the titlebar's Sidebar view ⋯ sits: at the sidebar's right edge, hidden once the sidebar is too narrow to
 /// hold it beside the toggle.
-pub(super) fn view_button_left(sidebar_w: f32) -> Option<f32> {
-    (sidebar_w >= TITLEBAR_CLUSTER + 32.).then_some(sidebar_w - 8. - 24.)
+pub(super) fn view_button_left(sidebar_w: f32, badge: bool) -> Option<f32> {
+    (sidebar_w >= titlebar_cluster(badge) + 32.).then_some(sidebar_w - 8. - 24.)
 }
 
 /// The Focus chip's left edge and width in the titlebar, right before the ⋯: its word and icon while they clear the
 /// toggle, the icon alone when only that does, and gone with the ⋯.
-pub(super) fn chip_box(sidebar_w: f32) -> Option<(f32, f32)> {
-    let right = view_button_left(sidebar_w)? - CHIP_GAP;
-    [CHIP_FULL, CHIP_ICON].into_iter().map(|w| (right - w, w)).find(|(left, _)| *left >= TITLEBAR_CLUSTER)
+pub(super) fn chip_box(sidebar_w: f32, badge: bool) -> Option<(f32, f32)> {
+    let right = view_button_left(sidebar_w, badge)? - CHIP_GAP;
+    [CHIP_FULL, CHIP_ICON].into_iter().map(|w| (right - w, w)).find(|(left, _)| *left >= titlebar_cluster(badge))
 }
 
 /// The Focus chip as the titlebar draws it, absolute at its place before the ⋯ (the caller adds its click).
-pub(super) fn titlebar_chip(theme: &Theme, sidebar_w: f32) -> Option<gpui::Stateful<Div>> {
-    let (left, width) = chip_box(sidebar_w)?;
+fn titlebar_chip(theme: &Theme, sidebar_w: f32, badge: bool) -> Option<gpui::Stateful<Div>> {
+    let (left, width) = chip_box(sidebar_w, badge)?;
     let accent = theme.accent;
     let word = width == CHIP_FULL;
     Some(
@@ -122,6 +122,28 @@ pub(super) fn titlebar_chip(theme: &Theme, sidebar_w: f32) -> Option<gpui::State
             .child(gpui::svg().path("icons/solar/target.svg").size(px(10.)).flex_none().text_color(accent))
             .when(word, |el| el.child("Focus").child(gpui::svg().path("icons/close.svg").size(px(9.)).flex_none().text_color(accent))),
     )
+}
+
+/// What the titlebar draws after the sidebar toggle, each at its place, for the shell to add its clicks to: the dev
+/// build's badge (`badge`), the Focus chip (while `focus` mode is on), and the Sidebar view ⋯.
+pub(super) struct TitlebarParts {
+    pub badge: Option<gpui::Stateful<Div>>,
+    pub chip: Option<gpui::Stateful<Div>>,
+    pub more: Option<gpui::Stateful<Div>>,
+}
+
+pub(super) fn titlebar_parts(theme: &Theme, sidebar_w: f32, badge: bool, focus: bool) -> TitlebarParts {
+    TitlebarParts {
+        badge: badge.then(|| dev_badge(theme).absolute().top(px(TRAFFIC_LIGHTS_CENTER - DEV_BADGE_H / 2.)).left(px(TOGGLE_LEFT + 24. + DEV_BADGE_GAP))),
+        chip: focus.then(|| titlebar_chip(theme, sidebar_w, badge)).flatten(),
+        more: view_button_left(sidebar_w, badge).map(|left| {
+            titlebar_button(theme, "sidebar-view", "icons/more-horizontal.svg")
+                .debug_selector(|| "sidebar-view".into())
+                .absolute()
+                .top(px(TRAFFIC_LIGHTS_CENTER - 12.))
+                .left(px(left))
+        }),
+    }
 }
 
 impl Shell {
@@ -405,72 +427,117 @@ mod tests {
         assert!(on.sidebar_focus && on.tree_agents_only() && !on.tree_one_session());
     }
 
-    /// A titlebar as the shell draws the sidebar's part of it: the toggle's place, the chip when focus mode is on, the
-    /// ⋯, all at `w` of sidebar.
+    /// A titlebar as the shell draws the sidebar's part of it: the toggle's place, then the badge, chip and ⋯ as
+    /// `titlebar_parts` builds them for the shell, all at `w` of sidebar; and a mark where the tab bar's pad (for the
+    /// sidebar closed, `w` 0) begins the tabs.
     struct Bar {
         w: f32,
         focus: bool,
+        badge: bool,
     }
 
     impl gpui::Render for Bar {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let theme = Theme::of(cx).clone();
-            let (w, focus) = (self.w, self.focus);
+            let (w, focus, badge) = (self.w, self.focus, self.badge);
+            let parts = titlebar_parts(&theme, w, badge, focus);
             div()
                 .relative()
                 .w(px(w))
                 .h(px(TITLEBAR_HEIGHT))
                 .child(div().debug_selector(|| "toggle".into()).absolute().top(px(TRAFFIC_LIGHTS_CENTER - 12.)).left(px(TOGGLE_LEFT)).size(px(24.)))
-                .when_some(focus.then(|| titlebar_chip(&theme, w)).flatten(), |el, chip| el.child(chip))
-                .when_some(view_button_left(w), |el, left| {
-                    el.child(titlebar_button(&theme, "sidebar-view", "icons/more-horizontal.svg").debug_selector(|| "sidebar-view".into()).absolute().top(px(TRAFFIC_LIGHTS_CENTER - 12.)).left(px(left)))
-                })
+                .child(div().debug_selector(|| "tabs".into()).absolute().top_0().left(px(titlebar_clear(w, badge))).size(px(10.)))
+                .children(parts.badge)
+                .children(parts.chip)
+                .children(parts.more)
         }
     }
 
-    fn bar_at(cx: &mut gpui::TestAppContext, w: f32, focus: bool) -> &'static mut gpui::VisualTestContext {
+    fn bar_at(cx: &mut gpui::TestAppContext, w: f32, focus: bool, badge: bool) -> &'static mut gpui::VisualTestContext {
         cx.update(|cx| cx.set_global(Theme::for_appearance(gpui::WindowAppearance::Dark)));
-        let (_, cx) = cx.add_window_view(|_, _| Bar { w, focus });
+        let (_, cx) = cx.add_window_view(|_, _| Bar { w, focus, badge });
         let cx: &'static mut gpui::VisualTestContext = Box::leak(Box::new(cx.clone()));
         cx.run_until_parked();
         cx
     }
 
     /// Focus on, the chip is in the titlebar before the ⋯: clear of the toggle and of the ⋯ at every width the ⋯ shows,
-    /// from the narrowest the sidebar goes to the widest, and where the word will not fit the icon alone.
+    /// from the narrowest the sidebar goes to the widest, and where the word will not fit the icon alone; with the dev
+    /// build's badge after the toggle, nothing of the three overlaps it.
     #[gpui::test]
     fn the_focus_chip_sits_in_the_titlebar_before_the_menu_button(cx: &mut gpui::TestAppContext) {
-        // the dev badge heads the sidebar's row under the titlebar, not the titlebar
-        assert!(is_dev_build(), "a test build is a dev build, with its badge");
-        for w in [crate::settings::SIDEBAR_MIN, 256., crate::settings::SIDEBAR_MAX, TITLEBAR_CLUSTER + 32., TITLEBAR_CLUSTER + 60., TITLEBAR_CLUSTER + 100., TITLEBAR_CLUSTER + 200.] {
-            let cx = bar_at(cx, w, true);
-            let toggle = cx.debug_bounds("toggle").unwrap();
-            let more = cx.debug_bounds("sidebar-view").unwrap_or_else(|| panic!("the ⋯ drawn at {w}"));
-            let chip = cx.debug_bounds("sidebar-focus-chip");
-            let Some(chip) = chip else {
-                assert!(w < TITLEBAR_CLUSTER + 100., "no chip at {w}, where the icon fits");
-                continue;
-            };
-            assert!(chip.left() >= toggle.right(), "{w}: chip {:?} over the toggle {:?}", chip, toggle);
-            assert!(chip.right() <= more.left(), "{w}: chip {:?} over the ⋯ {:?}", chip, more);
-            assert!(chip.right() <= px(w), "{w}: chip inside the sidebar");
-            assert_eq!(more.left() - chip.right(), px(6.), "{w}: the chip beside the ⋯");
-            assert!(chip.top() >= px(0.) && chip.bottom() <= px(TITLEBAR_HEIGHT), "{w}: chip inside the titlebar");
+        for badge in [false, true] {
+            let cluster = titlebar_cluster(badge);
+            for w in [crate::settings::SIDEBAR_MIN, 256., crate::settings::SIDEBAR_MAX, cluster + 32., cluster + 60., cluster + 100., cluster + 200.] {
+                let cx = bar_at(cx, w, true, badge);
+                let case = format!("{w} wide, badge {badge}");
+                let toggle = cx.debug_bounds("toggle").unwrap();
+                let more = cx.debug_bounds("sidebar-view").unwrap_or_else(|| panic!("the ⋯ drawn at {case}"));
+                let drawn = cx.debug_bounds("dev-badge");
+                assert_eq!(drawn.is_some(), badge, "{case}: the badge is drawn with the flag");
+                if let Some(drawn) = drawn {
+                    assert_eq!(drawn.size, gpui::size(px(DEV_BADGE_W), px(DEV_BADGE_H)), "{case}: the badge's fixed size");
+                    assert_eq!(drawn.left() - toggle.right(), px(DEV_BADGE_GAP), "{case}: the badge right after the toggle");
+                    assert!(drawn.top() >= px(0.) && drawn.bottom() <= px(TITLEBAR_HEIGHT), "{case}: badge inside the titlebar");
+                    assert!(drawn.right() <= more.left(), "{case}: badge {:?} over the ⋯ {:?}", drawn, more);
+                }
+                let chip = cx.debug_bounds("sidebar-focus-chip");
+                let Some(chip) = chip else {
+                    assert!(w < cluster + 100., "no chip at {case}, where the icon fits");
+                    continue;
+                };
+                assert!(chip.left() >= toggle.right(), "{case}: chip {:?} over the toggle {:?}", chip, toggle);
+                if let Some(drawn) = drawn {
+                    assert!(chip.left() >= drawn.right(), "{case}: chip {:?} over the badge {:?}", chip, drawn);
+                }
+                assert!(chip.right() <= more.left(), "{case}: chip {:?} over the ⋯ {:?}", chip, more);
+                assert!(chip.right() <= px(w), "{case}: chip inside the sidebar");
+                assert_eq!(more.left() - chip.right(), px(6.), "{case}: the chip beside the ⋯");
+                assert!(chip.top() >= px(0.) && chip.bottom() <= px(TITLEBAR_HEIGHT), "{case}: chip inside the titlebar");
+            }
+            // wide: the word; narrow: the icon alone; where the ⋯ hides: neither
+            let wide = bar_at(cx, 256., true, badge).debug_bounds("sidebar-focus-chip").unwrap();
+            assert_eq!(wide.size.width, px(if cfg!(target_os = "macos") { 24. } else { 66. }));
+            let icon = bar_at(cx, cluster + 100., true, badge).debug_bounds("sidebar-focus-chip").expect("the icon chip where only it fits");
+            assert_eq!(icon.size.width, px(24.));
+            let narrow = bar_at(cx, cluster + 60., true, badge);
+            assert!(narrow.debug_bounds("sidebar-view").is_some() && narrow.debug_bounds("sidebar-focus-chip").is_none(), "the ⋯ shows, the chip clears the toggle nowhere");
+            let hidden = bar_at(cx, cluster + 31., true, badge);
+            assert!(hidden.debug_bounds("sidebar-view").is_none() && hidden.debug_bounds("sidebar-focus-chip").is_none(), "chip hides with the ⋯");
         }
-        // wide: the word; narrow: the icon alone; where the ⋯ hides: neither
-        let wide = bar_at(cx, 256., true).debug_bounds("sidebar-focus-chip").unwrap();
-        assert_eq!(wide.size.width, px(if cfg!(target_os = "macos") { 24. } else { 66. }));
-        let icon = bar_at(cx, TITLEBAR_CLUSTER + 100., true).debug_bounds("sidebar-focus-chip").expect("the icon chip where only it fits");
-        assert_eq!(icon.size.width, px(24.));
-        let narrow = bar_at(cx, TITLEBAR_CLUSTER + 60., true);
-        assert!(narrow.debug_bounds("sidebar-view").is_some() && narrow.debug_bounds("sidebar-focus-chip").is_none(), "the ⋯ shows, the chip clears the toggle nowhere");
-        let hidden = bar_at(cx, TITLEBAR_CLUSTER + 31., true);
-        assert!(hidden.debug_bounds("sidebar-view").is_none() && hidden.debug_bounds("sidebar-focus-chip").is_none(), "chip hides with the ⋯");
+    }
+
+    /// With the sidebar closed the tab bar's pad clears the badge's measured right edge (the toggle's without a badge);
+    /// a sidebar wide enough to hold the cluster needs no pad but the 8 px.
+    #[gpui::test]
+    fn the_tabs_clear_the_badge_with_the_sidebar_closed(cx: &mut gpui::TestAppContext) {
+        for badge in [false, true] {
+            let cx = bar_at(cx, 0., false, badge);
+            let toggle = cx.debug_bounds("toggle").unwrap();
+            let tabs = cx.debug_bounds("tabs").unwrap();
+            let edge = cx.debug_bounds("dev-badge").map_or(toggle.right(), |b| b.right());
+            assert_eq!(cx.debug_bounds("dev-badge").is_some(), badge, "the badge is drawn with the flag, sidebar closed");
+            assert!(tabs.left() >= edge, "badge {badge}: the tabs at {:?} clear the right edge {:?}", tabs.left(), edge);
+        }
+        assert_eq!(titlebar_clear(0., true), TOGGLE_LEFT + 24. + DEV_BADGE_GAP + DEV_BADGE_W + 8.);
+        assert_eq!(titlebar_clear(300., true), 8., "open wide: just the 8 px");
+    }
+
+    /// Without the badge the cluster is what it was: the toggle and 8 px, the ⋯ from 32 px beyond it.
+    #[test]
+    fn without_the_badge_the_titlebar_widths_hold() {
+        assert_eq!(titlebar_cluster(false), TOGGLE_LEFT + 24. + 8.);
+        assert_eq!(titlebar_clear(0., false), TOGGLE_LEFT + 32.);
+        let at = TOGGLE_LEFT + 32. + 32.;
+        assert_eq!(view_button_left(at, false), Some(at - 32.));
+        assert_eq!(view_button_left(at - 1., false), None);
+        assert_eq!(chip_box(256., false), Some((256. - 8. - 24. - CHIP_GAP - CHIP_FULL, CHIP_FULL)));
+        assert_eq!(titlebar_cluster(true) - titlebar_cluster(false), DEV_BADGE_GAP + DEV_BADGE_W);
     }
 
     #[gpui::test]
     fn focus_off_shows_no_chip(cx: &mut gpui::TestAppContext) {
-        let cx = bar_at(cx, 256., false);
+        let cx = bar_at(cx, 256., false, true);
         assert!(cx.debug_bounds("sidebar-focus-chip").is_none());
         assert!(cx.debug_bounds("sidebar-view").is_some(), "the ⋯ stays");
     }
@@ -482,8 +549,10 @@ mod tests {
         let cx = head_with(cx, false, false);
         let head = cx.debug_bounds("sidebar-head").expect("the head drawn");
         assert!(cx.debug_bounds("sidebar-focus-chip").is_none(), "no chip in the head");
-        // 8 px over and 6 under the dev badge, the tallest thing in it: the same with focus mode on or off
-        assert_eq!(head.size.height, px(8. + 18. + 6.));
+        // 8 px over and 6 under the label; the dev badge is in the titlebar, not here
+        let label = cx.debug_bounds("sidebar-head-label").expect("the label drawn");
+        assert_eq!(head.size.height, px(8. + 6.) + label.size.height);
+        assert!(cx.debug_bounds("dev-badge").is_none(), "no badge in the head");
     }
 
     /// The head as `sidebar_head` draws it for a tree that names its sessions (`listed`) or not, with a spinner or not.

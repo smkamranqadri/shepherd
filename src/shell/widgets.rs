@@ -417,7 +417,8 @@ pub(crate) fn row(theme: &Theme, selected: bool, id: impl Into<gpui::ElementId>)
         .when(!selected, |el| el.hover(move |s| s.bg(hover)))
 }
 
-/// The small "DEV" pill of a dev build, its tooltip the commit it was built from.
+/// The small "DEV" pill of a dev build, its tooltip the commit it was built from: a fixed size ([`DEV_BADGE_W`] by
+/// [`DEV_BADGE_H`]), as the titlebar's cluster counts on.
 pub(crate) fn dev_badge(theme: &Theme) -> Stateful<Div> {
     let tooltip = match option_env!("GIT_HASH") {
         Some(hash) => format!("Dev build · {hash}"),
@@ -425,9 +426,13 @@ pub(crate) fn dev_badge(theme: &Theme) -> Stateful<Div> {
     };
     div()
         .id("dev-badge")
+        .debug_selector(|| "dev-badge".into())
         .flex_none()
-        .ml(px(6.))
-        .px(px(5.))
+        .w(px(DEV_BADGE_W))
+        .h(px(DEV_BADGE_H))
+        .flex()
+        .items_center()
+        .justify_center()
         .rounded(px(4.))
         .bg(theme.warning.opacity(0.18))
         .text_size(px(9.))

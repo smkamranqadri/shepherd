@@ -5,7 +5,7 @@ use super::*;
 const PEEK_LINGER: Duration = Duration::from_millis(200);
 
 /// The sidebar's head row, drawn only when something is in it: the place's label (`label`, asked for when the tree names
-/// no session, `listed` false) filling it, then the dev build's badge, then the place's `spinner` while it connects.
+/// no session, `listed` false) filling it, then the place's `spinner` while it connects.
 pub(super) fn sidebar_head(theme: &Theme, listed: bool, label: impl FnOnce() -> String, spinner: Option<impl IntoElement>) -> Option<Div> {
     let name = (!listed).then(label);
     if name.is_none() && spinner.is_none() {
@@ -23,7 +23,6 @@ pub(super) fn sidebar_head(theme: &Theme, listed: bool, label: impl FnOnce() -> 
             .text_size(px(11.))
             .text_color(theme.text_faint)
             .child(div().flex_1().min_w_0().truncate().children(name.map(|n| div().debug_selector(|| "sidebar-head-label".into()).child(n))))
-            .when(is_dev_build(), |el| el.child(dev_badge(theme)))
             .children(spinner),
     )
 }

@@ -628,7 +628,7 @@ impl Shell {
             .items_center()
             .gap(px(2.))
             .pr(px(TAB_TOP + if self.panel_open { 0. } else { window_controls_w(cx) }))
-            .pl(px((TITLEBAR_CLUSTER - sidebar_w).max(8.)))
+            .pl(px(titlebar_clear(sidebar_w, is_dev_build())))
             .child(button("web-back", "icons/solar/alt-arrow-left.svg", can(wry::WebView::can_go_back), wry::WebView::go_back))
             .child(button("web-forward", "icons/solar/alt-arrow-right.svg", can(wry::WebView::can_go_forward), wry::WebView::go_forward))
             .child(button("web-reload", "icons/solar/restart.svg", view.is_some(), wry::WebView::reload))
