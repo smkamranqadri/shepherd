@@ -70,18 +70,18 @@ pub fn resolve_link(href: &str, place: Option<(&Path, &Path)>) -> Link {
 }
 
 /// `href`'s scheme, lowercased, when it starts with one (`https:`, `file:`, `vscode:`, …).
-fn scheme(href: &str) -> Option<String> {
+pub(crate) fn scheme(href: &str) -> Option<String> {
     let (scheme, _) = href.split_once(':')?;
     let mut chars = scheme.chars();
     (chars.next()?.is_ascii_alphabetic() && chars.all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))).then(|| scheme.to_ascii_lowercase())
 }
 
-fn decode(text: &str) -> String {
+pub(crate) fn decode(text: &str) -> String {
     percent_encoding::percent_decode_str(text).decode_utf8().map_or_else(|_| text.to_string(), |t| t.into_owned())
 }
 
 /// `path` with `.` dropped and `..` taking the folder before it (never above `/`).
-fn normalize(path: &Path) -> PathBuf {
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::from("/");
     for part in path.components() {
         match part {
@@ -165,6 +165,42 @@ pub struct Look {
     pub document: bool,
     /// An image's file here, by its source; `None` (or no file yet) keeps its alt text.
     pub image: Option<Rc<dyn Fn(&str) -> Option<PathBuf>>>,
+}
+
+/// The sources of the images in `blocks`, each once, in document order.
+pub fn image_sources(blocks: &[Block]) -> Vec<String> {
+    fn runs(runs: &[InlineRun], out: &mut Vec<String>) {
+        for image in runs.iter().filter_map(|r| r.style.image.as_ref()) {
+            if !out.contains(&image.source) {
+                out.push(image.source.clone());
+            }
+        }
+    }
+    fn walk(blocks: &[Block], out: &mut Vec<String>) {
+        for block in blocks {
+            match block {
+                Block::Paragraph { runs: r } | Block::Heading { runs: r, .. } => runs(r, out),
+                Block::BlockQuote { children } => walk(children, out),
+                Block::List { items, .. } => items.iter().for_each(|item| walk(item, out)),
+                Block::Table { header, rows, .. } => header.iter().chain(rows.iter().flatten()).for_each(|cell| runs(cell, out)),
+                Block::CodeBlock { .. } | Block::Rule => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(blocks, &mut out);
+    out
+}
+
+// ponytail: sizes by path for the life of the app (a few bytes an image); drop them with the image if a long session ever shows it
+thread_local! {
+    static IMAGE_SIZES: RefCell<HashMap<PathBuf, (f32, f32)>> = RefCell::new(HashMap::new());
+}
+
+/// Tells [`picture`] the size `path` is drawn at when nothing says otherwise, in logical pixels: with it a picture
+/// keeps its proportions when the column is narrower than it is (gpui would otherwise fix its height at its own).
+pub fn note_image_size(path: &Path, width: f32, height: f32) {
+    IMAGE_SIZES.with(|s| s.borrow_mut().insert(path.to_path_buf(), (width, height)));
 }
 
 /// `blocks`, keyed under `key` (their paragraphs' selection keys and element ids start with it), their links
@@ -377,23 +413,39 @@ fn figure(runs: &[InlineRun], key: &str, color: Hsla, links: &Links, theme: &The
     div().flex().flex_wrap().items_center().gap(px(4.)).children(parts).into_any_element()
 }
 
-/// An image at its own size, no wider than the column; its alt text until (or unless) it is fetched. A linked one
-/// follows its link as a text link does.
+/// An image at its own size, or its `width` when the HTML gave one, no wider than the column; its alt text until
+/// (or unless) it is fetched. A linked one follows its link as a text link does.
 fn picture(image: &InlineImage, alt: &str, key: &str, links: &Links, theme: &Theme, look: &Look) -> AnyElement {
     let alt: SharedString = alt.to_string().into();
     let Some(path) = look.image.as_ref().and_then(|file| file(&image.source)) else {
-        return div().text_color(theme.text_faint).child(alt).into_any_element();
+        return div().text_color(theme.text_faint).debug_selector(|| format!("{key}-alt")).child(alt).into_any_element();
     };
-    let shown = gpui::img(path).max_w_full().with_fallback({
+    let size = IMAGE_SIZES.with(|s| s.borrow().get(&path).copied()).filter(|(w, h)| *w > 0. && *h > 0.);
+    let width = crate::ui::review::image_width(image);
+    let shown = gpui::img(path).with_fallback({
         let (alt, faint) = (alt.clone(), theme.text_faint);
         move || div().text_color(faint).child(alt.clone()).into_any_element()
     });
+    let shown = match size {
+        // a box of the picture's proportions, as wide as asked for and no wider than the column: its height follows
+        // from the width it ends up with, which `max_w_full` on the picture alone would leave at its own
+        Some((w, h)) => div()
+            .w(px(width.unwrap_or(w)))
+            .max_w_full()
+            .aspect_ratio(w / h)
+            .debug_selector(|| format!("{key}-picture"))
+            .child(shown.size_full().object_fit(gpui::ObjectFit::Fill))
+            .into_any_element(),
+        None => shown.max_w_full().when_some(width, |img, width| img.max_w(px(width))).debug_selector(|| format!("{key}-picture")).into_any_element(),
+    };
     match image.link.as_deref().map(|href| links.resolve(href)) {
-        Some(Link::Disabled(_)) | None => shown.into_any_element(),
+        Some(Link::Disabled(_)) | None => shown,
         Some(link) => {
             let follow = links.follow.clone();
             div()
                 .id(SharedString::from(key.to_string()))
+                .min_w_0()
+                .max_w_full()
                 .cursor_pointer()
                 .child(shown)
                 .on_click(move |_, window, cx| match &link {

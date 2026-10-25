@@ -858,12 +858,23 @@ fn gitlab_rest(dir: &str, branch: &str, host: &str) -> Review {
 }
 
 pub use zeron_markdown::{Block, InlineRun};
+use zeron_markdown::parser::{InlineImage, InlineStyle};
 
 /// `text` as Zeron's markdown blocks (pulldown-cmark), for a panel without HTML: comments (GitHub's templates are
 /// full of them) and tags (`<details>`, `<br>`) dropped; a task's `[x]` as a check box.
 pub fn markdown(text: &str) -> Vec<Block> {
+    build(text, false)
+}
+
+/// [`markdown`] for a document the reader opened: its HTML `<img>` tags (the parser keeps raw HTML as text, which
+/// `markdown` strips) become image runs, as `![alt](src)` is, a `width` attribute and an enclosing `<a href>` kept.
+pub fn markdown_document(text: &str) -> Vec<Block> {
+    build(text, true)
+}
+
+fn build(text: &str, images: bool) -> Vec<Block> {
     let mut blocks: Vec<Block> = zeron_markdown::parse_full(&strip_comments(text)).blocks.iter().map(|b| b.block.clone()).collect();
-    blocks.iter_mut().for_each(tidy);
+    blocks.iter_mut().for_each(|b| tidy(b, images));
     blocks.retain(|b| !matches!(b, Block::Paragraph { runs } if runs_text(runs).trim().is_empty() && !has_image(runs)));
     blocks
 }
@@ -872,17 +883,20 @@ fn has_image(runs: &[InlineRun]) -> bool {
     runs.iter().any(|r| r.style.image.is_some())
 }
 
-fn tidy(block: &mut Block) {
+fn tidy(block: &mut Block, images: bool) {
     match block {
-        Block::Paragraph { runs } | Block::Heading { runs, .. } => tidy_runs(runs),
-        Block::BlockQuote { children } => children.iter_mut().for_each(tidy),
-        Block::List { items, .. } => items.iter_mut().flatten().for_each(tidy),
-        Block::Table { header, rows, .. } => header.iter_mut().chain(rows.iter_mut().flatten()).for_each(tidy_runs),
+        Block::Paragraph { runs } | Block::Heading { runs, .. } => tidy_runs(runs, images),
+        Block::BlockQuote { children } => children.iter_mut().for_each(|b| tidy(b, images)),
+        Block::List { items, .. } => items.iter_mut().flatten().for_each(|b| tidy(b, images)),
+        Block::Table { header, rows, .. } => header.iter_mut().chain(rows.iter_mut().flatten()).for_each(|cell| tidy_runs(cell, images)),
         Block::CodeBlock { .. } | Block::Rule => {}
     }
 }
 
-fn tidy_runs(runs: &mut Vec<InlineRun>) {
+fn tidy_runs(runs: &mut Vec<InlineRun>, images: bool) {
+    if images {
+        *runs = html_images(std::mem::take(runs));
+    }
     for run in runs.iter_mut() {
         if let Some(task) = &run.style.task {
             run.text = if task.checked { "☑ " } else { "☐ " }.into();
@@ -895,6 +909,211 @@ fn tidy_runs(runs: &mut Vec<InlineRun>) {
         }
     }
     runs.retain(|r| !r.text.is_empty() || r.style.image.is_some());
+}
+
+/// What an HTML image's `width` is kept as in its image's `title`, which the parser's own image has no place for:
+/// [`image_width`] reads it back.
+const WIDTH_MARK: &str = "\u{1}width=";
+
+/// The `width` of the HTML `<img>` that [`markdown_document`] made `image` of, in pixels.
+pub fn image_width(image: &InlineImage) -> Option<f32> {
+    image.title.strip_prefix(WIDTH_MARK)?.parse::<f32>().ok().filter(|w| *w > 0.)
+}
+
+/// An HTML tag [`html_images`] cares about: `<img>`, `<a>` and `</a>`.
+struct Tag {
+    name: &'static str,
+    closing: bool,
+    attributes: Vec<(String, String)>,
+}
+
+impl Tag {
+    fn attribute(&self, name: &str) -> Option<&str> {
+        self.attributes.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
+    }
+}
+
+/// A piece of `text` cut by [`html_pieces`].
+enum Piece<'a> {
+    Text(&'a str),
+    Tag(Tag),
+}
+
+/// `text` cut at its `<img>`, `<a>` and `</a>` tags: the text between them (any other tag left in it for
+/// [`strip_tags`]) and the tags.
+fn html_pieces(text: &str) -> Vec<Piece<'_>> {
+    let mut pieces = Vec::new();
+    let (mut from, mut at) = (0, 0);
+    while let Some(start) = text[at..].find('<').map(|i| at + i) {
+        at = start + 1;
+        let after = &text[at..];
+        let (closing, named) = after.strip_prefix('/').map_or((false, after), |rest| (true, rest));
+        let length = named.find(|c: char| !c.is_ascii_alphanumeric()).unwrap_or(named.len());
+        let name = match (named[..length].to_ascii_lowercase().as_str(), closing) {
+            ("img", false) => "img",
+            ("a", _) => "a",
+            _ => continue,
+        };
+        // a name ends at a space, a `/` or the `>`: not `<a-b>`
+        if !named[length..].starts_with(|c: char| c.is_whitespace() || c == '/' || c == '>') {
+            continue;
+        }
+        let Some(end) = tag_end(named) else { continue };
+        if from < start {
+            pieces.push(Piece::Text(&text[from..start]));
+        }
+        pieces.push(Piece::Tag(Tag { name, closing, attributes: attributes(&named[length..end]) }));
+        at = text.len() - named.len() + end + 1;
+        from = at;
+    }
+    if from < text.len() {
+        pieces.push(Piece::Text(&text[from..]));
+    }
+    pieces
+}
+
+/// Where the tag in `s` (after its `<`) ends: its `>`, not one inside a quoted value.
+fn tag_end(s: &str) -> Option<usize> {
+    let mut quote = None;
+    for (i, c) in s.char_indices() {
+        match (quote, c) {
+            (None, '>') => return Some(i),
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A tag's attributes, names lowercased, values unquoted and their entities decoded; a bare one has an empty value.
+fn attributes(mut s: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    loop {
+        s = s.trim_start_matches(|c: char| c.is_whitespace() || c == '/');
+        let name_end = s.find(|c: char| c.is_whitespace() || c == '=' || c == '/').unwrap_or(s.len());
+        if name_end == 0 {
+            return out;
+        }
+        let name = s[..name_end].to_ascii_lowercase();
+        s = s[name_end..].trim_start();
+        let Some(rest) = s.strip_prefix('=') else {
+            out.push((name, String::new()));
+            continue;
+        };
+        let rest = rest.trim_start();
+        let (value, after) = match rest.chars().next() {
+            Some(q @ ('"' | '\'')) => rest[1..].split_once(q).unwrap_or((&rest[1..], "")),
+            _ => rest.split_at(rest.find(char::is_whitespace).unwrap_or(rest.len())),
+        };
+        out.push((name, entities(value)));
+        s = after;
+    }
+}
+
+/// `s` with the character references an attribute holds (`&amp;` in a badge's address) decoded.
+fn entities(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let decoded = rest.find(';').filter(|end| *end <= 8).and_then(|end| {
+            let c = match &rest[1..end] {
+                "amp" => '&',
+                "lt" => '<',
+                "gt" => '>',
+                "quot" => '"',
+                "apos" => '\'',
+                n => match n.strip_prefix('#')? {
+                    hex if hex.starts_with(['x', 'X']) => char::from_u32(u32::from_str_radix(&hex[1..], 16).ok()?)?,
+                    dec => char::from_u32(dec.parse().ok()?)?,
+                },
+            };
+            Some((c, end))
+        });
+        match decoded {
+            Some((c, end)) => {
+                out.push(c);
+                rest = &rest[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out + rest
+}
+
+/// `runs` with a tag the parser cut apart whole again: it makes a link run of an address in a paragraph, an
+/// `<img src="https://…">` among them, so the tag's text is in three runs and no run holds it.
+fn rejoin_tags(runs: Vec<InlineRun>) -> Vec<InlineRun> {
+    let plain = |run: &InlineRun| !run.style.code && run.style.image.is_none();
+    let mut out = Vec::with_capacity(runs.len());
+    let mut runs = runs.into_iter().peekable();
+    while let Some(mut run) = runs.next() {
+        while plain(&run) && has_open_tag(&run.text) {
+            let Some(next) = runs.next_if(plain) else { break };
+            run.text.push_str(&next.text);
+        }
+        out.push(run);
+    }
+    out
+}
+
+/// Whether `text` holds a tag that is not closed: a `<` and a letter or `/`, then no `>` outside quotes.
+fn has_open_tag(text: &str) -> bool {
+    text.match_indices('<').any(|(i, _)| {
+        let after = &text[i + 1..];
+        after.starts_with(|c: char| c.is_ascii_alphabetic() || c == '/') && tag_end(after).is_none()
+    })
+}
+
+/// `runs` with the `<img>` tags in their text made image runs, as `![alt](src)` makes them: inline HTML arrives in
+/// runs of its own (`<a href>`, `<img>`, `</a>` one each), a block's as one run of text, so the `<a href>` an image
+/// is inside is kept from run to run. A code run's `<img>` is the code's.
+fn html_images(runs: Vec<InlineRun>) -> Vec<InlineRun> {
+    let mut out = Vec::with_capacity(runs.len());
+    let mut anchor: Option<String> = None;
+    for run in rejoin_tags(runs) {
+        if run.style.code || run.style.image.is_some() || !run.text.contains('<') {
+            out.push(run);
+            continue;
+        }
+        let pieces = html_pieces(&run.text);
+        // a run with no image keeps its text whole (for `strip_tags`), but its `<a href>` still counts
+        let images = pieces.iter().any(|p| matches!(p, Piece::Tag(t) if t.name == "img"));
+        if !images {
+            for piece in &pieces {
+                if let Piece::Tag(tag) = piece {
+                    anchor = tag.attribute("href").filter(|_| !tag.closing).map(str::to_string);
+                }
+            }
+            out.push(run);
+            continue;
+        }
+        for piece in pieces {
+            match piece {
+                Piece::Text(text) => out.push(InlineRun { text: text.to_string(), style: run.style.clone() }),
+                Piece::Tag(tag) if tag.name == "a" => anchor = tag.attribute("href").filter(|_| !tag.closing).map(str::to_string),
+                Piece::Tag(tag) => {
+                    let Some(source) = tag.attribute("src").map(str::trim).filter(|s| !s.is_empty()) else { continue };
+                    let alt = tag.attribute("alt").unwrap_or_default().to_string();
+                    let width = tag.attribute("width").and_then(|w| w.trim().trim_end_matches("px").parse::<f32>().ok()).filter(|w| *w > 0.);
+                    // as the parser makes its own: the image's link is the one around it, the run's link its source
+                    let image = InlineImage {
+                        source: source.to_string(),
+                        alt: alt.clone(),
+                        title: width.map_or_else(String::new, |w| format!("{WIDTH_MARK}{w}")),
+                        link: anchor.clone().or_else(|| run.style.link.clone()),
+                    };
+                    out.push(InlineRun { text: alt, style: InlineStyle { image: Some(image), link: Some(source.to_string()), ..run.style.clone() } });
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The runs' text, as it reads.
@@ -1129,5 +1348,100 @@ mod tests {
         assert!(matches!(&blocks[4], Block::Paragraph { runs } if runs_text(runs) == "a < b"));
         assert_eq!(markdown(""), []);
         assert_eq!(markdown("<!-- only a hint -->"), []);
+    }
+
+    /// Every image in `blocks`, in order: source, alt, link, width.
+    fn images(blocks: &[Block]) -> Vec<(String, String, Option<String>, Option<f32>)> {
+        fn runs(runs: &[InlineRun], out: &mut Vec<(String, String, Option<String>, Option<f32>)>) {
+            out.extend(runs.iter().filter_map(|r| r.style.image.as_ref()).map(|i| (i.source.clone(), i.alt.clone(), i.link.clone(), image_width(i))));
+        }
+        let mut out = Vec::new();
+        for block in blocks {
+            match block {
+                Block::Paragraph { runs: r } | Block::Heading { runs: r, .. } => runs(r, &mut out),
+                Block::BlockQuote { children } => out.extend(images(children)),
+                Block::List { items, .. } => items.iter().for_each(|item| out.extend(images(item))),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn some(source: &str, alt: &str, link: Option<&str>, width: Option<f32>) -> (String, String, Option<String>, Option<f32>) {
+        (source.into(), alt.into(), link.map(String::from), width)
+    }
+
+    #[test]
+    fn an_html_image_inline_is_an_image_run_with_its_alt_and_width() {
+        let text = "Built <img src=\"logo.png\" alt=\"Acme &amp; Co\" width=\"40\"> by hand, <IMG SRC='b.svg' WIDTH=24px> too.";
+        let blocks = markdown_document(text);
+        assert_eq!(images(&blocks), [some("logo.png", "Acme & Co", None, Some(40.)), some("b.svg", "", None, Some(24.))]);
+        let Block::Paragraph { runs } = &blocks[0] else { panic!("{blocks:?}") };
+        let texts: Vec<_> = runs.iter().map(|r| (r.text.as_str(), r.style.image.is_some())).collect();
+        assert_eq!(texts, [("Built ", false), ("Acme & Co", true), (" by hand, ", false), ("", true), (" too.", false)]);
+        // the panels' markdown (a PR's description) still drops the tag
+        assert_eq!(images(&markdown(text)), []);
+        assert_eq!(runs_text(match &markdown(text)[0] { Block::Paragraph { runs } => runs, b => panic!("{b:?}") }), "Built  by hand,  too.");
+    }
+
+    #[test]
+    fn a_block_of_html_gives_its_images_and_its_text() {
+        // the shape of a README's banner: a block of HTML, a centred heading, a centred paragraph
+        let text = "<p align=\"center\">\n  <img src=\"docs/assets/hero.svg\" alt=\"You correct it once.\" width=\"860\">\n</p>\n\n<h1 align=\"center\">acme</h1>\n";
+        let blocks = markdown_document(text);
+        assert_eq!(images(&blocks), [some("docs/assets/hero.svg", "You correct it once.", None, Some(860.))]);
+        assert!(matches!(&blocks[0], Block::Paragraph { runs } if runs.len() == 1), "the image alone, no stray tag text: {blocks:?}");
+        assert!(matches!(&blocks[1], Block::Paragraph { runs } if runs_text(runs) == "acme"), "{blocks:?}");
+        // Shepherd's own README opens with an icon beside its name in one tag
+        let title = markdown_document("<h1 align=\"center\"><img src=\"docs/icon.png\" width=\"48\" height=\"48\" align=\"absmiddle\" alt=\"\"> Shepherd</h1>");
+        assert_eq!(images(&title), [some("docs/icon.png", "", None, Some(48.))]);
+        assert!(matches!(&title[0], Block::Paragraph { runs } if runs.len() == 2 && runs[1].text == "Shepherd"), "{title:?}");
+        // in the panels' markdown that is just the name
+        assert!(matches!(&markdown("<h1 align=\"center\"><img src=\"docs/icon.png\" alt=\"\"> Shepherd</h1>")[0], Block::Paragraph { runs } if runs_text(runs) == "Shepherd"));
+    }
+
+    #[test]
+    fn an_image_nested_in_a_paragraph_and_a_link_keeps_the_link() {
+        let text = "<p align=\"center\">\n  <a href=\"https://ci.example.net/acme/widget\"><img alt=\"tests\" src=\"https://ci.example.net/acme/widget/badge.svg\"></a>\n  <a href=\"LICENSE\"><img alt=\"MIT license\" src=\"https://img.example.net/license-MIT-blue\"></a>\n  <img alt=\"No dependencies\" src='https://img.example.net/deps-none?a=1&amp;b=2' width=\"50%\">\n</p>\n";
+        let blocks = markdown_document(text);
+        assert_eq!(
+            images(&blocks),
+            [
+                some("https://ci.example.net/acme/widget/badge.svg", "tests", Some("https://ci.example.net/acme/widget"), None),
+                some("https://img.example.net/license-MIT-blue", "MIT license", Some("LICENSE"), None),
+                some("https://img.example.net/deps-none?a=1&b=2", "No dependencies", None, None),
+            ],
+            "a link only around its own image; a percentage is no width"
+        );
+        assert_eq!(blocks.len(), 1);
+        // inline HTML comes in runs of its own, one a tag
+        let inline = markdown_document("Built with <a href=\"https://x.dev\"><img src=\"x.png\" alt=\"x\"></a> today, and plain <a href=\"https://y.dev\">text</a> after.");
+        assert_eq!(images(&inline), [some("x.png", "x", Some("https://x.dev"), None)]);
+        assert_eq!(runs_text(match &inline[0] { Block::Paragraph { runs } => runs, b => panic!("{b:?}") }), "Built with x today, and plain text after.");
+        // an address inside a tag is made a link run by the parser, which cuts the tag in three: put whole again
+        let cut = markdown_document("See <img src=\"https://img.example.net/a.png\" alt=\"a\" width=\"20\"> and <a href=\"https://y.dev/z\"><img alt=\"b\" src=\"https://img.example.net/b.png\"></a>.");
+        assert_eq!(images(&cut), [some("https://img.example.net/a.png", "a", None, Some(20.)), some("https://img.example.net/b.png", "b", Some("https://y.dev/z"), None)]);
+        assert_eq!(runs_text(match &cut[0] { Block::Paragraph { runs } => runs, b => panic!("{b:?}") }), "See a and b.");
+    }
+
+    #[test]
+    fn code_markdown_images_and_look_alike_tags_are_left_alone() {
+        let text = "`<img src=\"a.png\">` and ![md](m.png \"a title\") and <abbr>x</abbr> <a-b src=\"n.png\"> <img alt=\"no source\">\n\n```html\n<img src=\"c.png\">\n```\n";
+        let blocks = markdown_document(text);
+        assert_eq!(images(&blocks), [some("m.png", "md", None, None)], "only the markdown image: code, other tags and a tag with no src give none");
+        let Block::Paragraph { runs } = &blocks[0] else { panic!("{blocks:?}") };
+        assert!(runs.iter().any(|r| r.style.code && r.text == "<img src=\"a.png\">"));
+        assert_eq!(runs.iter().find_map(|r| r.style.image.as_ref()).map(|i| i.title.as_str()), Some("a title"), "a markdown title is no width");
+        assert!(matches!(&blocks[1], Block::CodeBlock { code, .. } if code.contains("<img src=\"c.png\">")));
+        // the same markdown image in both ways of parsing
+        assert_eq!(images(&markdown("![md](m.png)")), images(&markdown_document("![md](m.png)")));
+    }
+
+    #[test]
+    fn entities_and_attributes() {
+        assert_eq!(entities("a &amp; b &lt;c&gt; &quot;d&quot; &#39;e&#x27; &nope; & f"), "a & b <c> \"d\" 'e' &nope; & f");
+        let attrs = attributes(" src=a/b.png  alt = \"x y\" hidden data-n='1 > 0' /");
+        let got: Vec<(&str, &str)> = attrs.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+        assert_eq!(got, [("src", "a/b.png"), ("alt", "x y"), ("hidden", ""), ("data-n", "1 > 0")]);
     }
 }

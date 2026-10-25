@@ -11,7 +11,7 @@ use crate::files::content::{self, Content, MAX_TEXT, Text};
 use crate::files::highlight::{self, Highlights, Token};
 use crate::shell::widgets::{tip, titlebar_button};
 use crate::theme::Theme;
-use crate::ui::markdown::{Link, Links};
+use crate::ui::markdown::{Link, Links, Look};
 use crate::ui::pdf_view::PdfView;
 use crate::ui::review::Block;
 use gpui::{
@@ -41,6 +41,15 @@ const MAX_SHOWN: usize = 4000;
 pub(crate) const MAX_PREVIEW: usize = 512 * 1024;
 /// The lines kept worked out for drawing (`Drawn`); past this many the cache starts over (a long scroll).
 const MAX_DRAWN: usize = 2048;
+/// How long a fetched image stays fresh in the cache: a badge keeps its address while its picture changes.
+const IMAGE_FRESH: Duration = Duration::from_secs(24 * 60 * 60);
+/// The most images fetched at once.
+const FETCHES: usize = 4;
+/// What the image cache names a picture's type, the extensions `content::load` takes for an image.
+const IMAGE_TYPES: [&str; 5] = ["png", "jpg", "gif", "webp", "svg"];
+
+/// A remote image's bytes: `None` when it is not there, is not served over https or is over `content::MAX_IMAGE`.
+type Fetch = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
 
 pub enum ViewerEvent {
     /// "Open in editor", at a line when the viewer has one to give: the Shell shows the terminals (the editor's pane
@@ -239,6 +248,11 @@ pub struct FileViewer {
     painted: Rc<RefCell<Vec<(usize, TextLayout)>>>,
     /// A PDF's pages, which have the keyboard while they show.
     pdf: Option<Entity<PdfView>>,
+    /// The preview's images that are in (by their source in the file), each a file within the viewer's limits.
+    images: Arc<HashMap<String, PathBuf>>,
+    /// How a remote image is fetched, and where they are kept.
+    fetch: Fetch,
+    image_cache: PathBuf,
 }
 
 impl EventEmitter<ViewerEvent> for FileViewer {}
@@ -278,6 +292,9 @@ impl FileViewer {
             dragging: false,
             painted: Rc::default(),
             pdf: None,
+            images: Arc::default(),
+            fetch: Arc::new(fetch_https),
+            image_cache: crate::settings::cache_dir().join("images"),
         }
     }
 
@@ -299,6 +316,7 @@ impl FileViewer {
         self.cancel = Arc::default();
         (self.path, self.root, self.shown) = (path.clone(), root.clone(), Shown::Loading);
         (self.real_root, self.goto_fragment) = (None, None);
+        self.images = Arc::default();
         (self.text, self.highlights, self.blocks, self.columns) = (Arc::default(), Highlights::default(), None, 0);
         self.drawn.clear();
         (self.sel, self.dragging, self.preview) = (None, false, true);
@@ -312,7 +330,7 @@ impl FileViewer {
                 let (blocks, columns) = match &content {
                     Content::Text(text) | Content::Markdown(text) => {
                         let markdown = matches!(content, Content::Markdown(_)) && text.text.len() <= MAX_PREVIEW;
-                        (markdown.then(|| crate::ui::review::markdown(&text.text)), text.lines().map(columns).max().unwrap_or(0))
+                        (markdown.then(|| crate::ui::review::markdown_document(&text.text)), text.lines().map(columns).max().unwrap_or(0))
                     }
                     _ => (None, 0),
                 };
@@ -346,7 +364,11 @@ impl FileViewer {
 
     /// Drops the shown image's pixels from gpui's cache (an image shown again is read afresh), or a PDF's drawn
     /// pages and its worker: when the viewer goes out of sight, not only when it goes.
-    pub fn evict_image(&mut self, window: Option<&mut Window>, cx: &mut App) {
+    pub fn evict_image(&mut self, mut window: Option<&mut Window>, cx: &mut App) {
+        // the preview's pictures too
+        for path in self.images.values() {
+            gpui::ImageSource::from(path.clone()).evict(window.as_deref_mut(), cx);
+        }
         if let Some(pdf) = &self.pdf {
             pdf.update(cx, |p, _| p.hide(window));
         } else if matches!(self.shown, Shown::Other(Content::Image(..) | Content::Svg(..))) {
@@ -385,7 +407,42 @@ impl FileViewer {
         if let Some(fragment) = self.goto_fragment.take() {
             self.go_to_fragment(&fragment, cx);
         }
+        self.load_images(window, cx);
         cx.notify();
+    }
+
+    /// Brings the preview's images in once its text is: a local one is the file beside the document, a remote https
+    /// one is fetched once (a day's worth is kept on disk), each within the viewer's limits. Off the UI thread, a few
+    /// remote ones at a time, each drawn as it lands; until then (and for one that never does) its alt text stands.
+    fn load_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(blocks) = self.blocks.as_deref() else { return };
+        let (document, root, generation) = (self.path.clone(), self.real_root.clone(), self.generation);
+        let slots = Arc::new(tokio::sync::Semaphore::new(FETCHES));
+        for source in crate::ui::markdown::image_sources(blocks) {
+            let (document, root, fetch, cache, slots, name) = (document.clone(), root.clone(), self.fetch.clone(), self.image_cache.clone(), slots.clone(), source.clone());
+            let job = self.rt.spawn(async move {
+                let _slot = slots.acquire().await.ok()?;
+                tokio::task::spawn_blocking(move || image_file(&name, &document, root.as_deref(), &cache, fetch.as_ref())).await.ok()?
+            });
+            cx.spawn_in(window, async move |this, cx| {
+                let Ok(Some((file, content))) = job.await else { return };
+                let _ = this.update_in(cx, |v, window, cx| {
+                    if v.generation != generation {
+                        return;
+                    }
+                    // a bitmap's pixels are device pixels, an SVG's CSS pixels: the size it shows at
+                    let scale = window.scale_factor();
+                    match content {
+                        Content::Image(w, h) => crate::ui::markdown::note_image_size(&file, w as f32 / scale, h as f32 / scale),
+                        Content::Svg(w, h) => crate::ui::markdown::note_image_size(&file, w as f32, h as f32),
+                        _ => {}
+                    }
+                    Arc::make_mut(&mut v.images).insert(source, file);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
     }
 
     /// Goes to `fragment` (a heading's anchor, or a line as `L12`) once the text is in: a markdown link's, after
@@ -437,9 +494,15 @@ impl FileViewer {
     /// Highlights the lines on the runtime's blocking pool; plain until it lands, dropped if another file opened.
     fn highlight(&mut self, cx: &mut Context<Self>) {
         let (text, path, cancel, generation) = (self.text.clone(), self.path.clone(), self.cancel.clone(), self.generation);
-        let job = self.rt.spawn_blocking(move || {
-            let syntax = highlight::syntax_for(&path, text.line(0))?;
-            Some(highlight::highlight(syntax, text.lines(), highlight::BUDGET, &cancel))
+        // awaited by a task of the runtime, so the window's task is woken from the runtime's thread, never the blocking pool's
+        let job = self.rt.spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let syntax = highlight::syntax_for(&path, text.line(0))?;
+                Some(highlight::highlight(syntax, text.lines(), highlight::BUDGET, &cancel))
+            })
+            .await
+            .ok()
+            .flatten()
         });
         cx.spawn(async move |this, cx| {
             if let Ok(Some(highlights)) = job.await {
@@ -793,7 +856,9 @@ impl FileViewer {
             // no root: a relative link has nowhere it may lead
             None => Links::web(),
         };
-        markdown_preview("viewer-md", blocks, &links, &self.preview_scroll, theme)
+        let images = self.images.clone();
+        let look = Look { document: false, image: Some(Rc::new(move |source: &str| images.get(source).cloned())) };
+        markdown_preview_with("viewer-md", blocks, &links, &self.preview_scroll, theme, &look)
     }
 
     /// The text as a list of rows, a gutter of line numbers and the line, no wrapping: wider lines scroll across.
@@ -923,6 +988,88 @@ pub(crate) fn shown_path(path: &Path, root: Option<&Path>) -> String {
     }
 }
 
+/// The file the preview draws the image `source` from, with what [`content::load`] made of it: a bitmap or an SVG
+/// within the viewer's limits (bytes, pixels, frames), anything else none. A relative path is the document's folder's
+/// (a leading `/` the root's); an `https` address is fetched through `fetch` into `cache` unless a copy a day old at
+/// most is there; any other scheme, `http` included, is not fetched at all.
+fn image_file(source: &str, document: &Path, root: Option<&Path>, cache: &Path, fetch: &dyn Fn(&str) -> Option<Vec<u8>>) -> Option<(PathBuf, Content)> {
+    let source = source.trim();
+    let (file, remote) = match crate::ui::markdown::scheme(source).as_deref() {
+        Some("https") => (remote_image(source, cache, fetch)?, true),
+        Some(_) => return None,
+        None => (local_image(source, document, root)?, false),
+    };
+    match content::load(&file) {
+        content @ (Content::Image(..) | Content::Svg(..)) => Some((file, content)),
+        _ => {
+            // a fetched copy that is no picture within the limits is not kept to be shown again
+            if remote {
+                let _ = std::fs::remove_file(&file);
+            }
+            None
+        }
+    }
+}
+
+/// A relative image path, from the document's folder (a leading `/` from the root's), without its `?query` or `#fragment`.
+fn local_image(source: &str, document: &Path, root: Option<&Path>) -> Option<PathBuf> {
+    let target = crate::ui::markdown::decode(source.split(['?', '#']).next()?);
+    if target.is_empty() {
+        return None;
+    }
+    let base = if target.starts_with('/') { root? } else { document.parent()? };
+    Some(crate::ui::markdown::normalize(&base.join(target.trim_start_matches('/'))))
+}
+
+/// The cached copy of the image at `url`, fetched first when there is none or it is over `IMAGE_FRESH` old; a stale
+/// copy stands in for a fetch that fails. Named by the address's hash and the type its bytes have.
+fn remote_image(url: &str, cache: &Path, fetch: &dyn Fn(&str) -> Option<Vec<u8>>) -> Option<PathBuf> {
+    use sha2::Digest;
+    let name: String = sha2::Sha256::digest(url.as_bytes())[..8].iter().map(|b| format!("{b:02x}")).collect();
+    let file = |ext: &str| cache.join(format!("{name}.{ext}"));
+    let cached = IMAGE_TYPES.iter().map(|ext| file(ext)).find(|f| f.is_file());
+    let age = |f: &Path| std::fs::metadata(f).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+    if let Some(fresh) = cached.as_ref().filter(|f| age(f).is_some_and(|age| age < IMAGE_FRESH)) {
+        return Some(fresh.clone());
+    }
+    let stored = fetch(url).filter(|bytes| bytes.len() as u64 <= content::MAX_IMAGE).and_then(|bytes| {
+        let ext = image_type(&bytes)?;
+        std::fs::create_dir_all(cache).ok()?;
+        let part = cache.join(format!("{name}.part"));
+        std::fs::write(&part, &bytes).ok()?;
+        std::fs::rename(&part, file(ext)).ok()?;
+        // another type's older copy would be found first
+        IMAGE_TYPES.iter().filter(|other| **other != ext).for_each(|other| drop(std::fs::remove_file(file(other))));
+        Some(file(ext))
+    });
+    stored.or(cached)
+}
+
+/// The extension an image's bytes call for, from their first bytes; `None` for anything else the viewer draws no
+/// image from.
+fn image_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if bytes.starts_with(b"GIF8") {
+        Some("gif")
+    } else if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else if String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).contains("<svg") {
+        Some("svg")
+    } else {
+        None
+    }
+}
+
+/// A remote image over https, no bigger than the viewer takes of an image file and a few seconds in coming (a
+/// redirect to plain http fails); the fetch the reader makes.
+fn fetch_https(url: &str) -> Option<Vec<u8>> {
+    let agent: ureq::Agent = ureq::Agent::config_builder().https_only(true).timeout_global(Some(Duration::from_secs(15))).build().into();
+    agent.get(url).call().ok()?.body_mut().with_config().limit(content::MAX_IMAGE).read_to_vec().ok()
+}
+
 /// Markdown's preview: Zeron's blocks, selectable through `ui::markdown`, in a column a page wide. Each block is a
 /// child of the scrolled element after a spacer, so a `#heading` link scrolls to its block (child `ix + 1`).
 ///
@@ -930,6 +1077,11 @@ pub(crate) fn shown_path(path: &Path, root: Option<&Path>) -> String {
 /// the container's width, before `max_w` narrows it, so a paragraph that wraps to more lines in the page's column
 /// than across the window got the shorter box and the next block drew over its last lines.
 pub(crate) fn markdown_preview(id: &'static str, blocks: &[Block], links: &Links, scroll: &ScrollHandle, theme: &Theme) -> AnyElement {
+    markdown_preview_with(id, blocks, links, scroll, theme, &Look::default())
+}
+
+/// [`markdown_preview`] drawn the `look` way (the reader's, with its images).
+pub(crate) fn markdown_preview_with(id: &'static str, blocks: &[Block], links: &Links, scroll: &ScrollHandle, theme: &Theme, look: &Look) -> AnyElement {
     // 12 px between the blocks, 20 px above the first and below the last
     let space = |height: f32| div().h(px(height)).into_any_element();
     let column = |block: AnyElement| div().w_full().max_w(px(820.)).mx_auto().px(px(24.)).pt(px(12.)).child(block).into_any_element();
@@ -941,7 +1093,7 @@ pub(crate) fn markdown_preview(id: &'static str, blocks: &[Block], links: &Links
         .font_family(theme.font_ui.clone())
         .text_size(px(13.5))
         .child(space(8.))
-        .children(crate::ui::markdown::render(blocks, id, links, theme).into_iter().map(column))
+        .children(crate::ui::markdown::render_with(blocks, id, links, theme, look).into_iter().map(column))
         .child(space(20.))
         .into_any_element()
 }
@@ -1054,5 +1206,228 @@ mod tests {
         ]);
         assert_eq!(d.segments(Some(3..3)).len(), 5);
         assert!(Drawn::new("", &[]).segments(None).is_empty());
+    }
+
+    /// A PNG of `w` × `h` pixels.
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(w, h).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    type Calls = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A fetch that answers `bytes` for an address ending `.png` and `None` for any other, noting each address asked.
+    fn fetching(bytes: Vec<u8>) -> (Fetch, Calls) {
+        let calls = Calls::default();
+        let noted = calls.clone();
+        let fetch: Fetch = Arc::new(move |url: &str| {
+            noted.lock().unwrap().push(url.to_string());
+            url.ends_with(".png").then(|| bytes.clone())
+        });
+        (fetch, calls)
+    }
+
+    #[test]
+    fn an_image_is_the_file_beside_the_document_or_one_fetched_over_https_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (docs, cache) = (dir.path().join("docs"), dir.path().join("cache"));
+        std::fs::create_dir_all(docs.join("img")).unwrap();
+        std::fs::write(docs.join("img/dot.png"), png(8, 4)).unwrap();
+        std::fs::write(dir.path().join("top.png"), png(2, 2)).unwrap();
+        std::fs::write(docs.join("a b.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"30\" height=\"10\"></svg>").unwrap();
+        std::fs::write(docs.join("notes.png"), "not a picture").unwrap();
+        let document = docs.join("README.md");
+        let (fetch, calls) = fetching(png(6, 3));
+        let file = |source: &str| image_file(source, &document, Some(dir.path()), &cache, fetch.as_ref());
+        // local: from the document's folder, `..` and a leading `/` resolved, the query and the encoding dropped
+        assert_eq!(file("img/dot.png"), Some((docs.join("img/dot.png"), Content::Image(8, 4))));
+        assert_eq!(file("./img/../img/dot.png?raw=1#x").map(|f| f.0), Some(docs.join("img/dot.png")));
+        assert_eq!(file("../top.png"), Some((dir.path().join("top.png"), Content::Image(2, 2))));
+        assert_eq!(file("/top.png").map(|f| f.0), Some(dir.path().join("top.png")), "a leading / is the root");
+        assert_eq!(file("a%20b.svg"), Some((docs.join("a b.svg"), Content::Svg(30, 10))));
+        assert_eq!((file("notes.png"), file("nothing.png"), file(""), file("data:image/png;base64,AAAA"), file("ftp://x/a.png")), (None, None, None, None, None));
+        assert_eq!(image_file("/top.png", &document, None, &cache, fetch.as_ref()), None, "no root, no root-relative path");
+        assert!(calls.lock().unwrap().is_empty(), "nothing local goes to the network");
+        // remote: https only, fetched once, then from the cache
+        assert_eq!(file("http://img.example.net/plain.png"), None);
+        assert!(calls.lock().unwrap().is_empty(), "plain http is never fetched");
+        let url = "https://img.example.net/badge.png";
+        let first = file(url).expect("fetched");
+        assert_eq!((first.1, first.0.parent()), (Content::Image(6, 3), Some(cache.as_path())));
+        assert_eq!(file(url).map(|f| f.0), Some(first.0.clone()), "the second asks nothing");
+        assert_eq!(*calls.lock().unwrap(), [url]);
+        // a failed fetch leaves nothing, and is asked again
+        assert_eq!(file("https://img.example.net/gone.svg"), None);
+        assert_eq!(file("https://img.example.net/gone.svg"), None);
+        assert_eq!(calls.lock().unwrap().iter().filter(|u| u.ends_with("gone.svg")).count(), 2);
+    }
+
+    #[test]
+    fn a_cached_image_goes_stale_after_a_day_and_stands_in_for_a_failed_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, document) = (dir.path().join("cache"), dir.path().join("README.md"));
+        let url = "https://img.example.net/badge.png";
+        let (fetch, calls) = fetching(png(6, 3));
+        let first = image_file(url, &document, None, &cache, fetch.as_ref()).unwrap().0;
+        // a copy a day and a bit old: fetched again, the new bytes in its place
+        let old = std::time::SystemTime::now() - IMAGE_FRESH - Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&first).unwrap().set_modified(old).unwrap();
+        let (fetch2, calls2) = fetching(png(10, 5));
+        assert_eq!(image_file(url, &document, None, &cache, fetch2.as_ref()), Some((first.clone(), Content::Image(10, 5))));
+        assert_eq!((calls.lock().unwrap().len(), calls2.lock().unwrap().len()), (1, 1));
+        // stale again and the server gone: the old copy is shown
+        std::fs::File::options().write(true).open(&first).unwrap().set_modified(old).unwrap();
+        let down: Fetch = Arc::new(|_| None);
+        assert_eq!(image_file(url, &document, None, &cache, down.as_ref()), Some((first, Content::Image(10, 5))));
+    }
+
+    #[test]
+    fn a_fetched_image_over_the_limits_or_no_picture_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, document) = (dir.path().join("cache"), dir.path().join("README.md"));
+        let kept = || std::fs::read_dir(&cache).map_or(0, |d| d.count());
+        let image = |url: &str, bytes: Vec<u8>| image_file(url, &document, None, &cache, &move |_: &str| Some(bytes.clone()));
+        // too many pixels (a side over MAX_SIDE), by its header
+        assert_eq!(image("https://img.example.net/wide.png", png(content::MAX_SIDE + 1, 1)), None);
+        // over the byte limit
+        let mut huge = png(2, 2);
+        huge.resize(content::MAX_IMAGE as usize + 1, 0);
+        assert_eq!(image("https://img.example.net/huge.png", huge), None);
+        // an SVG over its own limit, and bytes that are no image at all
+        let mut svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"3\" height=\"3\">".to_vec();
+        svg.resize(content::MAX_SVG as usize + 1, b' ');
+        assert_eq!(image("https://img.example.net/big.svg", svg), None);
+        assert_eq!(image("https://img.example.net/page.png", b"<html>not found</html>".to_vec()), None);
+        assert_eq!(kept(), 0, "nothing stays in the cache");
+    }
+
+    #[test]
+    fn an_images_type_is_told_from_its_first_bytes() {
+        assert_eq!(image_type(&png(1, 1)), Some("png"));
+        assert_eq!(image_type(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]), Some("jpg"));
+        assert_eq!(image_type(b"GIF89a\x01\x00"), Some("gif"));
+        assert_eq!(image_type(b"RIFF\x10\0\0\0WEBPVP8 "), Some("webp"));
+        assert_eq!(image_type(b"<?xml version=\"1.0\"?>\n<svg width=\"1\"/>"), Some("svg"));
+        assert_eq!((image_type(b"<html></html>"), image_type(b""), image_type(b"MZ\x90\0")), (None, None, None));
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    /// Runs the window's tasks and the runtime's until `done` holds (at most a few seconds).
+    fn settle(rt: &tokio::runtime::Runtime, cx: &mut gpui::VisualTestContext, mut done: impl FnMut(&mut gpui::VisualTestContext) -> bool) {
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            rt.block_on(async { tokio::time::sleep(Duration::from_millis(5)).await });
+        }
+        panic!("never settled");
+    }
+
+    /// A fetch that notes each address and answers `bytes` for the badge once the test sends on `gate`'s other end;
+    /// any other address is not there.
+    fn waiting_for(gate: std::sync::mpsc::Receiver<()>, bytes: Vec<u8>, noted: Calls) -> Fetch {
+        let gate = std::sync::Mutex::new(gate);
+        Arc::new(move |url: &str| {
+            noted.lock().unwrap().push(url.to_string());
+            url.ends_with("badge.png").then(|| gate.lock().unwrap().recv().ok().map(|_| bytes.clone())).flatten()
+        })
+    }
+
+    /// A window with a viewer fetching through `fetch` into `cache`, wide enough for the preview's whole column.
+    fn viewer_window(cx: &mut gpui::TestAppContext, rt: &tokio::runtime::Runtime, fetch: Fetch, cache: PathBuf) -> (Entity<FileViewer>, &'static mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::for_appearance(gpui::WindowAppearance::Dark));
+        });
+        let handle = rt.handle().clone();
+        let (viewer, cx) = cx.add_window_view(|_, cx| FileViewer::new(handle, cx));
+        let cx: &'static mut gpui::VisualTestContext = Box::leak(Box::new(cx.clone()));
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        viewer.update(cx, |v, _| (v.fetch, v.image_cache) = (fetch, cache));
+        (viewer, cx)
+    }
+
+    /// The reader's preview of a README of images: a markdown one and HTML ones, local and remote, the remote ones
+    /// answered when the test says. Each is its alt text until it is in, then its picture, no wider than the column
+    /// and at its `width` when it has one.
+    #[gpui::test]
+    fn the_preview_shows_alt_text_then_the_image_and_keeps_its_proportions(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("README.md");
+        std::fs::write(
+            &path,
+            "![dot](dot.png)\n\n<img src=\"dot.png\" width=\"40\" alt=\"narrow\">\n\n<img src=\"big.png\" alt=\"big\">\n\n<p><a href=\"LICENSE\"><img src=\"https://img.example.net/badge.png\" alt=\"badge\"></a></p>\n\n<img src=\"http://img.example.net/plain.png\" alt=\"plain\">\n\n<img src=\"https://img.example.net/gone.svg\" alt=\"gone\">\n\n<a href=\"LICENSE\"><img src=\"big.png\" alt=\"big link\"></a>\n\n<p align=\"center\">\n  <img src=\"hero.svg\" alt=\"hero\" width=\"860\">\n</p>\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("dot.png"), png(100, 50)).unwrap();
+        std::fs::write(dir.path().join("big.png"), png(2000, 1000)).unwrap();
+        std::fs::write(dir.path().join("hero.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1200\" height=\"600\" viewBox=\"0 0 1200 600\"></svg>").unwrap();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let noted = Calls::default();
+        let fetch = waiting_for(gate, png(60, 30), noted.clone());
+        let (viewer, cx) = viewer_window(cx, rt, fetch, dir.path().join("cache"));
+        viewer.update_in(cx, |v, window, cx| v.open(path.clone(), None, Some(dir.path().to_path_buf()), window, cx));
+        // the local ones come in; the badge is still being fetched: its alt text, not its picture
+        settle(rt, cx, |cx| viewer.read_with(cx, |v, _| v.images.len() == 3));
+        cx.run_until_parked();
+        // a bitmap draws at its pixels over the window's scale
+        let scale = cx.update(|window, _| window.scale_factor());
+        let bounds = |cx: &mut gpui::VisualTestContext, key: &'static str| cx.debug_bounds(key).map(|b| (f32::from(b.size.width), f32::from(b.size.height)));
+        assert_eq!(bounds(cx, "viewer-md-0-image-0-picture"), Some((100. / scale, 50. / scale)), "a markdown image at its own size");
+        assert_eq!(bounds(cx, "viewer-md-1-image-0-picture"), Some((40., 20.)), "an HTML width caps it, its proportions kept");
+        // the column is 820 wide with 24 each side: 772
+        assert_eq!(bounds(cx, "viewer-md-2-image-0-picture"), Some((772., 386.)), "wider than the column: the column's width, its proportions kept");
+        assert_eq!(bounds(cx, "viewer-md-6-image-0-picture"), Some((772., 386.)), "a linked one shrinks to the column too");
+        assert_eq!(bounds(cx, "viewer-md-7-image-0-picture"), Some((772., 386.)), "an SVG asked for 860 wide in a 772 column");
+        assert!(bounds(cx, "viewer-md-3-image-0-picture").is_none() && cx.debug_bounds("viewer-md-3-image-0-alt").is_some(), "the badge's alt text until it is in");
+        assert!(cx.debug_bounds("viewer-md-4-image-0-alt").is_some(), "plain http is never fetched: its alt text stays");
+        // the badge lands: its picture replaces its alt text
+        release.send(()).unwrap();
+        settle(rt, cx, |cx| viewer.read_with(cx, |v, _| v.images.len() == 4));
+        cx.run_until_parked();
+        assert_eq!(bounds(cx, "viewer-md-3-image-0-picture"), Some((60. / scale, 30. / scale)));
+        assert!(cx.debug_bounds("viewer-md-3-image-0-alt").is_none());
+        // the one that is not there keeps its alt text
+        assert!(cx.debug_bounds("viewer-md-5-image-0-alt").is_some() && bounds(cx, "viewer-md-5-image-0-picture").is_none());
+        let asked_of = |url: &str| noted.lock().unwrap().iter().filter(|u| u.ends_with(url)).count();
+        assert_eq!((asked_of("badge.png"), asked_of("gone.svg"), asked_of("plain.png")), (1, 1, 0));
+        // opened again: the badge is in the cache, nothing asks for it; the missing one is asked again
+        viewer.update_in(cx, |v, window, cx| v.open(path.clone(), None, Some(dir.path().to_path_buf()), window, cx));
+        settle(rt, cx, |cx| viewer.read_with(cx, |v, _| v.images.len() == 4));
+        assert_eq!((asked_of("badge.png"), asked_of("gone.svg"), asked_of("plain.png")), (1, 2, 0));
+    }
+
+    /// An image whose fetch ends after another file was opened is not shown with it.
+    #[gpui::test]
+    fn an_image_landing_after_another_file_opened_is_dropped(cx: &mut gpui::TestAppContext) {
+        let rt = &runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("a.md"), dir.path().join("b.md"));
+        std::fs::write(&first, "<img src=\"https://img.example.net/badge.png\" alt=\"badge\">\n").unwrap();
+        std::fs::write(&second, "![dot](dot.png)\n").unwrap();
+        std::fs::write(dir.path().join("dot.png"), png(4, 4)).unwrap();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let noted = Calls::default();
+        let cache = dir.path().join("cache");
+        let (viewer, cx) = viewer_window(cx, rt, waiting_for(gate, png(6, 3), noted.clone()), cache.clone());
+        viewer.update_in(cx, |v, window, cx| v.open(first, None, Some(dir.path().to_path_buf()), window, cx));
+        settle(rt, cx, |_| !noted.lock().unwrap().is_empty());
+        viewer.update_in(cx, |v, window, cx| v.open(second.clone(), None, Some(dir.path().to_path_buf()), window, cx));
+        settle(rt, cx, |cx| viewer.read_with(cx, |v, _| v.images.len() == 1));
+        // the first file's fetch now ends: it is in the cache, not on the second file's page
+        release.send(()).unwrap();
+        settle(rt, cx, |_| std::fs::read_dir(&cache).is_ok_and(|d| d.count() == 1));
+        let mut rounds = 0;
+        settle(rt, cx, |_| {
+            rounds += 1;
+            rounds > 20
+        });
+        viewer.read_with(cx, |v, _| assert_eq!(v.images.keys().collect::<Vec<_>>(), ["dot.png"]));
     }
 }
